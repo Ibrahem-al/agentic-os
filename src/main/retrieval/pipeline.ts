@@ -41,9 +41,10 @@ export interface PassOptions {
 
 /**
  * FTS treats most punctuation as noise and its tokenizer strips digits
- * (phase-01 finding 8); feed it plain word characters only.
+ * (phase-01 finding 8); feed it plain word characters only. Shared with
+ * search.ts (the §12 search_memory arm).
  */
-function ftsQueryOf(query: string): string {
+export function ftsQueryOf(query: string): string {
   return query
     .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
     .replace(/\s+/g, ' ')

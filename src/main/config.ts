@@ -22,6 +22,32 @@ export const HOOK_SESSION_END_PATH = '/hooks/session-end'
 export const HOOK_SESSION_END_URL = `http://${MCP_HOST}:${MCP_PORT}${HOOK_SESSION_END_PATH}`
 /** 30 min of MCP silence per session id → session considered ended. */
 export const MCP_INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000
+/**
+ * MCP endpoint path + server identity. The path matches the §12 connection
+ * helper (`claude mcp add ... http://127.0.0.1:4517/mcp`); name/version are
+ * what the server reports during the MCP initialize handshake.
+ */
+export const MCP_ENDPOINT_PATH = '/mcp'
+export const MCP_URL = `http://${MCP_HOST}:${MCP_PORT}${MCP_ENDPOINT_PATH}`
+export const MCP_SERVER_NAME = PRODUCT_NAME
+export const MCP_SERVER_VERSION = '0.0.1'
+/**
+ * Values below are not in §20 — conservative rule-12 picks, recorded in the
+ * phase-05 report.
+ */
+/** Max bytes of a POST body the MCP HTTP endpoint accepts. */
+export const MCP_MAX_BODY_BYTES = 4 * 1024 * 1024
+/**
+ * mcp_calls keeps the args hash always (phase-05 doc); the full args JSON is
+ * kept alongside only up to this size (§6 extraction wants the args, but
+ * ingest_document can carry whole documents — those log hash-only).
+ */
+export const MCP_CALL_ARGS_JSON_MAX_BYTES = 16 * 1024
+/** search_memory: default and max result count (k). */
+export const SEARCH_MEMORY_DEFAULT_K = 8
+export const SEARCH_MEMORY_MAX_K = 30
+/** External MCP servers the OS consumes as a client (§12), in userData. */
+export const MCP_SERVERS_CONFIG_FILENAME = 'mcp-servers.json'
 
 // ── Filesystem layout ────────────────────────────────────────────────────────
 /** Spool folder for pending (unprocessed) session transcripts. */

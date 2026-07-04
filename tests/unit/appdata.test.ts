@@ -20,13 +20,13 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('creates the db in WAL mode with all tables and user_version 2', () => {
+  it('creates the db in WAL mode with all tables and user_version 3', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const appData = openAppData(join(dir, 'nested', 'appdata.db'))
     try {
       expect(existsSync(appData.path)).toBe(true)
       expect(appData.db.pragma('journal_mode', { simple: true })).toBe('wal')
-      expect(appData.db.pragma('user_version', { simple: true })).toBe(2)
+      expect(appData.db.pragma('user_version', { simple: true })).toBe(3)
       expect(appData.db.pragma('foreign_keys', { simple: true })).toBe(1)
       const names = appData.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -47,12 +47,9 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
         'INSERT INTO traces (trace_id, span_id, name, start_unix_ms, attributes_json) VALUES (?, ?, ?, ?, ?)'
       ).run('t1', 's1', 'boot', 1000, '{"k":1}')
       db.prepare('INSERT INTO tasks (id, kind, status) VALUES (?, ?, ?)').run('task-1', 'extraction', 'pending')
-      db.prepare('INSERT INTO mcp_calls (session_id, tool, started_unix_ms, duration_ms) VALUES (?, ?, ?, ?)').run(
-        'sess-1',
-        'retrieve_context',
-        2000,
-        42
-      )
+      db.prepare(
+        'INSERT INTO mcp_calls (session_id, tool, args_hash, started_unix_ms, duration_ms) VALUES (?, ?, ?, ?, ?)'
+      ).run('sess-1', 'get_context', 'sha256:abc', 2000, 42)
       db.prepare('INSERT INTO staged_writes (id, proposed_by, kind, payload_json) VALUES (?, ?, ?, ?)').run(
         'sw-1',
         'claude',
@@ -75,9 +72,11 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
       expect(task.status).toBe('pending')
       expect(task.attempts).toBe(0)
       expect(Number.isNaN(Date.parse(task.created_at))).toBe(false)
-      expect(
-        (db.prepare('SELECT tool FROM mcp_calls WHERE session_id = ?').get('sess-1') as { tool: string }).tool
-      ).toBe('retrieve_context')
+      const call = db
+        .prepare('SELECT tool, args_hash FROM mcp_calls WHERE session_id = ?')
+        .get('sess-1') as { tool: string; args_hash: string }
+      expect(call.tool).toBe('get_context')
+      expect(call.args_hash).toBe('sha256:abc')
       expect(
         (db.prepare('SELECT status FROM staged_writes WHERE id = ?').get('sw-1') as { status: string }).status
       ).toBe('staged')
@@ -109,32 +108,54 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const second = openAppData(dbPath)
     try {
-      expect(second.db.pragma('user_version', { simple: true })).toBe(2)
+      expect(second.db.pragma('user_version', { simple: true })).toBe(3)
       expect((second.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(1)
     } finally {
       second.close()
     }
   })
 
-  it('upgrades a v1 db in place (additive tables, phase-04 v2)', () => {
+  it('upgrades a v1 db in place (additive tables + columns, phase-04 v2 / phase-05 v3)', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const dbPath = join(dir, 'appdata.db')
     const first = openAppData(dbPath)
     first.db.prepare('INSERT INTO tasks (id, kind) VALUES (?, ?)').run('keep-me', 'probe')
-    // Simulate a phase-01..03 database: drop the phase-04 tables, set v1.
+    // Simulate a phase-01..03 database: drop the phase-04 tables, recreate
+    // mcp_calls without the phase-05 args_hash column, set v1.
     first.db.exec('DROP TABLE workflow_checkpoints; DROP TABLE workflow_checkpoint_writes')
+    first.db.exec(`DROP TABLE mcp_calls;
+      CREATE TABLE mcp_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT,
+        tool TEXT NOT NULL,
+        params_json TEXT,
+        result_status TEXT,
+        error TEXT,
+        started_unix_ms INTEGER NOT NULL,
+        duration_ms INTEGER,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      )`)
+    first.db
+      .prepare('INSERT INTO mcp_calls (session_id, tool, started_unix_ms) VALUES (?, ?, ?)')
+      .run('old-sess', 'get_context', 1000)
     first.db.pragma('user_version = 1')
     first.close()
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(2)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(3)
       const names = upgraded.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .all()
         .map((r) => (r as { name: string }).name)
       expect(names).toEqual([...TABLES].sort())
       expect((upgraded.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(1)
+      // The pre-v3 row survives with a NULL args_hash; the column now exists.
+      const old = upgraded.db
+        .prepare('SELECT tool, args_hash FROM mcp_calls WHERE session_id = ?')
+        .get('old-sess') as { tool: string; args_hash: string | null }
+      expect(old.tool).toBe('get_context')
+      expect(old.args_hash).toBeNull()
     } finally {
       upgraded.close()
     }

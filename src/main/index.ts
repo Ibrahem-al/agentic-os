@@ -5,14 +5,17 @@ import {
   appDataPaths,
   MCP_HOST,
   MCP_PORT,
+  MCP_SERVERS_CONFIG_FILENAME,
   PRODUCT_NAME,
   RYU_EXTENSION_VERSION_DIR,
   RYUGRAPH_VERSION_PIN
 } from './config'
 import { openAppData, openRyuGraphEngine, type AppData } from './storage'
-import { Keychain, keychainPath, loadModelSettings, OllamaClient, settingsPath } from './models'
+import { Keychain, keychainPath, loadModelSettings, OllamaClient, Reranker, settingsPath } from './models'
 import { createTelemetry, type Telemetry } from './telemetry'
 import { ContextManager, Kernel, LangGraphRunner, createAuditLogStub } from './kernel'
+import { createRetriever } from './retrieval'
+import { AgenticOsMcpServer, claudeMcpAddCommand, McpClientManager, writeSampleMcpJson } from './mcp'
 
 // Native modules are CJS; load them through require so the bundler leaves them
 // external and Electron resolves them from node_modules at runtime.
@@ -26,9 +29,15 @@ if (userDataOverride) app.setPath('userData', userDataOverride)
 let engine: Awaited<ReturnType<typeof openRyuGraphEngine>> | null = null
 let appData: AppData | null = null
 let telemetry: Telemetry | null = null
-/** Kernel singletons (phase 04) — phase 05's MCP server + later agents use these. */
+/** Kernel singletons (phase 04) — the MCP server + later agents run through these. */
 let kernelInstances: { kernel: Kernel; runner: LangGraphRunner; contextManager: ContextManager } | null = null
-void kernelInstances
+/** Model-layer singletons (phase 02) — shared by the MCP server (phase 05). */
+let keychain: Keychain | null = null
+let ollama: OllamaClient | null = null
+/** MCP server + client manager (phase 05); the manager serves phases 08/10. */
+let mcpServer: AgenticOsMcpServer | null = null
+let mcpClientManager: McpClientManager | null = null
+void mcpClientManager
 
 /** Native-module pipeline sanity: versions logged from Electron main. */
 function logNativeModuleVersions(): void {
@@ -89,7 +98,7 @@ async function bootStorage(): Promise<void> {
  */
 async function bootModels(): Promise<void> {
   const userDataDir = app.getPath('userData')
-  const keychain = new Keychain({ filePath: keychainPath(userDataDir), safeStorage })
+  keychain = new Keychain({ filePath: keychainPath(userDataDir), safeStorage })
   keychain.ensureMcpBearerToken()
   console.log(
     `[models] keychain open (safeStorage-encrypted) — secrets present: ${keychain.listSecretNames().join(', ') || '(none)'}`
@@ -98,7 +107,8 @@ async function bootModels(): Promise<void> {
   const settings = loadModelSettings(settingsPath(userDataDir))
   console.log(`[models] active cloud provider: ${settings.cloudProvider}`)
 
-  const status = await new OllamaClient().status()
+  ollama = new OllamaClient()
+  const status = await ollama.status()
   if (status.state === 'ready') {
     console.log(`[models] ollama ready (${status.installedModels.length} models incl. required)`)
   } else if (status.state === 'models-missing') {
@@ -122,9 +132,66 @@ function bootKernel(): void {
   telemetry = createTelemetry(appData.db)
   const kernel = new Kernel({ telemetry, audit: createAuditLogStub() })
   const runner = new LangGraphRunner({ db: appData.db, telemetry, executor: kernel })
-  const contextManager = new ContextManager({ llm: new OllamaClient(), telemetry })
+  const contextManager = new ContextManager({ llm: ollama ?? new OllamaClient(), telemetry })
   kernelInstances = { kernel, runner, contextManager }
   console.log('[kernel] workflow runner ready (LangGraph + SQLite checkpointer) — spans → traces table')
+}
+
+/**
+ * Phase-05 MCP boot: the §12 Streamable HTTP server on 127.0.0.1:4517 behind
+ * the keychain bearer token, every tool call kernel-mediated and logged to
+ * mcp_calls; plus the outbound MCP client manager. The get_context path uses
+ * ONE retriever over the shared OllamaClient + one lazy Reranker (phase-03:
+ * never re-instantiate models per call).
+ */
+async function bootMcp(): Promise<void> {
+  if (appData === null || engine === null || kernelInstances === null || keychain === null || ollama === null) {
+    console.warn('[mcp] storage/models/kernel unavailable — MCP server disabled this launch')
+    return
+  }
+  const userDataDir = app.getPath('userData')
+  const paths = appDataPaths(userDataDir)
+  const reranker = new Reranker({ modelsDir: paths.modelsDir })
+  const retrievalDeps = { engine, embedder: ollama, reranker }
+  const retriever = createRetriever({ ...retrievalDeps, llm: ollama })
+  const server = new AgenticOsMcpServer({
+    bearerToken: keychain.ensureMcpBearerToken(),
+    engine,
+    retriever,
+    retrieval: retrievalDeps,
+    db: appData.db,
+    executor: kernelInstances.kernel
+  })
+  try {
+    await server.start()
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'EADDRINUSE') {
+      console.error(
+        `[mcp] port ${MCP_PORT} is already in use (another ${PRODUCT_NAME} instance?) — MCP server disabled this launch`
+      )
+      return
+    }
+    throw err
+  }
+  mcpServer = server
+  mcpClientManager = new McpClientManager({
+    configPath: join(userDataDir, MCP_SERVERS_CONFIG_FILENAME),
+    secrets: (name) => keychain?.getSecret(name)
+  })
+
+  // Connection helper (§12). The sample + the printed command carry the
+  // <token> placeholder — the real token stays in the keychain (§21 rule 7)
+  // and is surfaced by the dashboard (phase 10). Dev escape hatch: set
+  // AGENTIC_OS_PRINT_MCP_TOKEN=1 to print the runnable command.
+  const samplePath = join(userDataDir, '.mcp.json')
+  writeSampleMcpJson(samplePath)
+  console.log(`[mcp] server listening at ${server.url} (bearer auth, 7 tools, call log → mcp_calls)`)
+  console.log(`[mcp] connect Claude Code with:\n[mcp]   ${claudeMcpAddCommand()}`)
+  console.log(`[mcp] sample .mcp.json written to ${samplePath} (replace <token> with the keychain token)`)
+  if (process.env['AGENTIC_OS_PRINT_MCP_TOKEN'] === '1') {
+    console.log(`[mcp] dev: ${claudeMcpAddCommand(keychain.ensureMcpBearerToken())}`)
+  }
 }
 
 function createWindow(): void {
@@ -174,6 +241,11 @@ void app.whenReady().then(async () => {
   } catch (err) {
     console.error('[kernel] kernel boot FAILED', err)
   }
+  try {
+    await bootMcp()
+  } catch (err) {
+    console.error('[mcp] MCP boot FAILED', err)
+  }
 
   createWindow()
 
@@ -189,6 +261,12 @@ let quitting = false
 app.on('will-quit', (event) => {
   if (quitting) return
   quitting = true
+  // MCP first: closeAllConnections() severs sockets synchronously, so no new
+  // tool call can reach appdata.db after this line; the rest of stop() (SDK
+  // session teardown) finishes in the background.
+  void mcpServer?.stop().catch(() => undefined)
+  mcpServer = null
+  mcpClientManager = null
   // Telemetry flushes synchronously (SimpleSpanProcessor + better-sqlite3);
   // shutdown just stops accepting spans before the db handle closes.
   void telemetry?.shutdown().catch(() => undefined)

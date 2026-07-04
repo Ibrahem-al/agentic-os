@@ -58,6 +58,7 @@ const APPDATA_SCHEMA: readonly string[] = [
     session_id TEXT,
     tool TEXT NOT NULL,
     params_json TEXT,
+    args_hash TEXT,
     result_status TEXT,
     error TEXT,
     started_unix_ms INTEGER NOT NULL,
@@ -118,7 +119,18 @@ const APPDATA_SCHEMA: readonly string[] = [
   )`
 ]
 
-const APPDATA_USER_VERSION = 2
+const APPDATA_USER_VERSION = 3
+
+/**
+ * Column additions to tables that predate them (CREATE IF NOT EXISTS skips an
+ * existing table, so new columns need a guarded ALTER). Applied idempotently:
+ * the column is added only when pragma table_info says it is missing.
+ * v3 (phase 05): mcp_calls.args_hash — the call log keeps a stable hash of
+ * every tool call's arguments even when the args JSON is too large to store.
+ */
+const APPDATA_COLUMN_ADDITIONS: readonly { table: string; column: string; ddl: string }[] = [
+  { table: 'mcp_calls', column: 'args_hash', ddl: 'ALTER TABLE mcp_calls ADD COLUMN args_hash TEXT' }
+]
 
 /** The binding that loaded successfully in this runtime (cached). */
 let resolvedBinding: string | null | undefined
@@ -187,10 +199,15 @@ export function openAppData(dbPath: string): AppData {
   db.pragma('synchronous = NORMAL')
   db.pragma('foreign_keys = ON')
   for (const statement of APPDATA_SCHEMA) db.exec(statement)
+  for (const addition of APPDATA_COLUMN_ADDITIONS) {
+    const columns = db.pragma(`table_info(${addition.table})`) as { name: string }[]
+    if (!columns.some((c) => c.name === addition.column)) db.exec(addition.ddl)
+  }
   if (existingVersion < APPDATA_USER_VERSION) {
-    // Every schema change so far is additive CREATE IF NOT EXISTS, so applying
-    // the full statement list upgrades any older version in place (v1 → v2
-    // added the two workflow_checkpoint* tables in phase 04).
+    // Every schema change so far is additive (CREATE IF NOT EXISTS tables +
+    // guarded ADD COLUMNs above), so applying the full list upgrades any older
+    // version in place (v1 → v2: workflow_checkpoint* tables, phase 04;
+    // v2 → v3: mcp_calls.args_hash, phase 05).
     db.pragma(`user_version = ${APPDATA_USER_VERSION}`)
   }
   return {
