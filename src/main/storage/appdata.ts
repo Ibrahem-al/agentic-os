@@ -90,10 +90,35 @@ const APPDATA_SCHEMA: readonly string[] = [
     usd REAL NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_spend_task ON spend(task_id)`
+  `CREATE INDEX IF NOT EXISTS idx_spend_task ON spend(task_id)`,
+  // Workflow checkpoints (§9/§10, phase 04): LangGraph durable state lives in
+  // appdata.db so long jobs survive a restart. Shapes mirror the upstream
+  // SQLite saver; serialized blobs come from the checkpointer's serde.
+  `CREATE TABLE IF NOT EXISTS workflow_checkpoints (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL,
+    parent_checkpoint_id TEXT,
+    type TEXT,
+    checkpoint BLOB NOT NULL,
+    metadata BLOB NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS workflow_checkpoint_writes (
+    thread_id TEXT NOT NULL,
+    checkpoint_ns TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    type TEXT,
+    value BLOB,
+    PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+  )`
 ]
 
-const APPDATA_USER_VERSION = 1
+const APPDATA_USER_VERSION = 2
 
 /** The binding that loaded successfully in this runtime (cached). */
 let resolvedBinding: string | null | undefined
@@ -162,7 +187,10 @@ export function openAppData(dbPath: string): AppData {
   db.pragma('synchronous = NORMAL')
   db.pragma('foreign_keys = ON')
   for (const statement of APPDATA_SCHEMA) db.exec(statement)
-  if (existingVersion === 0) {
+  if (existingVersion < APPDATA_USER_VERSION) {
+    // Every schema change so far is additive CREATE IF NOT EXISTS, so applying
+    // the full statement list upgrades any older version in place (v1 → v2
+    // added the two workflow_checkpoint* tables in phase 04).
     db.pragma(`user_version = ${APPDATA_USER_VERSION}`)
   }
   return {

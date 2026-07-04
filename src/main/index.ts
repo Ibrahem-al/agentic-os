@@ -11,6 +11,8 @@ import {
 } from './config'
 import { openAppData, openRyuGraphEngine, type AppData } from './storage'
 import { Keychain, keychainPath, loadModelSettings, OllamaClient, settingsPath } from './models'
+import { createTelemetry, type Telemetry } from './telemetry'
+import { ContextManager, Kernel, LangGraphRunner, createAuditLogStub } from './kernel'
 
 // Native modules are CJS; load them through require so the bundler leaves them
 // external and Electron resolves them from node_modules at runtime.
@@ -23,6 +25,10 @@ if (userDataOverride) app.setPath('userData', userDataOverride)
 
 let engine: Awaited<ReturnType<typeof openRyuGraphEngine>> | null = null
 let appData: AppData | null = null
+let telemetry: Telemetry | null = null
+/** Kernel singletons (phase 04) — phase 05's MCP server + later agents use these. */
+let kernelInstances: { kernel: Kernel; runner: LangGraphRunner; contextManager: ContextManager } | null = null
+void kernelInstances
 
 /** Native-module pipeline sanity: versions logged from Electron main. */
 function logNativeModuleVersions(): void {
@@ -102,6 +108,25 @@ async function bootModels(): Promise<void> {
   }
 }
 
+/**
+ * Phase-04 kernel boot: OTel telemetry into the traces table, the workflow
+ * runner (LangGraph behind the WorkflowRunner interface, SQLite checkpointer
+ * in appdata.db) and the context manager (local-LLM summarizer). Background
+ * agents (phase 08+) and the MCP server (phase 05) run through these.
+ */
+function bootKernel(): void {
+  if (appData === null) {
+    console.warn('[kernel] appdata.db unavailable — kernel boot skipped')
+    return
+  }
+  telemetry = createTelemetry(appData.db)
+  const kernel = new Kernel({ telemetry, audit: createAuditLogStub() })
+  const runner = new LangGraphRunner({ db: appData.db, telemetry, executor: kernel })
+  const contextManager = new ContextManager({ llm: new OllamaClient(), telemetry })
+  kernelInstances = { kernel, runner, contextManager }
+  console.log('[kernel] workflow runner ready (LangGraph + SQLite checkpointer) — spans → traces table')
+}
+
 function createWindow(): void {
   const win = new BrowserWindow({
     width: 1200,
@@ -144,6 +169,11 @@ void app.whenReady().then(async () => {
   } catch (err) {
     console.error('[models] model-layer boot FAILED', err)
   }
+  try {
+    bootKernel()
+  } catch (err) {
+    console.error('[kernel] kernel boot FAILED', err)
+  }
 
   createWindow()
 
@@ -159,6 +189,11 @@ let quitting = false
 app.on('will-quit', (event) => {
   if (quitting) return
   quitting = true
+  // Telemetry flushes synchronously (SimpleSpanProcessor + better-sqlite3);
+  // shutdown just stops accepting spans before the db handle closes.
+  void telemetry?.shutdown().catch(() => undefined)
+  telemetry = null
+  kernelInstances = null
   appData?.close()
   appData = null
   if (engine) {

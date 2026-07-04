@@ -118,6 +118,37 @@ export const CLOUD_DEFAULT_MODELS: Readonly<Record<CloudProvider, string>> = {
 /** Default completion cap — spend-conservative; callers raise it as needed. */
 export const CLOUD_MAX_TOKENS_DEFAULT = 4096
 
+// ── Kernel / context manager (§9, §10) ──────────────────────────────────────
+/**
+ * Context-window sizes used to derive the prompt budget per provider (§10
+ * "within the active provider's token budget"). Not §20 values — conservative
+ * floors per rule 12 (recorded in the phase-04 report): a smaller window only
+ * makes summarization kick in earlier, never overflows a real model.
+ */
+export const PROVIDER_CONTEXT_WINDOW_TOKENS: Readonly<Record<CloudProvider, number>> = {
+  anthropic: 200_000,
+  openai: 200_000,
+  gemini: 1_000_000,
+  openrouter: 128_000
+}
+/**
+ * The local small LLM's usable window. Ollama's default num_ctx is 4096;
+ * summarization chunks are sized so prompt + output always fit inside it.
+ */
+export const LOCAL_LLM_CONTEXT_WINDOW_TOKENS = 4096
+/** Estimated tokens of section content fed to one summarize call. */
+export const CONTEXT_SUMMARIZE_CHUNK_TOKENS = 2048
+/** Re-summarize rounds before giving up (output caps make >1 rare). */
+export const CONTEXT_SUMMARIZE_MAX_ROUNDS = 3
+/**
+ * Fraction of a summary's token target requested as the model's num_predict.
+ * The estimating counter overestimates real tokens by up to ~25%, so capping
+ * output below target keeps the *estimate* of the summary under target too.
+ */
+export const CONTEXT_SUMMARY_OUTPUT_FRACTION = 0.6
+/** Below this per-section summary target the budget is too small to be honest. */
+export const CONTEXT_MIN_SUMMARY_TOKENS = 32
+
 // ── Retrieval ────────────────────────────────────────────────────────────────
 /** Vector top-30 per label + FTS top-30 → fuse → rerank → top-8 to bundle. */
 export const RETRIEVAL_VECTOR_TOP_K = 30

@@ -4,7 +4,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openAppData } from '../../src/main/storage/appdata'
 
-const TABLES = ['traces', 'tasks', 'mcp_calls', 'staged_writes', 'spend'] as const
+const TABLES = [
+  'traces',
+  'tasks',
+  'mcp_calls',
+  'staged_writes',
+  'spend',
+  'workflow_checkpoints',
+  'workflow_checkpoint_writes'
+] as const
 
 describe('appdata.db (SQLite side of §20 app data)', () => {
   let dir: string
@@ -12,13 +20,13 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('creates the db in WAL mode with all five tables and user_version 1', () => {
+  it('creates the db in WAL mode with all tables and user_version 2', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const appData = openAppData(join(dir, 'nested', 'appdata.db'))
     try {
       expect(existsSync(appData.path)).toBe(true)
       expect(appData.db.pragma('journal_mode', { simple: true })).toBe('wal')
-      expect(appData.db.pragma('user_version', { simple: true })).toBe(1)
+      expect(appData.db.pragma('user_version', { simple: true })).toBe(2)
       expect(appData.db.pragma('foreign_keys', { simple: true })).toBe(1)
       const names = appData.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -101,10 +109,43 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const second = openAppData(dbPath)
     try {
-      expect(second.db.pragma('user_version', { simple: true })).toBe(1)
+      expect(second.db.pragma('user_version', { simple: true })).toBe(2)
       expect((second.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(1)
     } finally {
       second.close()
     }
+  })
+
+  it('upgrades a v1 db in place (additive tables, phase-04 v2)', () => {
+    dir = mkdtempSync(join(tmpdir(), 'appdata-'))
+    const dbPath = join(dir, 'appdata.db')
+    const first = openAppData(dbPath)
+    first.db.prepare('INSERT INTO tasks (id, kind) VALUES (?, ?)').run('keep-me', 'probe')
+    // Simulate a phase-01..03 database: drop the phase-04 tables, set v1.
+    first.db.exec('DROP TABLE workflow_checkpoints; DROP TABLE workflow_checkpoint_writes')
+    first.db.pragma('user_version = 1')
+    first.close()
+
+    const upgraded = openAppData(dbPath)
+    try {
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(2)
+      const names = upgraded.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .all()
+        .map((r) => (r as { name: string }).name)
+      expect(names).toEqual([...TABLES].sort())
+      expect((upgraded.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(1)
+    } finally {
+      upgraded.close()
+    }
+  })
+
+  it('refuses a db with a newer user_version', () => {
+    dir = mkdtempSync(join(tmpdir(), 'appdata-'))
+    const dbPath = join(dir, 'appdata.db')
+    const first = openAppData(dbPath)
+    first.db.pragma('user_version = 99')
+    first.close()
+    expect(() => openAppData(dbPath)).toThrow(/newer than this build/)
   })
 })
