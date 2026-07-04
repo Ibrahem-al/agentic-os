@@ -16,6 +16,7 @@
     "rebuild:native": "node scripts/native/rebuild-native.cjs"
   },
   "dependencies": {
+    "@huggingface/tokenizers": "0.1.3",
     "better-sqlite3": "12.11.1",
     "onnxruntime-node": "1.27.0",
     "ryugraph": "25.9.1"

@@ -73,3 +73,16 @@ jobs:
           node node_modules\electron\cli.js scripts\ci\electron-native-check.cjs
           if ($LASTEXITCODE -ne 0) { throw "electron native check failed: $LASTEXITCODE" }
           Get-Content "$env:TEMP\electron-native-check.json"
+
+      # Keychain check (spec §21 rule 7): the real Keychain class under a real
+      # Electron main process with real safeStorage (DPAPI) — keys round-trip,
+      # MCP bearer token idempotent, no plaintext byte ever on disk. Windows
+      # only: Linux/macOS CI runners have no OS keyring, so
+      # safeStorage.isEncryptionAvailable() is false there by design.
+      - name: Electron keychain check (real safeStorage, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          node node_modules\electron\cli.js scripts\ci\electron-keychain-check.cjs
+          if ($LASTEXITCODE -ne 0) { throw "electron keychain check failed: $LASTEXITCODE" }
+          Get-Content "$env:TEMP\agentic-os-keychain-check.json"

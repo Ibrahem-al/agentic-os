@@ -1,4 +1,4 @@
-import { app, BrowserWindow, shell } from 'electron'
+import { app, BrowserWindow, safeStorage, shell } from 'electron'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import {
@@ -10,6 +10,7 @@ import {
   RYUGRAPH_VERSION_PIN
 } from './config'
 import { openAppData, openRyuGraphEngine, type AppData } from './storage'
+import { Keychain, keychainPath, loadModelSettings, OllamaClient, settingsPath } from './models'
 
 // Native modules are CJS; load them through require so the bundler leaves them
 // external and Electron resolves them from node_modules at runtime.
@@ -75,6 +76,32 @@ async function bootStorage(): Promise<void> {
   )
 }
 
+/**
+ * Phase-02 model-layer boot: keychain (safeStorage-encrypted; auto-generates
+ * the MCP bearer token, consumed in phase 05), model settings, and Ollama
+ * detection for the §4 guided-install flow. No secret value is ever logged.
+ */
+async function bootModels(): Promise<void> {
+  const userDataDir = app.getPath('userData')
+  const keychain = new Keychain({ filePath: keychainPath(userDataDir), safeStorage })
+  keychain.ensureMcpBearerToken()
+  console.log(
+    `[models] keychain open (safeStorage-encrypted) — secrets present: ${keychain.listSecretNames().join(', ') || '(none)'}`
+  )
+
+  const settings = loadModelSettings(settingsPath(userDataDir))
+  console.log(`[models] active cloud provider: ${settings.cloudProvider}`)
+
+  const status = await new OllamaClient().status()
+  if (status.state === 'ready') {
+    console.log(`[models] ollama ready (${status.installedModels.length} models incl. required)`)
+  } else if (status.state === 'models-missing') {
+    console.log(`[models] ollama running, missing models: ${status.missingModels.join(', ')} — dashboard offers one-click pull`)
+  } else {
+    console.log(`[models] ollama not detected — dashboard links installer (${status.installUrl})`)
+  }
+}
+
 function createWindow(): void {
   const win = new BrowserWindow({
     width: 1200,
@@ -111,6 +138,11 @@ void app.whenReady().then(async () => {
     await bootStorage()
   } catch (err) {
     console.error('[storage] storage boot FAILED', err)
+  }
+  try {
+    await bootModels()
+  } catch (err) {
+    console.error('[models] model-layer boot FAILED', err)
   }
 
   createWindow()

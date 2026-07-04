@@ -19,6 +19,7 @@
     "src/main/**/*.ts",
     "src/preload/**/*.ts",
     "tests/unit/**/*.ts",
-    "tests/integration/**/*.ts"
+    "tests/integration/**/*.ts",
+    "tests/fixtures/**/*.ts"
   ]
 }
