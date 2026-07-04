@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+
+      - name: Verify vendored extension integrity
+        if: runner.os == 'Linux'
+        run: sha256sum -c resources/extensions/SHA256SUMS
+
+      # Offline extension-load check (spec §21 rule 2): the spike must pass
+      # with networking disabled, loading vector + FTS from resources/extensions/.
+      - name: Offline extension-load check (Linux, network namespace)
+        if: runner.os == 'Linux'
+        run: sudo unshare -n -- "$(which node)" scripts/spike/run-spike.cjs
+
+      - name: Offline extension-load check (macOS, sandbox deny-network)
+        if: runner.os == 'macOS'
+        run: sandbox-exec -p '(version 1)(allow default)(deny network*)' node scripts/spike/run-spike.cjs
+
+      - name: Offline extension-load check (Windows, outbound firewall block)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $node = (Get-Command node).Source
+          New-NetFirewallRule -DisplayName "block-node-egress" -Direction Outbound -Program $node -Action Block | Out-Null
+          try {
+            node scripts/spike/run-spike.cjs
+            if ($LASTEXITCODE -ne 0) { throw "spike failed offline: $LASTEXITCODE" }
+          } finally {
+            Remove-NetFirewallRule -DisplayName "block-node-egress"
+          }
+
+      # Electron ABI check (spec §5): the RyuGraph N-API binding must load in
+      # Electron's runtime. The win32 npm prebuilt lacks the delay-load hook
+      # (needs the rebuild:native source build, too slow for CI), so this runs
+      # where the prebuilt is Electron-compatible.
+      - name: Electron ABI check (ryugraph spike under Electron runtime)
+        if: runner.os != 'Windows'
+        run: ELECTRON_RUN_AS_NODE=1 ./node_modules/electron/dist/electron${{ runner.os == 'macOS' && '.app/Contents/MacOS/Electron' || '' }} scripts/spike/run-spike.cjs
+        env:
+          SPIKE_LOG_FILE: spike-electron-ci.log
+
+      - name: Electron ABI check (better-sqlite3 + onnxruntime-node, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # electron-rebuild only: the ryugraph Electron source build (the rest
+          # of rebuild:native) takes ~an hour and is exercised on dev machines.
+          npx electron-rebuild -f -w better-sqlite3
+          $env:ELECTRON_RUN_AS_NODE = "1"
+          node node_modules\electron\cli.js scripts\ci\electron-native-check.cjs
+          if ($LASTEXITCODE -ne 0) { throw "electron native check failed: $LASTEXITCODE" }
+          Get-Content "$env:TEMP\electron-native-check.json"

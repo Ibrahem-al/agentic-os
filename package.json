@@ -1,0 +1,44 @@
+{
+  "name": "agentic-os",
+  "version": "0.0.1",
+  "description": "Agentic OS — local-first memory-and-tool backend for AI agents (Electron, embedded RyuGraph).",
+  "main": "out/main/index.js",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "vitest run",
+    "rebuild:native": "electron-rebuild -f -w better-sqlite3 && node scripts/native/rebuild-ryugraph-electron.cjs",
+    "spike:ryugraph": "node scripts/spike/run-spike.cjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "12.11.1",
+    "onnxruntime-node": "1.27.0",
+    "ryugraph": "25.9.1"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "4.1.0",
+    "@eslint/js": "9.39.4",
+    "@tailwindcss/vite": "4.3.2",
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "24.13.2",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "5.2.0",
+    "electron": "43.0.0",
+    "electron-vite": "5.0.0",
+    "eslint": "9.39.4",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "tailwindcss": "4.3.2",
+    "typescript": "5.8.3",
+    "typescript-eslint": "8.62.1",
+    "vite": "7.3.6",
+    "vitest": "4.1.9"
+  }
+}

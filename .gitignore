@@ -1,0 +1,24 @@
+# dependencies / build output
+node_modules/
+out/
+dist/
+*.tsbuildinfo
+
+# runtime data (never commit user memory)
+*.ryugraph
+*.ryugraph.wal
+spike-data/
+.agentic-os/
+
+# logs & OS noise
+npm-debug.log*
+*.log
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
+
+# handoff artifacts (not source)
+agentic-os-handoff*.zip
