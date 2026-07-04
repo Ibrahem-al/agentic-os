@@ -120,7 +120,13 @@ export const CHUNK_OVERLAP_TOKENS = 64
 /**
  * RyuGraph pin. Spec §5 pins "≥ v0.11.3" in Kùzu-lineage numbering; RyuGraph
  * renumbered to CalVer after the fork — npm `ryugraph@25.9.1` is that lineage's
- * successor and ships vector + FTS (+ algo, json) statically linked, so no
- * extension binary is ever fetched at runtime (§21 rule 2).
+ * successor. Vector + FTS are NOT bundled in the npm build (phase-00 finding 2):
+ * the pinned binaries are vendored in resources/extensions/ and loaded by
+ * absolute path — never fetched at runtime (§21 rule 2).
  */
 export const RYUGRAPH_VERSION_PIN = '25.9.1'
+/**
+ * Vendored extension directory name under resources/extensions/. Matches the
+ * engine's compiled-in RYU_EXTENSION_VERSION (25.9.0 for ryugraph 25.9.1).
+ */
+export const RYU_EXTENSION_VERSION_DIR = 'v25.9.0'

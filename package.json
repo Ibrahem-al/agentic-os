@@ -13,8 +13,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run",
-    "rebuild:native": "electron-rebuild -f -w better-sqlite3 && node scripts/native/rebuild-ryugraph-electron.cjs",
-    "spike:ryugraph": "node scripts/spike/run-spike.cjs"
+    "rebuild:native": "node scripts/native/rebuild-native.cjs"
   },
   "dependencies": {
     "better-sqlite3": "12.11.1",

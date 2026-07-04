@@ -69,5 +69,6 @@ describe('config (spec §20 defaults)', () => {
     expect(config.SKILL_JOB_CRON).toBe('0 2 * * *')
     expect(config.EXPORT_JOB_CRON).toBe('30 3 * * 0')
     expect(config.RYUGRAPH_VERSION_PIN).toBe('25.9.1')
+    expect(config.RYU_EXTENSION_VERSION_DIR).toBe('v25.9.0')
   })
 })

@@ -1,56 +1,78 @@
 import { app, BrowserWindow, shell } from 'electron'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
-import { MCP_HOST, MCP_PORT, PRODUCT_NAME, RYUGRAPH_VERSION_PIN } from './config'
+import {
+  appDataPaths,
+  MCP_HOST,
+  MCP_PORT,
+  PRODUCT_NAME,
+  RYU_EXTENSION_VERSION_DIR,
+  RYUGRAPH_VERSION_PIN
+} from './config'
+import { openAppData, openRyuGraphEngine, type AppData } from './storage'
 
 // Native modules are CJS; load them through require so the bundler leaves them
 // external and Electron resolves them from node_modules at runtime.
 const require = createRequire(import.meta.url)
 
-/** Phase-00 proof: native-module pipeline works inside Electron main. */
-function logNativeModuleVersions(): void {
-  const betterSqlite3Pkg = require('better-sqlite3/package.json') as { version: string }
-  const BetterSqlite3 = require('better-sqlite3') as typeof import('better-sqlite3')
-  const probe = new BetterSqlite3(':memory:')
-  const row = probe.prepare('SELECT sqlite_version() AS v').get() as { v: string }
-  probe.close()
-  console.log(`[native] better-sqlite3 ${betterSqlite3Pkg.version} (SQLite ${row.v}) loaded in Electron main`)
+// Test/e2e hook: point the whole app at a scratch userData dir (also keeps
+// smoke tests away from real data). Must be set before app is ready.
+const userDataOverride = process.env['AGENTIC_OS_USER_DATA_DIR']
+if (userDataOverride) app.setPath('userData', userDataOverride)
 
+let engine: Awaited<ReturnType<typeof openRyuGraphEngine>> | null = null
+let appData: AppData | null = null
+
+/** Native-module pipeline sanity: versions logged from Electron main. */
+function logNativeModuleVersions(): void {
   const ortPkg = require('onnxruntime-node/package.json') as { version: string }
   const ort = require('onnxruntime-node') as { env?: { versions?: Record<string, string> } }
   const ortRuntimeVersion = ort.env?.versions?.['common'] ?? ortPkg.version
   console.log(`[native] onnxruntime-node ${ortPkg.version} (runtime ${ortRuntimeVersion}) loaded in Electron main`)
 }
 
-/** Phase-00 proof: RyuGraph binding + offline vector/FTS extensions in Electron main. */
-async function runRyugraphSpikeInMain(): Promise<void> {
-  // ryugraph's `exports` map hides package.json from require — read it directly.
+/**
+ * Phase-01 storage boot: appdata.db (SQLite, WAL) + the RyuGraph engine
+ * (backup-if-migrating → open → migrate), both under Electron userData.
+ */
+async function bootStorage(): Promise<void> {
   const { readFileSync, existsSync } = require('node:fs') as typeof import('node:fs')
+  // ryugraph's `exports` map hides package.json from require — read it directly.
   const ryuPkgPath = join(app.getAppPath(), 'node_modules', 'ryugraph', 'package.json')
   const ryuPkg = JSON.parse(readFileSync(ryuPkgPath, 'utf8')) as { version: string }
   if (ryuPkg.version !== RYUGRAPH_VERSION_PIN) {
-    console.warn(`[spike] ryugraph ${ryuPkg.version} does not match pin ${RYUGRAPH_VERSION_PIN}`)
+    console.warn(`[storage] ryugraph ${ryuPkg.version} does not match pin ${RYUGRAPH_VERSION_PIN}`)
   }
   // The npm prebuilt ryujs.node binds its imports to node.exe with no
   // delay-load hook, so require()-ing it inside electron.exe on Windows is an
   // uncatchable native crash. `npm run rebuild:native` replaces it with an
-  // Electron-targeted cmake-js build and stamps this marker; until then, skip.
+  // Electron-targeted build and stamps this marker; until then, skip.
   if (process.platform === 'win32') {
     const marker = join(app.getAppPath(), 'node_modules', 'ryugraph', '.electron-safe')
     if (!existsSync(marker)) {
       console.warn(
-        '[spike] ryugraph prebuilt is not Electron-safe on win32 — run `npm run rebuild:native`; skipping in-main spike'
+        '[storage] ryugraph prebuilt is not Electron-safe on win32 — run `npm run rebuild:native`; storage disabled this launch'
       )
       return
     }
   }
-  const spikePath = join(app.getAppPath(), 'scripts', 'spike', 'ryugraph-spike.cjs')
-  const { runRyugraphSpike } = require(spikePath) as {
-    runRyugraphSpike: (dbDir: string) => Promise<{ ok: boolean }>
-  }
-  const dbDir = join(app.getPath('userData'), 'spike-data')
-  await runRyugraphSpike(dbDir)
-  console.log(`[spike] ryugraph ${ryuPkg.version}: offline vector + FTS spike PASS in Electron main`)
+
+  const paths = appDataPaths(app.getPath('userData'))
+  appData = openAppData(paths.appDb)
+  console.log(`[storage] appdata.db open (WAL: traces, tasks, mcp_calls, staged_writes, spend) at ${appData.path}`)
+
+  engine = await openRyuGraphEngine({
+    graphDir: paths.graphDir,
+    backupsDir: paths.backupsDir,
+    extensionsDir: join(app.getAppPath(), 'resources', 'extensions', RYU_EXTENSION_VERSION_DIR)
+  })
+  const counts = await engine.cypher('MATCH (n) RETURN count(n) AS c')
+  const backupNote = engine.backupCreated ? `, pre-migration backup: ${engine.backupCreated}` : ''
+  console.log(
+    `[storage] ryugraph ${ryuPkg.version} open at ${paths.graphDir} — schema v${engine.schemaVersion}, ${Number(
+      counts[0]?.['c'] ?? 0
+    )} nodes, vector+FTS from vendored extensions${backupNote}`
+  )
 }
 
 function createWindow(): void {
@@ -86,9 +108,9 @@ void app.whenReady().then(async () => {
     console.error('[native] native-module load FAILED', err)
   }
   try {
-    await runRyugraphSpikeInMain()
+    await bootStorage()
   } catch (err) {
-    console.error('[spike] ryugraph spike FAILED in Electron main', err)
+    console.error('[storage] storage boot FAILED', err)
   }
 
   createWindow()
@@ -96,6 +118,26 @@ void app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
+})
+
+// Quit path: checkpoint + close connections, but keep the Database handle —
+// ryugraph 25.9.1 segfaults during native teardown after Database.close(),
+// which would turn every clean exit into a crash. WAL replay covers the rest.
+let quitting = false
+app.on('will-quit', (event) => {
+  if (quitting) return
+  quitting = true
+  appData?.close()
+  appData = null
+  if (engine) {
+    event.preventDefault()
+    const closing = engine
+    engine = null
+    void closing
+      .close({ skipDatabaseClose: true })
+      .catch((err) => console.error('[storage] close failed', err))
+      .finally(() => app.exit(0))
+  }
 })
 
 app.on('window-all-closed', () => {
