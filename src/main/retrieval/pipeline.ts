@@ -14,10 +14,11 @@ import {
   RETRIEVAL_BUNDLE_TOKEN_BUDGET,
   RETRIEVAL_BUNDLE_TOP_N,
   RETRIEVAL_FTS_TOP_K,
+  RETRIEVAL_FUSION_WEIGHTS,
   RETRIEVAL_RERANK_TOP_K,
   RETRIEVAL_VECTOR_TOP_K
 } from '../config'
-import { RETRIEVABLE_LABELS, type StorageEngine } from '../storage'
+import { RETRIEVABLE_LABELS, type NodeLabel, type StorageEngine } from '../storage'
 import { expandGraph } from './expand'
 import { candidateKey, fuseCandidates, mergeCandidate, type Candidate } from './fusion'
 import { fetchNodeTexts, isCandidateLabel, type CandidateLabel } from './render'
@@ -52,6 +53,53 @@ export function ftsQueryOf(query: string): string {
 }
 
 const ZERO_SIGNALS = { vector: 0, keyword: 0, graph: 0 } as const
+
+/** Lowercased word tokens, splitting paths and camelCase identifiers. */
+const lexTokens = (text: string): string[] =>
+  text.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().match(/[a-z0-9]+/g) ?? []
+
+/** Prefix-tolerant token match ("ingestion" ~ "ingest", both ≥ 4 chars). */
+const tokensMatch = (a: string, b: string): boolean =>
+  a === b || (a.length >= 4 && b.length >= 4 && (a.startsWith(b) || b.startsWith(a)))
+
+/**
+ * Admission order for the bounded rerank pool (phase-07 finding). Fused
+ * scores tie EXACTLY for expansion-only candidates — e.g. every component of
+ * a seed project sits at the same hop — and the plain fused sort breaks ties
+ * by id, which for content-hash ids makes pool membership effectively random
+ * once a graph has more candidates than pool slots. Ties are therefore
+ * re-broken by cheap lexical overlap between the query and each candidate's
+ * rendered text, so the cross-encoder receives the tied candidates that can
+ * actually score. Graphs that fit the pool (all offline fixtures) are
+ * untouched: everything is admitted regardless of order.
+ */
+export function rerankAdmissionOrder<C extends { label: NodeLabel; id: string; fusedScore: number }>(
+  fused: readonly C[],
+  textOf: (candidate: C) => string,
+  query: string
+): C[] {
+  const queryTokens = [...new Set(lexTokens(query))]
+  const overlap = new Map<C, number>()
+  for (const candidate of fused) {
+    const tokens = new Set(lexTokens(textOf(candidate)))
+    let matched = 0
+    for (const q of queryTokens) {
+      for (const t of tokens) {
+        if (tokensMatch(q, t)) {
+          matched += 1
+          break
+        }
+      }
+    }
+    overlap.set(candidate, matched)
+  }
+  return [...fused].sort(
+    (a, b) =>
+      b.fusedScore - a.fusedScore ||
+      (overlap.get(b) ?? 0) - (overlap.get(a) ?? 0) ||
+      candidateKey(a.label, a.id).localeCompare(candidateKey(b.label, b.id))
+  )
+}
 
 /** Run one full read-path pass for `query`. */
 export async function runReadPath(
@@ -116,7 +164,14 @@ export async function runReadPath(
   })
 
   // 6. Rerank the fused head once (cross-encoder logits, higher = better).
-  const rerankPool = fused.slice(0, RETRIEVAL_RERANK_TOP_K)
+  //    Pool admission is contended only when candidates exceed the pool —
+  //    then ties are broken by lexical overlap instead of by id (see
+  //    rerankAdmissionOrder; small graphs take the plain fused order).
+  const admissionOrder =
+    fused.length > RETRIEVAL_RERANK_TOP_K
+      ? rerankAdmissionOrder(fused, (c) => texts.get(candidateKey(c.label, c.id)) ?? '', query)
+      : fused
+  const rerankPool = admissionOrder.slice(0, RETRIEVAL_RERANK_TOP_K)
   const scores = await reranker.rerank(
     query,
     rerankPool.map((c) => texts.get(candidateKey(c.label, c.id)) as string)
@@ -124,10 +179,27 @@ export async function runReadPath(
   if (scores.length !== rerankPool.length) {
     throw new Error(`reranker returned ${scores.length} scores for ${rerankPool.length} docs`)
   }
+  // Final ordering (phase-07 finding): §2 promises THREE-way hybrid —
+  // semantic + structural + lexical, "fused, then reranked" — but the
+  // cross-encoder only reads text, so graph proximity is invisible to it,
+  // and its absolute logits carry a class bias (terse structural name-cards
+  // like "component x (function)" score ~4 logits below on-topic prose,
+  // measured live). The structural signal therefore rides THROUGH the final
+  // ordering: sigmoid-calibrated rerank score plus the §20 graph-proximity
+  // weight times the graph signal. Rerank order is preserved among
+  // candidates with equal structure; graphs whose pool is prose-only are
+  // unaffected (graph signal 0 adds nothing).
+  const sigmoid = (logit: number): number => 1 / (1 + Math.exp(-logit))
   const reranked = rerankPool
-    .map((c, i) => ({ candidate: c, rerankScore: scores[i] as number }))
+    .map((c, i) => ({
+      candidate: c,
+      rerankScore: scores[i] as number,
+      finalScore:
+        sigmoid(scores[i] as number) + RETRIEVAL_FUSION_WEIGHTS.graphProximity * c.signals.graph
+    }))
     .sort(
       (a, b) =>
+        b.finalScore - a.finalScore ||
         b.rerankScore - a.rerankScore ||
         b.candidate.fusedScore - a.candidate.fusedScore ||
         candidateKey(a.candidate.label, a.candidate.id).localeCompare(

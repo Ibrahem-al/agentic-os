@@ -83,7 +83,8 @@ export interface IngestContentOptions {
 
 const sha256Hex = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex')
 
-const tagSlug = (name: string): string =>
+/** Tag-id slug — shared with codebase ingestion so tag ids never drift. */
+export const tagSlug = (name: string): string =>
   name
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')

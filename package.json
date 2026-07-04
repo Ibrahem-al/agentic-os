@@ -27,8 +27,13 @@
     "@opentelemetry/resources": "2.9.0",
     "@opentelemetry/sdk-trace-base": "2.9.0",
     "better-sqlite3": "12.11.1",
+    "ignore": "7.0.5",
     "onnxruntime-node": "1.27.0",
     "ryugraph": "25.9.1",
+    "tree-sitter-javascript": "0.25.0",
+    "tree-sitter-python": "0.25.0",
+    "tree-sitter-typescript": "0.23.2",
+    "web-tree-sitter": "0.26.10",
     "zod": "4.4.3"
   },
   "devDependencies": {

@@ -1,0 +1,5 @@
+ignored.ts
+dist/
+*.log
+secret*.md
+!secretpublic.md

@@ -87,3 +87,35 @@ describe('fuseCandidates', () => {
     expect(fused.map((c) => c.id)).toEqual(['top', 'a', 'b'])
   })
 })
+
+describe('rerankAdmissionOrder (phase-07: tie-break by lexical overlap)', () => {
+  it('reorders equal fused scores by query overlap, keeping score order above ties', async () => {
+    const { rerankAdmissionOrder } = await import('../../src/main/retrieval')
+    const texts = new Map<string, string>([
+      ['strong-seed', 'unrelated seed text'],
+      ['cmp-zzz-relevant', 'component src/main/ingest/knowledge.ts:ingestKnowledgeContent (function)'],
+      ['cmp-aaa-noise', 'component src/renderer/App.tsx:App (function)'],
+      ['cmp-bbb-noise', 'component src/main/models/reranker.ts:Reranker (class)']
+    ])
+    const tied = 0.15
+    const ordered = rerankAdmissionOrder(
+      [
+        { label: 'Component', id: 'cmp-aaa-noise', fusedScore: tied },
+        { label: 'Component', id: 'cmp-bbb-noise', fusedScore: tied },
+        { label: 'Component', id: 'cmp-zzz-relevant', fusedScore: tied },
+        { label: 'Knowledge', id: 'strong-seed', fusedScore: 0.9 }
+      ],
+      (c) => texts.get(c.id) ?? '',
+      'how does ingestion work'
+    )
+    // The strong seed stays first; among the tied components, lexical overlap
+    // ("ingestion" ~ "ingest", camelCase-split) wins over the id order that
+    // would otherwise admit the aaa/bbb noise first.
+    expect(ordered.map((c) => c.id)).toEqual([
+      'strong-seed',
+      'cmp-zzz-relevant',
+      'cmp-aaa-noise',
+      'cmp-bbb-noise'
+    ])
+  })
+})

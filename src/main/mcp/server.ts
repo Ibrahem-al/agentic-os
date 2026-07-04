@@ -29,6 +29,7 @@ import {
   MCP_SERVER_NAME,
   MCP_SERVER_VERSION
 } from '../config'
+import type { ProjectSummarizer } from '../ingest'
 import type { ActionExecutor } from '../kernel'
 import type { RetrievalDeps, Retriever } from '../retrieval'
 import type { StorageEngine } from '../storage'
@@ -41,6 +42,8 @@ export interface AgenticOsMcpServerDeps {
   readonly engine: StorageEngine
   readonly retriever: Retriever
   readonly retrieval: RetrievalDeps
+  /** The shared LOCAL small LLM (ingest_codebase README summaries). */
+  readonly llm: ProjectSummarizer
   /** appdata.db — mcp_calls + staged_writes. */
   readonly db: BetterSqlite3.Database
   /** The kernel chokepoint (§9/§13); every tool call runs through it. */
@@ -275,6 +278,7 @@ export class AgenticOsMcpServer {
             engine: this.deps.engine,
             retriever: this.deps.retriever,
             retrieval: this.deps.retrieval,
+            llm: this.deps.llm,
             db: this.deps.db,
             sessionId
           }

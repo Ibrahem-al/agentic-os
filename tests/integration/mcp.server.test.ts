@@ -2,16 +2,16 @@
  * Phase-05 DoD: a real SDK client against the real Streamable HTTP server —
  * auth rejected without/with a wrong token; get_context returns a bundle from
  * the fixture graph; propose_correction lands in staged_writes with the graph
- * untouched; ingest_document ingests end-to-end (phase-06 DoD: content-hash
- * dedup + one lane job per ingest) while ingest_codebase still refuses
- * cleanly; EVERY tool call leaves an mcp_calls row (count-asserted) and a
- * kernel.mcp-call span; the client manager lists the server's tools through
- * the config file.
+ * untouched; ingest_document (phase 06) and ingest_codebase (phase 07) ingest
+ * end-to-end with content-hash dedup; EVERY tool call leaves an mcp_calls row
+ * (count-asserted) and a kernel.mcp-call span; the client manager lists the
+ * server's tools through the config file.
  *
- * Offline by construction: deterministic fakes for embedder/reranker/critic
- * (same fixtures as the retrieval golden tests); the HTTP hop is real.
+ * Offline by construction: deterministic fakes for embedder/reranker/critic/
+ * summarizer (same fixtures as the retrieval golden tests); the HTTP hop and
+ * the Tree-sitter WASM parsing are real.
  */
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -31,6 +31,11 @@ const passingCritic: SmallLlm = {
   generate: async () => ({ text: '{"score": 10, "missing": "none"}' })
 }
 
+/** Summarizer behind ingest_codebase's README → Project summary. */
+const fakeSummarizer: SmallLlm = {
+  generate: async () => ({ text: 'Kiosk fleet tooling that schedules device refreshes.' })
+}
+
 let store: TestStore
 let stack: KernelTestStack
 let retrieval: RetrievalDeps
@@ -38,7 +43,7 @@ let retriever: Retriever
 let server: AgenticOsMcpServer
 let serverUrl: string
 let writesAfterSeeding = 0
-/** Write-lane jobs legitimately performed by ingest_document calls (phase 06). */
+/** Write-lane jobs legitimately performed by the two ingest tools (phases 06/07). */
 let graphWriteJobsExpected = 0
 
 /** Tool calls made over MCP in this suite — the mcp_calls count must match. */
@@ -88,6 +93,7 @@ beforeAll(async () => {
     engine: store.engine,
     retriever,
     retrieval,
+    llm: fakeSummarizer,
     db: stack.appData.db,
     executor: stack.kernel,
     port: 0 // ephemeral test port
@@ -231,13 +237,6 @@ describe('the §12 tool surface', () => {
     expect(missing.body.error.code).toBe('NOT_FOUND')
   })
 
-  it('ingest_codebase stays registered but NOT_IMPLEMENTED (phase 07)', async () => {
-    const code = await call(client, 'ingest_codebase', { path: '/tmp/repo' })
-    expect(code.isError).toBe(true)
-    expect(code.body.error.code).toBe('NOT_IMPLEMENTED')
-    expect(code.body.error.message).toContain('phase 07')
-  })
-
   it('unknown tools come back as a clean structured error (and are still logged)', async () => {
     const reply = await call(client, 'delete_everything', {})
     expect(reply.isError).toBe(true)
@@ -367,6 +366,78 @@ describe('ingest_document over MCP end-to-end (phase-06 DoD)', () => {
   })
 })
 
+describe('ingest_codebase over MCP end-to-end (phase-07 DoD)', () => {
+  let repoDir: string
+
+  afterAll(() => {
+    rmSync(join(repoDir, '..'), { recursive: true, force: true })
+  })
+
+  beforeAll(() => {
+    // A tiny two-unit codebase with one import edge and a README (no
+    // docstrings → the only knowledge document is the README).
+    repoDir = join(mkdtempSync(join(tmpdir(), 'mcp-codebase-')), 'kiosk')
+    mkdirSync(join(repoDir, 'src'), { recursive: true })
+    writeFileSync(join(repoDir, 'README.md'), '# Kiosk tools\nSchedules kiosk device refreshes.\n', 'utf8')
+    writeFileSync(join(repoDir, 'src', 'refresh.ts'), 'export function refreshDevice(id: string) { return id }\n', 'utf8')
+    writeFileSync(
+      join(repoDir, 'src', 'fleet.ts'),
+      "import { refreshDevice } from './refresh'\nexport function refreshFleet(ids: string[]) { return ids.map(refreshDevice) }\n",
+      'utf8'
+    )
+  })
+
+  it('ingests a codebase folder: Project + Components + edge land in the graph', async () => {
+    const writesBefore = store.engine.lane.enqueuedCount
+    const reply = await call(client, 'ingest_codebase', { path: repoDir, project: 'kiosk tools' })
+    expect(reply.isError).toBe(false)
+    expect(reply.body.status).toBe('created')
+    expect(reply.body.projectName).toBe('kiosk tools')
+    expect(reply.body.components.created).toBe(2)
+    expect(reply.body.dependsOn.created).toBe(1)
+    // ONE component-diff lane job + ONE knowledge job (the README).
+    graphWriteJobsExpected += 2
+    expect(store.engine.lane.enqueuedCount).toBe(writesBefore + 2)
+
+    const components = await store.engine.cypher(
+      `MATCH (p:Project {id: $pid})-[:HAS_COMPONENT]->(c:Component) RETURN c.name AS name ORDER BY c.name`,
+      { pid: reply.body.projectId }
+    )
+    expect(components.map((r) => String(r['name']))).toEqual(['src/fleet.ts:refreshFleet', 'src/refresh.ts:refreshDevice'])
+    const edge = await store.engine.cypher(
+      'MATCH (a:Component)-[:DEPENDS_ON]->(b:Component) WHERE a.name = $a RETURN b.name AS to',
+      { a: 'src/fleet.ts:refreshFleet' }
+    )
+    expect(edge.map((r) => String(r['to']))).toEqual(['src/refresh.ts:refreshDevice'])
+  })
+
+  it('re-ingesting the unchanged codebase over MCP is a zero-write no-op', async () => {
+    const writesBefore = store.engine.lane.enqueuedCount
+    const reply = await call(client, 'ingest_codebase', { path: repoDir, project: 'kiosk tools' })
+    expect(reply.isError).toBe(false)
+    expect(reply.body.status).toBe('unchanged')
+    expect(store.engine.lane.enqueuedCount).toBe(writesBefore)
+  })
+
+  it('pointing at a file (not a folder) → clean INVALID_INPUT error', async () => {
+    const reply = await call(client, 'ingest_codebase', { path: join(repoDir, 'README.md') })
+    expect(reply.isError).toBe(true)
+    expect(reply.body.error.code).toBe('INVALID_INPUT')
+    expect(reply.body.error.message).toContain('folder')
+  })
+
+  it('its mcp_calls rows exist with statuses and hashes', () => {
+    const rows = stack.appData.db
+      .prepare("SELECT result_status, args_hash, params_json FROM mcp_calls WHERE tool = 'ingest_codebase' ORDER BY id")
+      .all() as { result_status: string; args_hash: string; params_json: string | null }[]
+    expect(rows.map((r) => r.result_status)).toEqual(['ok', 'ok', 'error'])
+    for (const row of rows) {
+      expect(row.args_hash).toMatch(/^sha256:[0-9a-f]{64}$/)
+      expect(row.params_json).toContain('path')
+    }
+  })
+})
+
 describe('the MCP client manager consumes this server (§12 client side)', () => {
   it('lists the seven tools through a config entry + keychain secret indirection', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'mcp-manager-'))
@@ -455,9 +526,9 @@ describe('call log + kernel mediation (the experience backbone, §6/§12)', () =
     expect(errorSpans).toHaveLength(errorCallsMade)
   })
 
-  it('graph writes came ONLY from ingest_document lane jobs (§21 rules 1+6)', () => {
+  it('graph writes came ONLY from ingest_document/ingest_codebase lane jobs (§21 rules 1+6)', () => {
     // propose_correction and every read tool wrote nothing; the sanctioned
-    // §18 ingestion path accounts for every lane job after seeding.
+    // §18 ingestion paths account for every lane job after seeding.
     expect(store.engine.lane.enqueuedCount).toBe(writesAfterSeeding + graphWriteJobsExpected)
   })
 })

@@ -159,6 +159,7 @@ async function bootMcp(): Promise<void> {
     engine,
     retriever,
     retrieval: retrievalDeps,
+    llm: ollama,
     db: appData.db,
     executor: kernelInstances.kernel
   })

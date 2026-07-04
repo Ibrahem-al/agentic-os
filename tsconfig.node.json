@@ -21,5 +21,8 @@
     "tests/unit/**/*.ts",
     "tests/integration/**/*.ts",
     "tests/fixtures/**/*.ts"
+  ],
+  "exclude": [
+    "tests/fixtures/mini-repo"
   ]
 }

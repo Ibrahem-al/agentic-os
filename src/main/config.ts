@@ -280,6 +280,34 @@ export const INGEST_INLINE_SOURCE_PREFIX = 'inline:'
 /** Watched-folder definitions (§7), in userData; live watching lands in phase 11. */
 export const WATCHED_FOLDERS_CONFIG_FILENAME = 'watched-folders.json'
 
+// ── Codebase ingestion (§18 write path, phase 07) ────────────────────────────
+/**
+ * Provenance stamp on Components + edges written by codebase ingestion
+ * (§18: `extracted_by = codebase-ingest@<version>`, deterministic parsing →
+ * confidence 1.0). The version tracks package.json's `version`.
+ */
+export const CODEBASE_INGEST_PROVENANCE = 'codebase-ingest@0.0.1'
+/**
+ * Values below are not in §20 — conservative rule-12 picks, recorded in the
+ * phase-07 report.
+ */
+/** Extensions parsed with Tree-sitter (§18: TS/JS/Python grammars in v1). */
+export const CODEBASE_CODE_EXTENSIONS: readonly string[] = [
+  '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.py'
+]
+/**
+ * Source prefix for per-file docstring documents extracted from code — kept
+ * distinct from the file's own path so a literal ingest of the same file (via
+ * ingest_document / watched folders) never collides with its docstring doc.
+ */
+export const CODEBASE_DOCS_SOURCE_PREFIX = 'code-docs:'
+/** Output cap (num_predict) for the README → Project summary small-LLM call. */
+export const CODEBASE_SUMMARY_MAX_TOKENS = 160
+/** README characters fed to the summary prompt (fits the 4096 local window). */
+export const CODEBASE_README_PROMPT_MAX_CHARS = 6000
+/** Fallback Project summary length when the local LLM is unavailable. */
+export const CODEBASE_SUMMARY_FALLBACK_MAX_CHARS = 400
+
 // ── Storage engine ───────────────────────────────────────────────────────────
 /**
  * RyuGraph pin. Spec §5 pins "≥ v0.11.3" in Kùzu-lineage numbering; RyuGraph

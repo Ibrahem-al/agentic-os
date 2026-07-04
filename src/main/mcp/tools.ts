@@ -12,9 +12,9 @@
  *
  * Write policy: propose_correction stages a `staged_writes` row (§21 rule 6 —
  * staged → validated → commit is Claude's ONLY path for correcting memory);
- * ingest_document runs the sanctioned §18 knowledge-ingestion write path
- * (every mutation through the single write lane); everything else is
- * read-only. ingest_codebase stays NOT_IMPLEMENTED until phase 07.
+ * ingest_document and ingest_codebase run the sanctioned §18 ingestion write
+ * paths (every mutation through the single write lane); everything else is
+ * read-only.
  */
 import { randomUUID } from 'node:crypto'
 import * as z from 'zod'
@@ -22,7 +22,7 @@ import type BetterSqlite3 from 'better-sqlite3'
 import { RETRIEVAL_RECENT_EXAMPLES, SEARCH_MEMORY_MAX_K } from '../config'
 import { NODE_LABELS, RETRIEVABLE_LABELS, type StorageEngine } from '../storage'
 import { searchMemory, type RetrievalDeps, type Retriever } from '../retrieval'
-import { IngestError, ingestDocument } from '../ingest'
+import { IngestError, ingestCodebase, ingestDocument, type ProjectSummarizer } from '../ingest'
 import { stableStringify } from './callLog'
 
 export type ToolErrorCode = 'INVALID_INPUT' | 'NOT_FOUND' | 'NOT_IMPLEMENTED'
@@ -43,6 +43,8 @@ export interface ToolContext {
   readonly engine: StorageEngine
   readonly retriever: Retriever
   readonly retrieval: RetrievalDeps
+  /** The shared LOCAL small LLM (README → Project summary in ingest_codebase). */
+  readonly llm: ProjectSummarizer
   /** appdata.db — staged_writes lives here (SQLite, not the graph). */
   readonly db: BetterSqlite3.Database
   /** MCP transport session id (also the §6 correlation key). */
@@ -293,12 +295,30 @@ async function ingestDocumentTool(args: unknown, ctx: ToolContext): Promise<unkn
   }
 }
 
-async function ingestCodebase(args: unknown, _ctx: ToolContext): Promise<unknown> {
-  parse(IngestCodebaseInput, args, 'ingest_codebase')
-  throw new ToolError(
-    'NOT_IMPLEMENTED',
-    'ingest_codebase is registered but not implemented yet (codebase ingestion arrives in phase 07) — nothing was ingested'
-  )
+/** Skip-list entries echoed in the reply (full list stays in the function result). */
+const INGEST_CODEBASE_SKIPPED_REPLY_CAP = 50
+
+async function ingestCodebaseTool(args: unknown, ctx: ToolContext): Promise<unknown> {
+  const input = parse(IngestCodebaseInput, args, 'ingest_codebase')
+  try {
+    // The phase-07 pipeline: gitignore walk → Tree-sitter units → Component
+    // diff in one write-lane job → README/markdown/docstrings through the
+    // phase-06 knowledge pipeline. Per-unit content hashes make re-ingests of
+    // unchanged code zero-write no-ops.
+    const result = await ingestCodebase(
+      { engine: ctx.engine, embedder: ctx.retrieval.embedder, llm: ctx.llm },
+      input.path,
+      input.project !== undefined ? { project: input.project } : {}
+    )
+    return {
+      ...result,
+      skipped: result.skipped.slice(0, INGEST_CODEBASE_SKIPPED_REPLY_CAP),
+      skippedTotal: result.skipped.length
+    }
+  } catch (err) {
+    if (err instanceof IngestError) throw new ToolError(err.code, err.message)
+    throw err
+  }
 }
 
 // ── The registry the server dispatches against ───────────────────────────────
@@ -353,8 +373,13 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: 'ingest_codebase',
-    description: 'Ingest a codebase into component memory. NOT IMPLEMENTED YET (phase 07).',
+    description:
+      'Ingest a codebase folder into component memory: gitignore-respecting walk, Tree-sitter parsing ' +
+      '(TypeScript/JavaScript/Python) into meaningful units (exported functions/classes, routes, data models) ' +
+      'as Component nodes with DEPENDS_ON edges, attached to a Project matched by path or created with a ' +
+      'README-derived summary. READMEs, markdown and docstrings become Knowledge chunks tagged to the Project. ' +
+      'Per-unit content hashes: re-ingesting unchanged code is a no-op.',
     inputSchema: jsonSchema(IngestCodebaseInput),
-    handle: ingestCodebase
+    handle: ingestCodebaseTool
   }
 ]

@@ -18,8 +18,13 @@ export class FakeEmbedder implements Embedder {
 }
 
 /**
- * Lexical-overlap cross-encoder stand-in: score = |query ∩ doc| / sqrt(|doc|),
- * higher = more relevant, mirroring the real reranker's "raw logit" contract.
+ * Lexical-overlap cross-encoder stand-in, SCALE-faithful to the real int8
+ * model's raw logits (phase-07): the real model puts irrelevant pairs deep
+ * below zero (≈ −8..−11, measured) and relevant ones in (−2, +8], and the
+ * read path's final ordering sigmoid-calibrates the logit — so the fake must
+ * spread the same way or offline bundles diverge from live ones. Relevance
+ * order is the same monotone |query ∩ doc| / sqrt(|doc|) as ever; only the
+ * scale is affine-mapped, so order-based assertions are unaffected.
  */
 export class FakeReranker implements RerankerLike {
   calls = 0
@@ -31,7 +36,8 @@ export class FakeReranker implements RerankerLike {
       const docTokens = new Set(tokenizeForFake(doc))
       let overlap = 0
       for (const token of docTokens) if (queryTokens.has(token)) overlap += 1
-      return overlap / Math.sqrt(docTokens.size + 1)
+      if (overlap === 0) return -8
+      return 6 * (overlap / Math.sqrt(docTokens.size + 1)) - 2
     })
   }
 }
