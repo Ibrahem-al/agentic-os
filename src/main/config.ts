@@ -247,6 +247,39 @@ export const SPEND_CEILING_USD_DEFAULT = 0.5
 export const CHUNK_TARGET_TOKENS = 512
 export const CHUNK_OVERLAP_TOKENS = 64
 
+// ── Knowledge ingestion (§18 write path, phase 06) ──────────────────────────
+/**
+ * Values below are not in §20 — conservative rule-12 picks, recorded in the
+ * phase-06 report.
+ */
+/** Extensions chunked with markdown structure awareness (headings + fences). */
+export const INGEST_MARKDOWN_EXTENSIONS: readonly string[] = ['.md', '.markdown', '.mdx']
+/** Plain-text / source extensions chunked on paragraph boundaries. */
+export const INGEST_TEXT_EXTENSIONS: readonly string[] = [
+  '.txt', '.text', '.rst', '.adoc', '.log', '.csv', '.tsv',
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json',
+  '.py', '.rb', '.go', '.rs', '.java', '.kt', '.swift',
+  '.c', '.h', '.cpp', '.hpp', '.cc', '.cs',
+  '.sh', '.bash', '.ps1', '.bat', '.sql',
+  '.css', '.scss', '.html', '.xml', '.svg',
+  '.yaml', '.yml', '.toml', '.ini', '.cfg', '.env.example'
+]
+/** Rich-document formats explicitly deferred (spec: "PDF etc. are deferred"). */
+export const INGEST_DEFERRED_EXTENSIONS: readonly string[] = [
+  '.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.odt', '.epub', '.rtf'
+]
+/**
+ * Max file size ingested as knowledge. Mirrors the §18 codebase-ingest rule
+ * ("skip files > 1 MB") — the only file-size figure the spec states.
+ */
+export const INGEST_MAX_FILE_BYTES = 1024 * 1024
+/** Provenance stamp on ingested Knowledge chunks (deterministic pipeline). */
+export const KNOWLEDGE_INGEST_PROVENANCE = 'knowledge-ingest@1.0'
+/** Source prefix for documents ingested as inline content (no file path). */
+export const INGEST_INLINE_SOURCE_PREFIX = 'inline:'
+/** Watched-folder definitions (§7), in userData; live watching lands in phase 11. */
+export const WATCHED_FOLDERS_CONFIG_FILENAME = 'watched-folders.json'
+
 // ── Storage engine ───────────────────────────────────────────────────────────
 /**
  * RyuGraph pin. Spec §5 pins "≥ v0.11.3" in Kùzu-lineage numbering; RyuGraph

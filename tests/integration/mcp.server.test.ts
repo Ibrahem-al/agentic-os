@@ -2,9 +2,11 @@
  * Phase-05 DoD: a real SDK client against the real Streamable HTTP server —
  * auth rejected without/with a wrong token; get_context returns a bundle from
  * the fixture graph; propose_correction lands in staged_writes with the graph
- * untouched; ingestion tools refuse cleanly; EVERY tool call leaves an
- * mcp_calls row (count-asserted) and a kernel.mcp-call span; the client
- * manager lists the server's tools through the config file.
+ * untouched; ingest_document ingests end-to-end (phase-06 DoD: content-hash
+ * dedup + one lane job per ingest) while ingest_codebase still refuses
+ * cleanly; EVERY tool call leaves an mcp_calls row (count-asserted) and a
+ * kernel.mcp-call span; the client manager lists the server's tools through
+ * the config file.
  *
  * Offline by construction: deterministic fakes for embedder/reranker/critic
  * (same fixtures as the retrieval golden tests); the HTTP hop is real.
@@ -36,6 +38,8 @@ let retriever: Retriever
 let server: AgenticOsMcpServer
 let serverUrl: string
 let writesAfterSeeding = 0
+/** Write-lane jobs legitimately performed by ingest_document calls (phase 06). */
+let graphWriteJobsExpected = 0
 
 /** Tool calls made over MCP in this suite — the mcp_calls count must match. */
 let callsMade = 0
@@ -227,11 +231,7 @@ describe('the §12 tool surface', () => {
     expect(missing.body.error.code).toBe('NOT_FOUND')
   })
 
-  it('ingest_document and ingest_codebase are registered but NOT_IMPLEMENTED', async () => {
-    const doc = await call(client, 'ingest_document', { path_or_content: '/tmp/notes.md' })
-    expect(doc.isError).toBe(true)
-    expect(doc.body.error.code).toBe('NOT_IMPLEMENTED')
-    expect(doc.body.error.message).toContain('phase 06')
+  it('ingest_codebase stays registered but NOT_IMPLEMENTED (phase 07)', async () => {
     const code = await call(client, 'ingest_codebase', { path: '/tmp/repo' })
     expect(code.isError).toBe(true)
     expect(code.body.error.code).toBe('NOT_IMPLEMENTED')
@@ -308,6 +308,62 @@ describe('propose_correction (§21 rule 6: staged, never a direct write)', () =>
     expect(reply.isError).toBe(true)
     expect(reply.body.error.code).toBe('INVALID_INPUT')
     expect(reply.body.error.message).toContain('id')
+  })
+})
+
+describe('ingest_document over MCP end-to-end (phase-06 DoD)', () => {
+  const NOTE = [
+    '# Rollout runbook',
+    'Blue green rollout for the kiosk fleet happens after the smoke checks pass.',
+    '',
+    '## Rollback',
+    'Rollback flips the traffic weight back to the previous kiosk release.'
+  ].join('\n')
+
+  it('ingests inline content: Document + chunks + tags land in the graph', async () => {
+    const writesBefore = store.engine.lane.enqueuedCount
+    const reply = await call(client, 'ingest_document', { path_or_content: NOTE, tags: ['kiosk'] })
+    expect(reply.isError).toBe(false)
+    expect(reply.body.status).toBe('created')
+    // Two headings → two chunks; each paragraph joins its heading's chunk.
+    expect(reply.body.chunkCount).toBe(2)
+    graphWriteJobsExpected += 1 // the whole ingest is ONE write-lane job
+    expect(store.engine.lane.enqueuedCount).toBe(writesBefore + 1)
+
+    const rows = await store.engine.cypher(
+      `MATCH (d:Document {id: $id})-[:HAS_CHUNK]->(k:Knowledge)-[:TAGGED]->(t:Tag)
+       RETURN k.content AS content, t.name AS tag ORDER BY k.id`,
+      { id: reply.body.documentId }
+    )
+    expect(rows).toHaveLength(reply.body.chunkCount)
+    expect(rows.every((r) => r['tag'] === 'kiosk')).toBe(true)
+    expect(String(rows[0]?.['content'])).toContain('# Rollout runbook')
+  })
+
+  it('identical re-add over MCP is a no-op (content-hash dedup, zero writes)', async () => {
+    const writesBefore = store.engine.lane.enqueuedCount
+    const reply = await call(client, 'ingest_document', { path_or_content: NOTE, tags: ['kiosk'] })
+    expect(reply.isError).toBe(false)
+    expect(reply.body.status).toBe('unchanged')
+    expect(store.engine.lane.enqueuedCount).toBe(writesBefore)
+  })
+
+  it('deferred formats come back as a clean INVALID_INPUT error (and are logged)', async () => {
+    const reply = await call(client, 'ingest_document', { path_or_content: 'C:\\docs\\quarterly.pdf' })
+    expect(reply.isError).toBe(true)
+    expect(reply.body.error.code).toBe('INVALID_INPUT')
+    expect(reply.body.error.message).toContain('deferred')
+  })
+
+  it('its mcp_calls rows exist: ok ingests + the error, hash always present', () => {
+    const rows = stack.appData.db
+      .prepare("SELECT result_status, args_hash, params_json FROM mcp_calls WHERE tool = 'ingest_document' ORDER BY id")
+      .all() as { result_status: string; args_hash: string; params_json: string | null }[]
+    expect(rows.map((r) => r.result_status)).toEqual(['ok', 'ok', 'error'])
+    for (const row of rows) {
+      expect(row.args_hash).toMatch(/^sha256:[0-9a-f]{64}$/)
+      expect(row.params_json).toContain('path_or_content')
+    }
   })
 })
 
@@ -399,8 +455,10 @@ describe('call log + kernel mediation (the experience backbone, §6/§12)', () =
     expect(errorSpans).toHaveLength(errorCallsMade)
   })
 
-  it('the whole suite performed ZERO graph writes (§21 rule 6)', () => {
-    expect(store.engine.lane.enqueuedCount).toBe(writesAfterSeeding)
+  it('graph writes came ONLY from ingest_document lane jobs (§21 rules 1+6)', () => {
+    // propose_correction and every read tool wrote nothing; the sanctioned
+    // §18 ingestion path accounts for every lane job after seeding.
+    expect(store.engine.lane.enqueuedCount).toBe(writesAfterSeeding + graphWriteJobsExpected)
   })
 })
 

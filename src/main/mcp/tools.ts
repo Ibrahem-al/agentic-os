@@ -10,10 +10,11 @@
  * throw into a clean structured MCP error result (§15: the orchestrator
  * decides whether to retry or adapt; no pause-and-notify).
  *
- * Write policy: nothing here mutates the graph. propose_correction stages a
- * `staged_writes` row (§21 rule 6 — staged → validated → commit is Claude's
- * ONLY write path); the ingestion tools are registered but NOT_IMPLEMENTED
- * until phases 06/07 fill them in.
+ * Write policy: propose_correction stages a `staged_writes` row (§21 rule 6 —
+ * staged → validated → commit is Claude's ONLY path for correcting memory);
+ * ingest_document runs the sanctioned §18 knowledge-ingestion write path
+ * (every mutation through the single write lane); everything else is
+ * read-only. ingest_codebase stays NOT_IMPLEMENTED until phase 07.
  */
 import { randomUUID } from 'node:crypto'
 import * as z from 'zod'
@@ -21,6 +22,7 @@ import type BetterSqlite3 from 'better-sqlite3'
 import { RETRIEVAL_RECENT_EXAMPLES, SEARCH_MEMORY_MAX_K } from '../config'
 import { NODE_LABELS, RETRIEVABLE_LABELS, type StorageEngine } from '../storage'
 import { searchMemory, type RetrievalDeps, type Retriever } from '../retrieval'
+import { IngestError, ingestDocument } from '../ingest'
 import { stableStringify } from './callLog'
 
 export type ToolErrorCode = 'INVALID_INPUT' | 'NOT_FOUND' | 'NOT_IMPLEMENTED'
@@ -275,12 +277,20 @@ async function proposeCorrection(args: unknown, ctx: ToolContext): Promise<unkno
   }
 }
 
-async function ingestDocument(args: unknown, _ctx: ToolContext): Promise<unknown> {
-  parse(IngestDocumentInput, args, 'ingest_document')
-  throw new ToolError(
-    'NOT_IMPLEMENTED',
-    'ingest_document is registered but not implemented yet (knowledge ingestion arrives in phase 06) — nothing was ingested'
-  )
+async function ingestDocumentTool(args: unknown, ctx: ToolContext): Promise<unknown> {
+  const input = parse(IngestDocumentInput, args, 'ingest_document')
+  try {
+    // The phase-06 pipeline: chunk → embed (the read path's embedder) → one
+    // write-lane job. Content-hash dedup means identical re-adds are no-ops.
+    return await ingestDocument(
+      { engine: ctx.engine, embedder: ctx.retrieval.embedder },
+      input.path_or_content,
+      input.tags ?? []
+    )
+  } catch (err) {
+    if (err instanceof IngestError) throw new ToolError(err.code, err.message)
+    throw err
+  }
 }
 
 async function ingestCodebase(args: unknown, _ctx: ToolContext): Promise<unknown> {
@@ -333,9 +343,13 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: 'ingest_document',
-    description: 'Ingest a document into knowledge memory. NOT IMPLEMENTED YET (phase 06).',
+    description:
+      'Ingest a document into knowledge memory: structure-aware chunking (headings/code fences, ~512 tokens), ' +
+      'local embeddings, content-hash dedup (identical re-adds are no-ops; changed documents replace their old chunks). ' +
+      'Pass an absolute file path (markdown/plain text/source; PDF is not supported) or the document content itself; ' +
+      'optional tags attach to every chunk.',
     inputSchema: jsonSchema(IngestDocumentInput),
-    handle: ingestDocument
+    handle: ingestDocumentTool
   },
   {
     name: 'ingest_codebase',
