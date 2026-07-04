@@ -128,9 +128,26 @@ export const RETRIEVAL_FUSION_WEIGHTS = {
   graphProximity: 0.3
 } as const
 export const RETRIEVAL_BUNDLE_TOP_N = 8
+/**
+ * Values below are not in §20 — conservative rule-12 picks, recorded in the
+ * phase-03 report.
+ */
+/** Fused candidates handed to the cross-encoder (bounds rerank latency). */
+export const RETRIEVAL_RERANK_TOP_K = 50
+/** Default context-bundle token budget (callers may override per call). */
+export const RETRIEVAL_BUNDLE_TOKEN_BUDGET = 8192
+/** Recent Examples pulled per skill during graph expansion (§18 read path). */
+export const RETRIEVAL_RECENT_EXAMPLES = 3
+/** Graph-proximity signal per hop from a seed hit: decay^hops (seed = 1.0). */
+export const RETRIEVAL_GRAPH_DECAY = 0.5
 
 /** Self-correcting loop: max 5 iterations; stop on non-improvement; critic = small local LLM vs. rubric. */
 export const LOOP_MAX_ITERATIONS = 5
+/** Normalized critic score (0..1) at/above which a bundle passes (rule 12). */
+export const RETRIEVAL_CRITIC_PASS_SCORE = 0.7
+/** Completion caps for the loop's local critic / query-rewrite calls (rule 12). */
+export const RETRIEVAL_CRITIC_MAX_TOKENS = 256
+export const RETRIEVAL_REWRITE_MAX_TOKENS = 128
 
 // ── Entity resolution ────────────────────────────────────────────────────────
 /** cosine ≥ 0.90 → merge; 0.75–0.90 → LLM tiebreak; < 0.75 → new node. */
