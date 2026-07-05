@@ -42,7 +42,13 @@ import {
 } from './security'
 import { createRetriever } from './retrieval'
 import { AgenticOsMcpServer, claudeMcpAddCommand, McpClientManager, writeSampleMcpJson } from './mcp'
-import { createExtractionAgent, type ExtractionAgent } from './agents'
+import {
+  createExtractionAgent,
+  createSkillImprovementAgent,
+  registerSkillImprovementHandler,
+  type ExtractionAgent,
+  type SkillImprovementAgent
+} from './agents'
 import { WatchedFolderStore } from './ingest'
 import {
   createSessionEndHookHandler,
@@ -88,6 +94,8 @@ let mcpClientManager: McpClientManager | null = null
 void mcpClientManager
 /** Extraction agent (phase 08) — the phase-11 session-end triggers call it. */
 let extractionAgent: ExtractionAgent | null = null
+/** Skill-improvement agent (phase 12) — the 02:00 slot + "improve now" drive it. */
+let skillImprovementAgent: SkillImprovementAgent | null = null
 /** Trigger runtime (phase 11): queue + schedules + watchers + session-end. */
 let triggerInstances: {
   queue: DurableTaskQueue
@@ -319,6 +327,26 @@ function bootAgents(): void {
       cloud ? settings.cloudProvider : 'not configured — low-confidence extractions stage for review'
     })`
   )
+  // Phase 12: the skill-improvement agent (§17 #4). Every version flip is an
+  // audited reversible delta, so the audit log is a hard dependency.
+  if (securityInstances !== null) {
+    skillImprovementAgent = createSkillImprovementAgent({
+      engine,
+      db: appData.db,
+      runner: kernelInstances.runner,
+      embedder: ollama,
+      llm: ollama,
+      cloud,
+      audit: securityInstances.audit
+    })
+    console.log(
+      `[agents] skill-improvement agent ready — 02:00 slot + "improve now" drive it (cloud tier: ${
+        cloud ? settings.cloudProvider : 'not configured — gated skills wait for an API key'
+      })`
+    )
+  } else {
+    console.warn('[agents] audit log unavailable — skill-improvement agent disabled this launch')
+  }
 }
 
 /**
@@ -346,6 +374,11 @@ async function bootTriggers(): Promise<void> {
     registerExtractionHandler(queue, { agent: extractionAgent, runner: kernelInstances.runner })
   } else {
     console.warn('[triggers] extraction agent unavailable — session-end tasks will defer to a later launch')
+  }
+  if (skillImprovementAgent !== null) {
+    registerSkillImprovementHandler(queue, { agent: skillImprovementAgent, runner: kernelInstances.runner })
+  } else {
+    console.warn('[triggers] skill-improvement agent unavailable — 02:00 slot tasks will defer to a later launch')
   }
   const folderStore = new WatchedFolderStore({ configPath: join(userDataDir, WATCHED_FOLDERS_CONFIG_FILENAME) })
   if (engine !== null) {
@@ -569,6 +602,7 @@ app.on('will-quit', (event) => {
       void telemetry?.shutdown().catch(() => undefined)
       telemetry = null
       extractionAgent = null
+      skillImprovementAgent = null
       kernelInstances = null
       securityInstances = null
       appData?.close()

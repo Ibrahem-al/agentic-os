@@ -2,7 +2,7 @@
  * Staged-writes lifecycle (§13, phase 09): propose → human-readable diff →
  * approve (commit via the single write lane, audited) / reject.
  *
- * Two proposers feed `staged_writes` (appdata.db):
+ * Three proposers feed `staged_writes` (appdata.db):
  *  - `propose_correction` (kind 'propose_correction', proposer
  *    `claude-mcp:<session>`): payload `{ patch, reason }` against an existing
  *    node — Claude's ONLY write path (§21 rule 6).
@@ -10,17 +10,33 @@
  *    `extraction-agent:<sessionNode>`): self-contained payload
  *    `{ op, node, embedOnCommit, edges, tagCreates, provenance, evidence,
  *    reason, session }` for items below the §17 write gate.
+ *  - the skill-improvement agent (kind 'skill-improvement', phase 12): a
+ *    stylistic skill's benchmarked candidate awaiting the §17 one-click human
+ *    approval. Approve = the audited adoption flip (candidate→active,
+ *    active→retired, Skill updated + re-embedded); reject = the row PLUS an
+ *    audited retire of the already-recorded candidate version (this kind's
+ *    candidate is a first-class graph record before review — recorded
+ *    deviation from the other kinds' "rejection touches nothing").
  *
  * Approval commits through ONE audited write-lane job (§21 rules 1 + 4 —
  * extraction payload edges carry their provenance stamps verbatim; the audit
  * row carries the reversible delta so a bad approval is undoable). Rejection
- * touches nothing but the row: no trace beyond the log.
+ * touches nothing but the row for correction/extraction kinds.
  *
  * Status flow: staged → approved (decision recorded) → committed (graph
  * updated). A commit failure leaves the row 'approved' with the error in
  * validation_json; calling approve() again retries the commit.
  */
 import type BetterSqlite3 from 'better-sqlite3'
+import {
+  SKILL_IMPROVEMENT_STAGED_KIND,
+  cleanupRejectedSkillImprovement,
+  commitSkillImprovementApproval,
+  decodeSkillImprovementPayload,
+  renderSkillImprovementDiff,
+  type SkillLifecycleDeps
+} from '../agents/skills/lifecycle'
+import { SkillImprovementError } from '../agents/skills/types'
 import { EDGE_TYPES, NODE_LABELS, type EdgeType, type NodeLabel, type StorageEngine } from '../storage'
 import type { AuditLog } from './audit'
 
@@ -181,6 +197,11 @@ export async function renderStagedWriteDiff(
     return lines.join('\n')
   }
 
+  if (row.kind === SKILL_IMPROVEMENT_STAGED_KIND) {
+    lines.push(renderSkillImprovementDiff(skillPayload(row)))
+    return lines.join('\n')
+  }
+
   lines.push(`(unknown kind — raw payload) ${JSON.stringify(row.payload)}`)
   return lines.join('\n')
 }
@@ -218,7 +239,9 @@ export async function approveStagedWrite(
         ? await commitCorrection(deps, row)
         : row.kind === 'extraction'
           ? await commitExtraction(deps, row)
-          : raise(new StagedWriteError('INVALID_PAYLOAD', `staged write ${id} has unknown kind '${row.kind}'`))
+          : row.kind === SKILL_IMPROVEMENT_STAGED_KIND
+            ? await commitSkillImprovement(deps, row, options.decidedBy)
+            : raise(new StagedWriteError('INVALID_PAYLOAD', `staged write ${id} has unknown kind '${row.kind}'`))
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     deps.db
@@ -246,11 +269,31 @@ export function rejectStagedWrite(
     throw new StagedWriteError('INVALID_STATE', `staged write ${id} is '${row.status}' — only staged rows can be rejected`)
   }
   // The ONLY effect of a rejection: the row's own status. The graph never
-  // hears about it — no trace beyond the log (§13; DoD-pinned).
+  // hears about it — no trace beyond the log (§13; DoD-pinned). (The
+  // skill-improvement kind additionally retires its recorded candidate —
+  // callers with graph access use rejectStagedWriteWithEffects.)
   db.prepare(
     `UPDATE staged_writes SET status = 'rejected', decided_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
      validation_json = ? WHERE id = ?`
   ).run(JSON.stringify({ decidedBy: options.decidedBy, ...(options.reason !== undefined ? { reason: options.reason } : {}) }), id)
+}
+
+/**
+ * Reject with kind-specific cleanup: correction/extraction rows behave
+ * exactly like rejectStagedWrite (graph untouched); a 'skill-improvement'
+ * row additionally retires its already-recorded candidate SkillVersion
+ * (audited) and records the ledger decision, so no orphaned 'candidate'
+ * version lingers in the graph.
+ */
+export async function rejectStagedWriteWithEffects(
+  deps: StagedWritesDeps,
+  id: string,
+  options: { decidedBy: string; reason?: string }
+): Promise<void> {
+  const row = requireRow(deps.db, id)
+  rejectStagedWrite(deps.db, id, options)
+  if (row.kind !== SKILL_IMPROVEMENT_STAGED_KIND) return
+  await cleanupRejectedSkillImprovement(skillLifecycleDeps(deps), skillPayload(row), options)
 }
 
 // ── committers (ONE audited lane job each) ───────────────────────────────────
@@ -328,6 +371,36 @@ async function commitExtraction(deps: StagedWritesDeps, row: StagedWriteRow): Pr
     }
   )
   return actionId
+}
+
+async function commitSkillImprovement(deps: StagedWritesDeps, row: StagedWriteRow, decidedBy: string): Promise<string> {
+  const payload = skillPayload(row)
+  try {
+    return await commitSkillImprovementApproval(skillLifecycleDeps(deps), payload, { decidedBy })
+  } catch (err) {
+    if (err instanceof SkillImprovementError) {
+      const code = err.code === 'NOT_FOUND' ? 'COMMIT_FAILED' : err.code === 'INVALID_INPUT' ? 'INVALID_PAYLOAD' : 'COMMIT_FAILED'
+      throw new StagedWriteError(code, err.message)
+    }
+    throw err
+  }
+}
+
+function skillLifecycleDeps(deps: StagedWritesDeps): SkillLifecycleDeps {
+  return {
+    engine: deps.engine,
+    db: deps.db,
+    audit: deps.audit,
+    ...(deps.embedder !== undefined ? { embedder: deps.embedder } : {})
+  }
+}
+
+function skillPayload(row: StagedWriteRow) {
+  try {
+    return decodeSkillImprovementPayload(row.payload, `staged write ${row.id}`)
+  } catch (err) {
+    throw new StagedWriteError('INVALID_PAYLOAD', err instanceof Error ? err.message : String(err))
+  }
 }
 
 // ── decode / validate helpers ─────────────────────────────────────────────────

@@ -65,6 +65,10 @@ export const statusColor: Readonly<Record<string, keyof typeof color>> = {
   active: 'ok',
   candidate: 'warn',
   retired: 'undo',
+  // skill improvement (phase 12)
+  adopted: 'ok',
+  'drift-flagged': 'warn',
+  'rolled-back': 'undo',
   // examples
   success: 'ok',
   failure: 'err'

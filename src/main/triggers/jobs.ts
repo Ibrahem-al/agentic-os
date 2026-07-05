@@ -8,8 +8,10 @@
  *    recorded), so it is undoable from the dashboard like any §13 action.
  *  - 'export' (§5 memory insurance): the phase-01 exportGraph dump into
  *    exports/<date>/ (CSV + Cypher + manifest).
- *  - 'skill-improvement': the 02:00 slot fires and completes as an explicit
- *    no-op until phase 12 replaces the handler body with the real agent.
+ *
+ * The 02:00 'skill-improvement' slot is handled by the REAL agent since
+ * phase 12 (registerSkillImprovementHandler in src/main/agents/skills) — the
+ * phase-11 no-op stub is gone.
  */
 import { TRANSCRIPT_RETENTION_DAYS } from '../config'
 import type { AuditLog } from '../security'
@@ -62,7 +64,7 @@ export async function runPruneJob(deps: MaintenanceJobDeps, now: Date = new Date
   return { pruned: ids, cutoffIso }
 }
 
-/** Register the three schedule-slot handlers on the queue. */
+/** Register the prune/export schedule-slot handlers on the queue. */
 export function registerMaintenanceHandlers(queue: DurableTaskQueue, deps: MaintenanceJobDeps): void {
   queue.registerHandler('prune', async () => {
     const result = await runPruneJob(deps)
@@ -79,11 +81,5 @@ export function registerMaintenanceHandlers(queue: DurableTaskQueue, deps: Maint
     const nodes = Object.values(result.nodeCounts).reduce((a, b) => a + b, 0)
     const rels = Object.values(result.relCounts).reduce((a, b) => a + b, 0)
     return { note: `graph exported to ${result.dir} (${nodes} nodes, ${rels} relationships)` }
-  })
-
-  queue.registerHandler('skill-improvement', () => {
-    // Phase 12 replaces this body with the real skill-improvement agent; the
-    // 02:00 slot, task rows and dashboard visibility are already real.
-    return Promise.resolve({ note: 'skill-improvement slot fired — no-op until phase 12' })
   })
 }

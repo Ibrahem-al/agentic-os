@@ -272,6 +272,45 @@ export interface SkillDetailDto {
   readonly corrections: readonly { readonly id: string; readonly content: string }[]
 }
 
+// ── skill improvement (§17 agent #4, phase 12) ────────────────────────────────
+
+export type SkillAdoptionModeDto = 'verifiable' | 'stylistic'
+
+export interface SkillImprovementSettingsDto {
+  /** verifiable = auto-adopt behind the no-regression gate; stylistic = review queue. */
+  readonly mode: SkillAdoptionModeDto
+  /** §20 drift watch: auto-revert on a worse-than-predecessor verdict (default off). */
+  readonly autoRevert: boolean
+  /** Event-gate cursor: corrections/examples after this are "new signal". */
+  readonly lastRunAt: string | null
+}
+
+export interface SkillImprovementEntryDto {
+  readonly id: string
+  readonly candidateVersionId: string
+  readonly predecessorVersionId: string | null
+  readonly mode: SkillAdoptionModeDto
+  readonly outcome: 'adopted' | 'rejected' | 'staged'
+  readonly reason: string | null
+  readonly createdAt: string
+  readonly adoptedAt: string | null
+  readonly rolledBackAt: string | null
+  readonly driftFlaggedAt: string | null
+  readonly driftResolvedAt: string | null
+  /** BenchmarkSummary JSON (held-out scores / A-B tallies / regressions / notes). */
+  readonly benchmark: JsonObject
+  readonly drift: JsonObject | null
+}
+
+export interface SkillImprovementDto {
+  readonly skillId: string
+  readonly settings: SkillImprovementSettingsDto
+  /** Ledger, newest first. */
+  readonly history: readonly SkillImprovementEntryDto[]
+  /** True when a standing adoption exists for rollbackSkill to undo. */
+  readonly canRollback: boolean
+}
+
 // ── ingestion ─────────────────────────────────────────────────────────────────
 
 export interface IngestDocumentResultDto {
@@ -440,6 +479,13 @@ export interface IpcChannels {
 
   'skills.list': { req: void; res: readonly SkillSummaryDto[] }
   'skills.detail': { req: { id: string }; res: SkillDetailDto }
+  'skills.improvement': { req: { skillId: string }; res: SkillImprovementDto }
+  'skills.improvementSettings': {
+    req: { skillId: string; mode: SkillAdoptionModeDto; autoRevert: boolean }
+    res: SkillImprovementDto
+  }
+  'skills.improveNow': { req: { skillId: string }; res: { taskId: string; deduped: boolean } }
+  'skills.rollback': { req: { skillId: string }; res: SkillImprovementDto }
 
   'ingest.pick': { req: { kind: 'file' | 'folder' }; res: { path: string | null } }
   'ingest.document': {

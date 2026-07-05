@@ -172,10 +172,47 @@ const APPDATA_SCHEMA: readonly string[] = [
     excerpt TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_injection_flags_source ON injection_flags(source)`
+  `CREATE INDEX IF NOT EXISTS idx_injection_flags_source ON injection_flags(source)`,
+  // Skill-improvement operational state (§17 agent #4, phase 12). The graph
+  // keeps the §18 ontology (Skill/SkillVersion/Correction/Example); the
+  // agent's run bookkeeping lives here like tasks/spend do:
+  //  - skill_settings: the §17 per-skill adoption setting (verifiable skills
+  //    may auto-adopt; stylistic — the default — always route to the review
+  //    queue), the §20 drift auto-revert toggle (off by default) and the
+  //    event-gate cursor (last_run_at: corrections/failure examples created
+  //    after it are "new signal").
+  //  - skill_improvements: one ledger row per candidate attempt — benchmark
+  //    detail, adoption/rollback timestamps, the predecessor snapshot rollback
+  //    restores, and the §20 drift-watch columns.
+  `CREATE TABLE IF NOT EXISTS skill_settings (
+    skill_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT 'stylistic' CHECK (mode IN ('verifiable','stylistic')),
+    auto_revert INTEGER NOT NULL DEFAULT 0,
+    last_run_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS skill_improvements (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL,
+    candidate_version_id TEXT NOT NULL,
+    predecessor_version_id TEXT,
+    predecessor_instructions TEXT,
+    mode TEXT NOT NULL CHECK (mode IN ('verifiable','stylistic')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('adopted','rejected','staged')),
+    benchmark_json TEXT NOT NULL,
+    reason TEXT,
+    job_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    adopted_at TEXT,
+    rolled_back_at TEXT,
+    drift_flagged_at TEXT,
+    drift_json TEXT,
+    drift_resolved_at TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_skill_improvements_skill ON skill_improvements(skill_id)`
 ]
 
-const APPDATA_USER_VERSION = 5
+const APPDATA_USER_VERSION = 6
 
 /**
  * Column additions to tables that predate them (CREATE IF NOT EXISTS skips an
@@ -270,7 +307,8 @@ export function openAppData(dbPath: string): AppData {
     // version in place (v1 → v2: workflow_checkpoint* tables, phase 04;
     // v2 → v3: mcp_calls.args_hash, phase 05; v3 → v4: approvals + audit_log +
     // injection_flags, phase 09; v4 → v5: tasks.priority +
-    // tasks.waiting_approval_id, phase 11).
+    // tasks.waiting_approval_id, phase 11; v5 → v6: skill_settings +
+    // skill_improvements, phase 12).
     db.pragma(`user_version = ${APPDATA_USER_VERSION}`)
   }
   return {

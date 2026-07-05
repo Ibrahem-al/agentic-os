@@ -6,11 +6,13 @@
  *    write — undoing it restores the pre-image (the §13 reversible-delta
  *    guarantee applies to the OS's own maintenance too);
  *  - 'export': the §5 weekly dump lands in exports/<date>/ with a manifest;
- *  - 'skill-improvement': the 02:00 slot completes as an explicit no-op
- *    until phase 12.
+ *  - 'skill-improvement': owned by the REAL phase-12 agent
+ *    (agents.skillimprove.test.ts); here we pin that a launch WITHOUT the
+ *    agent parks the slot's task as deferred instead of burning retries.
  *
- * All three run as queue tasks through registerMaintenanceHandlers — the
- * exact wiring the croner schedules enqueue into.
+ * The maintenance kinds run as queue tasks through
+ * registerMaintenanceHandlers — the exact wiring the croner schedules
+ * enqueue into.
  */
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -131,10 +133,13 @@ describe('weekly export + nightly skill slot', () => {
     expect(existsSync(join(dir, 'nodes_Session.csv'))).toBe(true)
   }, 60_000)
 
-  it('the skill-improvement slot completes as an explicit no-op (phase 12 fills it)', async () => {
+  it('the skill-improvement slot parks as deferred when the phase-12 agent did not boot', async () => {
+    // This queue registered only the maintenance handlers — the same shape as
+    // a launch where the skill agent is unavailable: the task defers for a
+    // launch that has it (never fails, never burns retries).
     queue.enqueue({ id: 'skill-run-1', kind: 'skill-improvement' })
     const settled = await waitForTask('skill-run-1')
-    expect(settled.status).toBe('done')
-    expect(settled.last_error).toBeNull()
+    expect(settled.status).toBe('deferred')
+    expect(settled.last_error).toContain("no handler registered for kind 'skill-improvement'")
   })
 })

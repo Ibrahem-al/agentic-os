@@ -1,7 +1,7 @@
 /**
- * Background agents barrel (§17). Phase 08 ships the extraction agent; the
- * skill-improvement agent (phase 12) will live beside it. Everything here
- * codes against the kernel/storage/model INTERFACES — no fenced SDK imports.
+ * Background agents barrel (§17). Phase 08 ships the extraction agent, phase
+ * 12 the skill-improvement agent. Everything here codes against the
+ * kernel/storage/model INTERFACES — no fenced SDK imports.
  */
 export {
   EXTRACTION_AGENT_ID,
@@ -59,3 +59,121 @@ export {
 } from './extraction/types'
 export { VERIFIER_SYSTEM_PROMPT, WRITE_GATE_CONFIDENCE, runVerification } from './extraction/verify'
 export { performGatedWrite, type GatedWriteOptions } from './extraction/write'
+
+// ── skill-improvement agent (phase 12) ───────────────────────────────────────
+export {
+  baselineSkillMdOf,
+  CLOUD_UNAVAILABLE_ERROR,
+  createSkillImprovementAgent,
+  SKILL_IMPROVEMENT_WORKFLOW,
+  type RunImprovementOptions,
+  type SkillImprovementAgent
+} from './skills/agent'
+export {
+  COMPARATOR_SYSTEM_PROMPT,
+  EXECUTOR_SYSTEM_MARKER,
+  executorSystemPrompt,
+  findRegressions,
+  GRADER_FORMAT,
+  GRADER_SYSTEM_PROMPT,
+  majorityPass,
+  parseComparatorReply,
+  parseGraderReply,
+  runBenchmark,
+  summarizeBenchmark,
+  type RunBenchmarkOptions
+} from './skills/benchmark'
+export {
+  buildRewritePrompt,
+  extractSkillMdReply,
+  generateCandidate,
+  REWRITE_SYSTEM_PROMPT,
+  type GenerateCandidateOptions
+} from './skills/candidate'
+export { planImprovementRun, type PlanOptions } from './skills/gate'
+export {
+  enqueueManualImprovement,
+  registerSkillImprovementHandler,
+  SKILL_IMPROVEMENT_TASK_KIND,
+  type SkillImprovementHandlerDeps
+} from './skills/handler'
+export {
+  adoptSkillVersion,
+  candidateVersionIdOf,
+  diffLines,
+  recordCandidateVersion,
+  renderSkillImprovementDiff,
+  retireCandidateVersion,
+  rollbackSkillAdoption,
+  SKILL_IMPROVEMENT_AGENT_ID,
+  SKILL_IMPROVEMENT_STAGED_KIND,
+  skillEmbedText,
+  stagedWriteIdOf,
+  stageSkillImprovement,
+  type AdoptResult,
+  type RollbackResult,
+  type SkillImprovementPayload,
+  type SkillLifecycleDeps
+} from './skills/lifecycle'
+export {
+  ensureSkillMd,
+  exportSkillMdFile,
+  importSkillMdFile,
+  looksLikeSkillMd,
+  parseSkillMd,
+  serializeSkillMd,
+  SkillMdError,
+  skillMdNameOf,
+  SKILL_MD_FILENAME,
+  type ParsedSkillMd
+} from './skills/skillmd'
+export {
+  getSkillSettings,
+  getImprovement,
+  latestStandingAdoption,
+  listImprovements,
+  listOpenDriftWatches,
+  markImprovementDecision,
+  markImprovementDrift,
+  markImprovementRolledBack,
+  markSkillRun,
+  recordImprovement,
+  setSkillSettings,
+  type ImprovementOutcome,
+  type ImprovementRow,
+  type SkillSettings
+} from './skills/state'
+export {
+  assignSplits,
+  buildCaseGenPrompt,
+  buildCorrectionCases,
+  buildTestSet,
+  CASE_GEN_SYSTEM_MARKER,
+  correctionCaseExpectation,
+  extractCaseArray
+} from './skills/testset'
+export {
+  SkillImprovementError,
+  type BenchmarkSummary,
+  type CaseRunResult,
+  type ComparisonResult,
+  type DriftApplied,
+  type DriftFinding,
+  type GradedExpectation,
+  type PlanState,
+  type ProcessedSkill,
+  type RegressionFinding,
+  type SkillAdoptionMode,
+  type SkillAgentDeps,
+  type SkillBenchmark,
+  type SkillCandidate,
+  type SkillCloud,
+  type SkillEmbedder,
+  type SkillImprovementResult,
+  type SkillImprovementRunResult,
+  type SkillLlm,
+  type SkillOutcome,
+  type SkillTestCase,
+  type SkillTestSet,
+  type SkillWorkItem
+} from './skills/types'

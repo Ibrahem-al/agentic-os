@@ -267,6 +267,41 @@ export const DRIFT_WATCH_USES = 20
 /** Auto-revert is off by default; worse-than-predecessor only flags. */
 export const DRIFT_AUTO_REVERT = false
 
+// ── Skill-improvement agent (§17 agent #4, phase 12) ─────────────────────────
+/**
+ * Provenance stamp on HAS_VERSION edges written by the improvement agent
+ * (Skill/SkillVersion carry no provenance columns per §18 — the edge carries
+ * it, the phase-07/08 convention). Version tracks package.json.
+ */
+export const SKILL_IMPROVEMENT_PROVENANCE = 'skill-improvement@0.0.1'
+/**
+ * Values below are not in §20 — conservative rule-12 picks, recorded in the
+ * phase-12 report. The benchmark methodology figures (3 runs per case per
+ * configuration, 0.4 held-out fraction, best-by-held-out) are reimplemented
+ * from the vendored skill-creator reference (docs/reference/skill-creator/),
+ * per the phase doc's "never guessed" mandate.
+ */
+/** Synthetic coverage cases the cloud brain pads the test set with ("a few"). */
+export const SKILL_SYNTHETIC_CASES = 3
+/** Cap on correction-derived regression cases per benchmark (cost bound). */
+export const SKILL_MAX_CORRECTION_CASES = 8
+/** Runs per case per configuration (skill-creator: runs_per_configuration 3). */
+export const SKILL_BENCHMARK_RUNS = 3
+/** Fraction of cases held out for scoring (skill-creator run_loop default). */
+export const SKILL_HOLDOUT_FRACTION = 0.4
+/** Skills processed per nightly run (wall-clock bound; the rest stay gated). */
+export const SKILL_IMPROVEMENT_MAX_PER_RUN = 5
+/** Output cap for the cloud synthetic-case call. */
+export const SKILL_CASE_GEN_MAX_TOKENS = 2000
+/** Output cap for the cloud SKILL.md rewrite (a whole skill file). */
+export const SKILL_REWRITE_MAX_TOKENS = 4096
+/** Output cap for one local case execution (the benchmarked output). */
+export const SKILL_GENERATION_MAX_TOKENS = 600
+/** Output cap for one local grader verdict ({passed, evidence}). */
+export const SKILL_GRADER_MAX_TOKENS = 200
+/** Output cap for one cloud blind-comparator verdict ({winner, reasoning}). */
+export const SKILL_COMPARATOR_MAX_TOKENS = 400
+
 // ── Background-job retry ─────────────────────────────────────────────────────
 /** 3 attempts, backoff 1 m / 5 m / 25 m, then defer to next run + flag. */
 export const JOB_RETRY_ATTEMPTS = 3
@@ -292,6 +327,8 @@ export const TASK_PRIORITY = {
   ruleAction: 20,
   extraction: 10,
   ingestFile: 10,
+  /** Manual "improve now" — user-initiated, routine-tier like extraction. */
+  skillImprove: 10,
   watchScan: 5,
   maintenance: 0
 } as const

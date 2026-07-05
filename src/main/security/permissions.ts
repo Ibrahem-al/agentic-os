@@ -322,6 +322,16 @@ export function registerInternalAgents(engine: PermissionEngine): void {
     capabilities: { ...EMPTY_CAPABILITIES, maxSpendUSD: SPEND_CEILING_USD_DEFAULT },
     gates: { write: 'allow', spend: 'allow' }
   })
+  // Skill improvement (§17 agent #4, phase 12): like extraction, its writes
+  // carry their own §13 machinery — the no-regression adoption gate, the
+  // stylistic path's review-queue staging, and every version flip lands as an
+  // audited reversible delta (rollback = the recorded inverse). Spend (test
+  // synthesis, candidate rewrite, blind comparison) is capped at the §20
+  // per-task ceiling the SpendMeter enforces per call.
+  engine.registerAgent('skill-improvement-agent', {
+    capabilities: { ...EMPTY_CAPABILITIES, maxSpendUSD: SPEND_CEILING_USD_DEFAULT },
+    gates: { write: 'allow', spend: 'allow' }
+  })
   // Live MCP sessions (§12 'mcp:<transport session id>'): the user drives
   // these through Claude interactively; §15 forbids pause-and-notify on live
   // tool calls, and the only correction path is staged (§21 rule 6). The

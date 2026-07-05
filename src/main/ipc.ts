@@ -39,6 +39,8 @@ import type {
   OllamaPullProgressDto,
   SettingsDto,
   SkillDetailDto,
+  SkillImprovementDto,
+  SkillImprovementEntryDto,
   SkillSummaryDto,
   SpendEntryDto,
   SpendSummaryDto,
@@ -85,10 +87,19 @@ import {
   approveStagedWrite,
   getStagedWrite,
   listStagedWrites,
-  rejectStagedWrite,
+  rejectStagedWriteWithEffects,
   renderStagedWriteDiff,
   type InjectionScanner
 } from './security'
+import {
+  SkillImprovementError,
+  enqueueManualImprovement,
+  getSkillSettings,
+  latestStandingAdoption,
+  listImprovements,
+  rollbackSkillAdoption,
+  setSkillSettings
+} from './agents'
 import {
   IngestError,
   WatchedFolderStore,
@@ -147,6 +158,7 @@ const errorCode = (err: unknown): IpcErrorCode => {
   if (err instanceof StagedWriteError) return err.code
   if (err instanceof UndoError) return err.code
   if (err instanceof IngestError) return err.code
+  if (err instanceof SkillImprovementError) return err.code
   if (err instanceof OllamaError) return 'OLLAMA_ERROR'
   if (err instanceof HookInstallError) return 'INVALID_STATE'
   return 'INTERNAL'
@@ -424,8 +436,19 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     return { id: result.id, auditActionId: result.auditActionId }
   })
 
-  register('review.staged.reject', ({ id, reason }) => {
-    rejectStagedWrite(need.db(), id, { decidedBy: DASHBOARD_USER, ...(reason !== undefined ? { reason } : {}) })
+  register('review.staged.reject', async ({ id, reason }) => {
+    // Kind-aware: skill-improvement rejections also retire the recorded
+    // candidate (audited); other kinds stay row-only (§13, phase 09).
+    await rejectStagedWriteWithEffects(
+      {
+        db: need.db(),
+        engine: need.engine(),
+        audit: need.audit(),
+        embedder: need.ollama()
+      },
+      id,
+      { decidedBy: DASHBOARD_USER, ...(reason !== undefined ? { reason } : {}) }
+    )
     return null
   })
 
@@ -847,6 +870,57 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       }))
     }
     return detail
+  })
+
+  // ── skill improvement (§17 agent #4, phase 12) ─────────────────────────────
+
+  const improvementDto = (skillId: string): SkillImprovementDto => {
+    const db = need.db()
+    const settings = getSkillSettings(db, skillId)
+    const history = listImprovements(db, skillId).map(
+      (row): SkillImprovementEntryDto => ({
+        id: row.id,
+        candidateVersionId: row.candidateVersionId,
+        predecessorVersionId: row.predecessorVersionId,
+        mode: row.mode,
+        outcome: row.outcome,
+        reason: row.reason,
+        createdAt: row.createdAt,
+        adoptedAt: row.adoptedAt,
+        rolledBackAt: row.rolledBackAt,
+        driftFlaggedAt: row.driftFlaggedAt,
+        driftResolvedAt: row.driftResolvedAt,
+        benchmark: jsonObject(row.benchmark),
+        drift: row.drift === null ? null : jsonObject(row.drift)
+      })
+    )
+    return {
+      skillId,
+      settings: { mode: settings.mode, autoRevert: settings.autoRevert, lastRunAt: settings.lastRunAt },
+      history,
+      canRollback: latestStandingAdoption(db, skillId) !== undefined
+    }
+  }
+
+  register('skills.improvement', ({ skillId }) => improvementDto(skillId))
+
+  register('skills.improvementSettings', ({ skillId, mode, autoRevert }) => {
+    setSkillSettings(need.db(), skillId, { mode, autoRevert })
+    return improvementDto(skillId)
+  })
+
+  register('skills.improveNow', ({ skillId }) => {
+    const queue = deps.triggers?.queue ?? raiseUnavailable('the trigger queue')
+    const result = enqueueManualImprovement(queue, skillId)
+    return { taskId: result.taskId, deduped: result.deduped }
+  })
+
+  register('skills.rollback', async ({ skillId }) => {
+    await rollbackSkillAdoption(
+      { engine: need.engine(), db: need.db(), audit: need.audit(), embedder: need.ollama() },
+      { skillId, decidedBy: DASHBOARD_USER }
+    )
+    return improvementDto(skillId)
   })
 
   // ── ingestion ──────────────────────────────────────────────────────────────

@@ -36,6 +36,7 @@ export {
   getStagedWrite,
   listStagedWrites,
   rejectStagedWrite,
+  rejectStagedWriteWithEffects,
   renderStagedWriteDiff,
   StagedWriteError,
   type ApproveResult,
