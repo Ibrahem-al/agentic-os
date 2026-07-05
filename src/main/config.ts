@@ -216,6 +216,32 @@ export const ENTITY_TIEBREAK_COSINE_LOW = 0.75
 export const EXTRACTION_ESCALATE_CONFIDENCE = 0.6
 /** …or above this transcript size (tokens). */
 export const EXTRACTION_ESCALATE_TRANSCRIPT_TOKENS = 60_000
+/**
+ * Provenance stamp for extraction-written nodes/edges (§18 "pipeline pass +
+ * extractor version", e.g. `extraction@0.0.1/llm-local`). The version tracks
+ * package.json; the pass suffix (`/deterministic`, `/llm-local`, `/llm-cloud`,
+ * `/llm-local+verified`) is appended by the agent per §18's example shape.
+ */
+export const EXTRACTION_PROVENANCE = 'extraction@0.0.1'
+/**
+ * Values below are not in §20 — conservative rule-12 picks, recorded in the
+ * phase-08 report. The per-item WRITE gate reuses
+ * EXTRACTION_ESCALATE_CONFIDENCE (0.6): §20 defines that figure as the "low
+ * confidence" line for extraction output, and the gated write is that line's
+ * per-item application (no second threshold invented).
+ */
+/** Estimated transcript tokens per LOCAL fuzzy-pass call (fits the 4096 num_ctx window with prompt + output). */
+export const EXTRACTION_LOCAL_CHUNK_TOKENS = 2048
+/** Estimated transcript tokens per CLOUD fuzzy-pass call (fits the 128k conservative provider floor). */
+export const EXTRACTION_CLOUD_CHUNK_TOKENS = 100_000
+/** Output cap (num_predict / max_tokens) for one fuzzy-pass reply. */
+export const EXTRACTION_PASS_MAX_TOKENS = 800
+/** Items kept per fuzzy pass per call (defensive cap on runaway JSON). */
+export const EXTRACTION_MAX_ITEMS_PER_PASS = 20
+/** Output cap for one cloud-verifier reply. */
+export const EXTRACTION_VERIFIER_MAX_TOKENS = 300
+/** Output cap for one entity-resolution tiebreak reply (YES/NO, narration-tolerant). */
+export const EXTRACTION_TIEBREAK_MAX_TOKENS = 64
 
 // ── Background jobs (cron expressions, local time) ───────────────────────────
 /** Nightly prune, 03:00 local. */

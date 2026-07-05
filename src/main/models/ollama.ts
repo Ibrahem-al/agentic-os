@@ -61,6 +61,13 @@ export interface GenerateOptions {
   maxTokens?: number
   temperature?: number
   stop?: string[]
+  /**
+   * Ollama structured outputs: 'json' or a JSON Schema object (constrained
+   * decoding). Load-bearing for extraction (phase-08 finding): qwen3:4b
+   * narrates through its whole output budget on plain prompts, but fills a
+   * constrained schema with correct content directly.
+   */
+  format?: 'json' | Record<string, unknown>
 }
 
 export interface GenerateResult {
@@ -179,6 +186,7 @@ export class OllamaClient {
       think: options.think ?? false
     }
     if (options.system !== undefined) payload['system'] = options.system
+    if (options.format !== undefined) payload['format'] = options.format
     const ollamaOptions: Record<string, unknown> = {}
     if (options.maxTokens !== undefined) ollamaOptions['num_predict'] = options.maxTokens
     if (options.temperature !== undefined) ollamaOptions['temperature'] = options.temperature

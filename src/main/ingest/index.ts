@@ -6,6 +6,7 @@
 export { chunkDocument, type ChunkFormat, type ChunkOptions, type DocumentChunk } from './chunker'
 export {
   ingestCodebase,
+  rootKeyOf,
   type CodebaseIngestDeps,
   type CodebaseIngestProgress,
   type IngestCodebaseOptions,
@@ -31,6 +32,7 @@ export {
   ingestKnowledgeContent,
   ingestKnowledgeFile,
   looksLikeFilePath,
+  tagSlug,
   type IngestContentOptions,
   type IngestDocumentResult,
   type IngestErrorCode,

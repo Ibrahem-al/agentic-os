@@ -108,8 +108,13 @@ const IDENTIFIER_RE = /^[A-Za-z_$][\w$]*$/
 
 // ── Identity (deterministic, path-derived — the "match by path" key) ─────────
 
-/** Case-normalized on win32 so the same folder always yields the same key. */
-function rootKeyOf(root: string): string {
+/**
+ * Case-normalized on win32 so the same folder always yields the same key.
+ * Exported for the extraction agent (phase 08): a session's cwd must derive
+ * the SAME `proj-<rootKey>` identity this pipeline uses, or "match by path"
+ * would split one repo into two Projects.
+ */
+export function rootKeyOf(root: string): string {
   const canonical = process.platform === 'win32' ? root.toLowerCase() : root
   return sha256Hex(canonical).slice(0, 16)
 }

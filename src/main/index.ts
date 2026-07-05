@@ -11,11 +11,22 @@ import {
   RYUGRAPH_VERSION_PIN
 } from './config'
 import { openAppData, openRyuGraphEngine, type AppData } from './storage'
-import { Keychain, keychainPath, loadModelSettings, OllamaClient, Reranker, settingsPath } from './models'
+import {
+  Keychain,
+  keychainPath,
+  loadModelSettings,
+  OllamaClient,
+  Reranker,
+  SpendMeter,
+  activeCloudModel,
+  createCloudBrain,
+  settingsPath
+} from './models'
 import { createTelemetry, type Telemetry } from './telemetry'
 import { ContextManager, Kernel, LangGraphRunner, createAuditLogStub } from './kernel'
 import { createRetriever } from './retrieval'
 import { AgenticOsMcpServer, claudeMcpAddCommand, McpClientManager, writeSampleMcpJson } from './mcp'
+import { createExtractionAgent, type ExtractionAgent } from './agents'
 
 // Native modules are CJS; load them through require so the bundler leaves them
 // external and Electron resolves them from node_modules at runtime.
@@ -38,6 +49,10 @@ let ollama: OllamaClient | null = null
 let mcpServer: AgenticOsMcpServer | null = null
 let mcpClientManager: McpClientManager | null = null
 void mcpClientManager
+/** Extraction agent (phase 08) — manual runExtraction(sessionId) until the
+ * phase-11 session-end triggers call it. */
+let extractionAgent: ExtractionAgent | null = null
+void extractionAgent
 
 /** Native-module pipeline sanity: versions logged from Electron main. */
 function logNativeModuleVersions(): void {
@@ -195,6 +210,42 @@ async function bootMcp(): Promise<void> {
   }
 }
 
+/**
+ * Phase-08 agents boot: the extraction agent's workflow registers on the
+ * kernel runner; `runExtraction(sessionId)` stays a MANUAL entry point until
+ * phase 11 wires the SessionEnd hook + inactivity fallback to it. The cloud
+ * tier (escalation + independent verification) activates only when the active
+ * provider has an API key in the keychain — without one, low-confidence
+ * extractions stage for human review instead.
+ */
+function bootAgents(): void {
+  if (appData === null || engine === null || kernelInstances === null || ollama === null) {
+    console.warn('[agents] storage/models/kernel unavailable — extraction agent disabled this launch')
+    return
+  }
+  const settings = loadModelSettings(settingsPath(app.getPath('userData')))
+  const apiKey = keychain?.getApiKey(settings.cloudProvider)
+  const cloud = apiKey
+    ? {
+        brain: createCloudBrain(settings.cloudProvider, { apiKey, model: activeCloudModel(settings) }),
+        meter: new SpendMeter({ db: appData.db })
+      }
+    : null
+  extractionAgent = createExtractionAgent({
+    engine,
+    db: appData.db,
+    runner: kernelInstances.runner,
+    embedder: ollama,
+    llm: ollama,
+    cloud
+  })
+  console.log(
+    `[agents] extraction agent ready — runExtraction(sessionId) is manual until phase 11 (cloud tier: ${
+      cloud ? settings.cloudProvider : 'not configured — low-confidence extractions stage for review'
+    })`
+  )
+}
+
 function createWindow(): void {
   const win = new BrowserWindow({
     width: 1200,
@@ -247,6 +298,11 @@ void app.whenReady().then(async () => {
   } catch (err) {
     console.error('[mcp] MCP boot FAILED', err)
   }
+  try {
+    bootAgents()
+  } catch (err) {
+    console.error('[agents] agents boot FAILED', err)
+  }
 
   createWindow()
 
@@ -272,6 +328,7 @@ app.on('will-quit', (event) => {
   // shutdown just stops accepting spans before the db handle closes.
   void telemetry?.shutdown().catch(() => undefined)
   telemetry = null
+  extractionAgent = null
   kernelInstances = null
   appData?.close()
   appData = null
