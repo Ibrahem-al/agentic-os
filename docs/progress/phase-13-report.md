@@ -112,7 +112,12 @@ CI                    the workflow's first green in project history. Iterated on
                           uploaded (145 MB win NSIS · 694 MB AppImage+deb · 707 MB dmg+zip
                           arm64+x64); the windows leg built ryugraph from source under MSVC
                           on the runner and cached it for future tags
-                      then squash-merged to main (this commit) and tagged v0.1.0.
+                      then squash-merged to main. The first main run went 5/6 green and
+                      caught one last slow-runner artifact (retrieval.latency's 48-node
+                      seeding beforeAll exceeded the 30s hook budget on the windows pool —
+                      setup headroom added, the latency assertion untouched); the follow-up
+                      main run 28738529128 is FULLY GREEN (test ×3 + e2e-linux + e2e-macos),
+                      and v0.1.0 is tagged on it (the tag run builds the release installers).
 ```
 
 ## Key decisions & findings (recorded)
