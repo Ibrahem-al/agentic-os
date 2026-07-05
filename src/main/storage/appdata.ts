@@ -48,6 +48,8 @@ const APPDATA_SCHEMA: readonly string[] = [
       CHECK (status IN ('pending','running','done','failed','deferred')),
     attempts INTEGER NOT NULL DEFAULT 0,
     not_before_unix_ms INTEGER,
+    priority INTEGER NOT NULL DEFAULT 0,
+    waiting_approval_id TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -173,7 +175,7 @@ const APPDATA_SCHEMA: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS idx_injection_flags_source ON injection_flags(source)`
 ]
 
-const APPDATA_USER_VERSION = 4
+const APPDATA_USER_VERSION = 5
 
 /**
  * Column additions to tables that predate them (CREATE IF NOT EXISTS skips an
@@ -181,9 +183,14 @@ const APPDATA_USER_VERSION = 4
  * the column is added only when pragma table_info says it is missing.
  * v3 (phase 05): mcp_calls.args_hash — the call log keeps a stable hash of
  * every tool call's arguments even when the args JSON is too large to store.
+ * v5 (phase 11): tasks.priority (the §8 queue mirror lists priority as a
+ * column) and tasks.waiting_approval_id (a task deferred behind a §13
+ * pending-approval row retries when the approval is decided).
  */
 const APPDATA_COLUMN_ADDITIONS: readonly { table: string; column: string; ddl: string }[] = [
-  { table: 'mcp_calls', column: 'args_hash', ddl: 'ALTER TABLE mcp_calls ADD COLUMN args_hash TEXT' }
+  { table: 'mcp_calls', column: 'args_hash', ddl: 'ALTER TABLE mcp_calls ADD COLUMN args_hash TEXT' },
+  { table: 'tasks', column: 'priority', ddl: 'ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0' },
+  { table: 'tasks', column: 'waiting_approval_id', ddl: 'ALTER TABLE tasks ADD COLUMN waiting_approval_id TEXT' }
 ]
 
 /** The binding that loaded successfully in this runtime (cached). */
@@ -262,7 +269,8 @@ export function openAppData(dbPath: string): AppData {
     // guarded ADD COLUMNs above), so applying the full list upgrades any older
     // version in place (v1 → v2: workflow_checkpoint* tables, phase 04;
     // v2 → v3: mcp_calls.args_hash, phase 05; v3 → v4: approvals + audit_log +
-    // injection_flags, phase 09).
+    // injection_flags, phase 09; v4 → v5: tasks.priority +
+    // tasks.waiting_approval_id, phase 11).
     db.pragma(`user_version = ${APPDATA_USER_VERSION}`)
   }
   return {

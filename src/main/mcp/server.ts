@@ -22,6 +22,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema, isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
 import type BetterSqlite3 from 'better-sqlite3'
 import {
+  HOOK_MAX_BODY_BYTES,
+  HOOK_SESSION_END_PATH,
   MCP_ENDPOINT_PATH,
   MCP_HOST,
   MCP_MAX_BODY_BYTES,
@@ -61,6 +63,18 @@ export interface AgenticOsMcpServerDeps {
 interface McpSession {
   readonly transport: StreamableHTTPServerTransport
   readonly server: Server
+}
+
+/**
+ * The §6/§20 session-end hook endpoint, mounted on this same HTTP server.
+ * Configured post-construction (the queue boots after the MCP server); until
+ * then POSTs get 503 and the hook script spools — no session lost to timing.
+ */
+export interface SessionEndHook {
+  /** The dedicated hook token (NOT the MCP bearer token — phase-11 decision). */
+  readonly token: string
+  /** Validate + enqueue; returns the HTTP status and JSON body to send. */
+  readonly handle: (body: unknown) => { status: number; body: unknown }
 }
 
 function unauthorized(res: ServerResponse): void {
@@ -109,10 +123,22 @@ export class AgenticOsMcpServer {
   private readonly callLog: McpCallLog
   private readonly sessions = new Map<string, McpSession>()
   private http: HttpServer | null = null
+  private sessionEndHook: SessionEndHook | null = null
+  private inflight = 0
 
   constructor(deps: AgenticOsMcpServerDeps) {
     this.deps = deps
     this.callLog = new McpCallLog(deps.db)
+  }
+
+  /** Arm the session-end hook endpoint (phase-11 boot, after the queue exists). */
+  setSessionEndHook(hook: SessionEndHook): void {
+    this.sessionEndHook = hook
+  }
+
+  /** Live tool calls in flight — the §8 queue yields while this is > 0. */
+  get inflightCalls(): number {
+    return this.inflight
   }
 
   /** The bound port (useful when constructed with port 0). */
@@ -163,6 +189,10 @@ export class AgenticOsMcpServer {
 
   private async handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+    if (url.pathname === HOOK_SESSION_END_PATH) {
+      await this.handleSessionEndPost(req, res)
+      return
+    }
     if (url.pathname !== MCP_ENDPOINT_PATH) {
       jsonRpcHttpError(res, 404, -32000, 'Not found — the MCP endpoint is ' + MCP_ENDPOINT_PATH)
       return
@@ -220,6 +250,45 @@ export class AgenticOsMcpServer {
     res.end()
   }
 
+  /**
+   * POST /hooks/session-end (§6 tier 1). Auth = the DEDICATED hook token
+   * (timing-safe); the §12 MCP surface stays behind its own bearer token.
+   * Anything but a valid authenticated POST answers with an error status —
+   * the hook script treats every non-2xx as "spool it".
+   */
+  private async handleSessionEndPost(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const respond = (status: number, body: unknown): void => {
+      res.writeHead(status, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(body))
+    }
+    if (req.method !== 'POST') {
+      res.writeHead(405, { Allow: 'POST' })
+      res.end()
+      return
+    }
+    const hook = this.sessionEndHook
+    if (hook === null) {
+      respond(503, { error: 'session-end triggers are not armed this launch — the hook script will spool' })
+      return
+    }
+    const auth = req.headers.authorization ?? ''
+    const token = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : ''
+    if (token === '' || !tokenMatches(token, hook.token)) {
+      unauthorized(res)
+      return
+    }
+    let body: unknown
+    try {
+      body = JSON.parse(await readBody(req, HOOK_MAX_BODY_BYTES))
+    } catch (err) {
+      const tooLarge = err instanceof Error && err.message === 'body too large'
+      respond(tooLarge ? 413 : 400, { error: tooLarge ? 'payload too large' : 'payload is not valid JSON' })
+      return
+    }
+    const result = hook.handle(body)
+    respond(result.status, result.body)
+  }
+
   private async createSession(): Promise<McpSession> {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
@@ -267,6 +336,7 @@ export class AgenticOsMcpServer {
     const t0 = performance.now()
     let resultStatus: 'ok' | 'error' = 'ok'
     let errorText: string | undefined
+    this.inflight += 1
     try {
       const result = await this.deps.executor.execute(
         `mcp:${sessionId}`,
@@ -306,6 +376,7 @@ export class AgenticOsMcpServer {
         isError: true
       }
     } finally {
+      this.inflight -= 1
       this.callLog.record({
         sessionId,
         tool: name,

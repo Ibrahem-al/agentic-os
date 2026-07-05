@@ -57,7 +57,10 @@ export async function launchSeededApp(prefix: string): Promise<LaunchedApp> {
     cwd: repoRoot,
     env: {
       ...process.env,
-      AGENTIC_OS_USER_DATA_DIR: userDataDir
+      AGENTIC_OS_USER_DATA_DIR: userDataDir,
+      // Phase 11: keep the trigger runtime hermetic too — the app under test
+      // must never drain the real ~/.agentic-os spool or load real rules.
+      AGENTIC_OS_DOT_DIR: join(userDataDir, 'dot-agentic-os')
     }
   })
   const page = await app.firstWindow()

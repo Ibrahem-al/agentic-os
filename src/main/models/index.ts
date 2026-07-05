@@ -42,6 +42,7 @@ export {
   KeychainError,
   KEYCHAIN_FILENAME,
   MCP_BEARER_TOKEN_SECRET,
+  SESSION_END_HOOK_TOKEN_SECRET,
   apiKeySecretName,
   keychainPath,
   type KnownSecretName,

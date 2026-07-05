@@ -20,6 +20,8 @@ export const MCP_TRANSPORT = 'streamable-http' as const
 /** Session-end hook endpoint (same server). */
 export const HOOK_SESSION_END_PATH = '/hooks/session-end'
 export const HOOK_SESSION_END_URL = `http://${MCP_HOST}:${MCP_PORT}${HOOK_SESSION_END_PATH}`
+/** Max bytes of a session-end hook POST body (payloads are tiny JSON; rule 12). */
+export const HOOK_MAX_BODY_BYTES = 256 * 1024
 /** 30 min of MCP silence per session id → session considered ended. */
 export const MCP_INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000
 /**
@@ -50,10 +52,16 @@ export const SEARCH_MEMORY_MAX_K = 30
 export const MCP_SERVERS_CONFIG_FILENAME = 'mcp-servers.json'
 
 // ── Filesystem layout ────────────────────────────────────────────────────────
+/**
+ * The ~/.agentic-os base (§20 spool + rules). AGENTIC_OS_DOT_DIR is the test
+ * seam (e2e/smoke runs must never drain the user's real spool or load their
+ * real rules) — the same hermeticity pattern as AGENTIC_OS_USER_DATA_DIR.
+ */
+const DOT_DIR = process.env['AGENTIC_OS_DOT_DIR'] ?? join(homedir(), '.agentic-os')
 /** Spool folder for pending (unprocessed) session transcripts. */
-export const SPOOL_DIR = join(homedir(), '.agentic-os', 'pending-sessions')
+export const SPOOL_DIR = join(DOT_DIR, 'pending-sessions')
 /** User rules folder. */
-export const RULES_DIR = join(homedir(), '.agentic-os', 'rules')
+export const RULES_DIR = join(DOT_DIR, 'rules')
 
 /** App-data subpaths, resolved against Electron's `userData` dir (spec §20 "App data"). */
 export function appDataPaths(userDataDir: string): {
@@ -263,6 +271,42 @@ export const DRIFT_AUTO_REVERT = false
 /** 3 attempts, backoff 1 m / 5 m / 25 m, then defer to next run + flag. */
 export const JOB_RETRY_ATTEMPTS = 3
 export const JOB_RETRY_BACKOFF_MS = [60_000, 300_000, 1_500_000] as const
+
+// ── Triggers & scheduler (§7/§8 — phase 11) ─────────────────────────────────
+/**
+ * Values below are not in §20 — conservative rule-12 picks, recorded in the
+ * phase-11 report.
+ */
+/** Waiting time that lifts a queued task's effective priority by +1 (§8 aging). */
+export const TASK_AGING_INTERVAL_MS = 5 * 60 * 1000
+/** Re-check cadence while background dispatch yields to a live MCP call (§8). */
+export const TASK_YIELD_RECHECK_MS = 1000
+/** Max total yield per dispatch — §8 aging: background must never starve. */
+export const TASK_YIELD_MAX_MS = 60_000
+/**
+ * Default enqueue priorities (higher runs first). User-authored rule actions
+ * are the most user-visible; extraction/ingest are routine; nightly
+ * maintenance is the least urgent.
+ */
+export const TASK_PRIORITY = {
+  ruleAction: 20,
+  extraction: 10,
+  ingestFile: 10,
+  watchScan: 5,
+  maintenance: 0
+} as const
+/** Cadence of the §6 MCP-log inactivity sweep (the 30-min figure is §20). */
+export const INACTIVITY_CHECK_INTERVAL_MS = 5 * 60 * 1000
+/** chokidar awaitWriteFinish stability window for watched files (§7). */
+export const WATCHER_DEBOUNCE_MS = 1000
+/** URL-watch poll bodies kept for hashing/conditions (bounded, §7 cheap detection). */
+export const WATCHER_URL_CONTENT_MAX_BYTES = 64 * 1024
+/** Floor on a url watcher's poll interval (a rule's intervalMin never polls hotter). */
+export const WATCHER_URL_MIN_INTERVAL_MS = 15_000
+/** Watcher baselines (file/url content hashes), in userData. */
+export const TRIGGER_STATE_FILENAME = 'trigger-state.json'
+/** Tag stamped on autonomously ingested documents (§13 source trust-tagging v1). */
+export const AUTO_INGEST_TRUST_TAG = 'auto-ingested'
 
 // ── Spend ────────────────────────────────────────────────────────────────────
 /** Per-task spend ceiling (USD); per-task override allowed; live total in dashboard. */

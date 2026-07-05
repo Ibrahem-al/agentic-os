@@ -1,7 +1,9 @@
 /**
- * Tasks & watchers panel (phase 10): background job queue (read-only view of
- * the durable task store) + watched-folder manager (spec §7 — definitions and
- * manual "scan now" only; automatic watching arrives with phase-11 triggers).
+ * Tasks & watchers panel (phase 10; triggers live since phase 11): the
+ * durable task queue (§8 mirror), the §20 schedules with next fires, loaded
+ * §17 rules (+ validation errors verbatim), and the watched-folder manager
+ * (§7 — folders now watch automatically; "scan now" stays as the manual
+ * trigger).
  */
 import { useState } from 'react'
 import { call, IpcError, useIpc } from '../lib/ipc'
@@ -11,6 +13,7 @@ import {
   Button,
   DataTable,
   ErrorState,
+  KV,
   LoadingRows,
   PanelHeader,
   SectionHeader,
@@ -53,6 +56,7 @@ const TASK_COLUMNS: readonly Column<TaskDto>[] = [
 export default function TasksPanel(): React.JSX.Element {
   const tasks = useIpc('tasks.list', undefined)
   const watchers = useIpc('watch.list', undefined)
+  const triggers = useIpc('triggers.status', undefined)
   const toast = useToast()
 
   const [scanningName, setScanningName] = useState<string | null>(null)
@@ -177,6 +181,68 @@ export default function TasksPanel(): React.JSX.Element {
       <PanelHeader title="tasks & watchers" />
       <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto px-5 py-4">
         <section>
+          <SectionHeader meta="queue, schedules and rules - live since phase 11">triggers</SectionHeader>
+          {triggers.error !== null ? (
+            <ErrorState error={triggers.error} onRetry={triggers.reload} />
+          ) : triggers.data === null ? (
+            <LoadingRows rows={2} />
+          ) : !triggers.data.available ? (
+            <div className="font-mono text-[11px] text-warn" data-testid="triggers-unavailable">
+              trigger runtime did not boot this launch - check the [triggers] boot log lines
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2" data-testid="triggers-status">
+              <KV
+                entries={[
+                  {
+                    k: 'queue',
+                    v:
+                      Object.entries(triggers.data.queue.counts)
+                        .map(([status, count]) => `${count} ${status}`)
+                        .join(' · ') || 'empty'
+                  },
+                  {
+                    k: 'running',
+                    v: <span className="font-mono">{triggers.data.queue.runningTaskId ?? '-'}</span>
+                  },
+                  {
+                    k: 'session-end hook',
+                    v:
+                      triggers.data.hook.installed === true
+                        ? 'installed'
+                        : triggers.data.hook.installed === false
+                          ? 'not installed (install it from settings)'
+                          : 'unknown - settings.json unreadable'
+                  }
+                ]}
+              />
+              <div className="font-mono text-[11px] text-ink-mute">
+                {triggers.data.schedules.map((schedule) => (
+                  <div key={schedule.name}>
+                    {schedule.name} ({schedule.cron}) - next{' '}
+                    {schedule.nextRunAt !== null ? <Timestamp iso={schedule.nextRunAt} /> : 'n/a'}
+                  </div>
+                ))}
+              </div>
+              {triggers.data.rules.length > 0 && (
+                <div className="font-mono text-[11px] text-ink-mute">
+                  {triggers.data.rules.map((rule) => (
+                    <div key={rule.id}>
+                      rule {rule.id}: {rule.trigger}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {triggers.data.ruleErrors.map((failure) => (
+                <div key={failure.file} className="font-mono text-[11px] text-err" title={failure.file}>
+                  invalid rule {truncate(failure.file, 60)}: {failure.error}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section>
           <SectionHeader meta="retries: 3 attempts, backoff 1m / 5m / 25m">background jobs</SectionHeader>
           {tasks.error !== null ? (
             <ErrorState error={tasks.error} onRetry={tasks.reload} />
@@ -194,7 +260,7 @@ export default function TasksPanel(): React.JSX.Element {
         </section>
 
         <section>
-          <SectionHeader meta="manual scan now - automatic watching arrives with triggers">
+          <SectionHeader meta="watched automatically while the app runs - scan now forces a pass">
             watched folders
           </SectionHeader>
           {watchers.error !== null ? (

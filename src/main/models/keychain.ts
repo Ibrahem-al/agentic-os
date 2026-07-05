@@ -27,9 +27,16 @@ export interface SafeStorageLike {
 }
 
 /** Well-known secret names (free-form names are also allowed). */
-export type KnownSecretName = `apiKey.${CloudProvider}` | 'mcp.bearerToken'
+export type KnownSecretName = `apiKey.${CloudProvider}` | 'mcp.bearerToken' | 'hooks.sessionEndToken'
 
 export const MCP_BEARER_TOKEN_SECRET = 'mcp.bearerToken'
+/**
+ * The session-end hook token (phase 11) — deliberately DISTINCT from the MCP
+ * bearer token: its only power is enqueuing extraction of a finished session,
+ * and the hook installer embeds it in the user's ~/.claude/settings.json
+ * command line, which must never expose the real MCP surface.
+ */
+export const SESSION_END_HOOK_TOKEN_SECRET = 'hooks.sessionEndToken'
 
 export function apiKeySecretName(provider: CloudProvider): KnownSecretName {
   return `apiKey.${provider}`
@@ -114,6 +121,15 @@ export class Keychain {
     if (existing) return existing
     const token = randomBytes(32).toString('base64url')
     this.setSecret(MCP_BEARER_TOKEN_SECRET, token)
+    return token
+  }
+
+  /** The session-end hook token (phase 11 triggers). Idempotent. */
+  ensureSessionEndHookToken(): string {
+    const existing = this.getSecret(SESSION_END_HOOK_TOKEN_SECRET)
+    if (existing) return existing
+    const token = randomBytes(32).toString('base64url')
+    this.setSecret(SESSION_END_HOOK_TOKEN_SECRET, token)
     return token
   }
 

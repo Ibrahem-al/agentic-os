@@ -29,6 +29,8 @@
     "@opentelemetry/resources": "2.9.0",
     "@opentelemetry/sdk-trace-base": "2.9.0",
     "better-sqlite3": "12.11.1",
+    "chokidar": "5.0.0",
+    "croner": "10.0.1",
     "ignore": "7.0.5",
     "onnxruntime-node": "1.27.0",
     "ryugraph": "25.9.1",

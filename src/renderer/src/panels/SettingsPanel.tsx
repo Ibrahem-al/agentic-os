@@ -4,7 +4,7 @@
  * Ollama model status/pulls, and the MCP connection details (§4, §14).
  */
 import { useEffect, useRef, useState } from 'react'
-import type { IpcCloudProvider, OllamaPullProgressDto, SettingsDto } from '../../../shared/ipc'
+import type { InstallHookResultDto, IpcCloudProvider, OllamaPullProgressDto, SettingsDto } from '../../../shared/ipc'
 import { call, IpcError, useIpc } from '../lib/ipc'
 import {
   Badge,
@@ -42,6 +42,24 @@ export default function SettingsPanel(): React.JSX.Element {
   const [pulling, setPulling] = useState<Record<string, boolean>>({})
 
   const [token, setToken] = useState<string | null>(null)
+
+  const hookStatus = useIpc('triggers.status', undefined)
+  const [installingHook, setInstallingHook] = useState(false)
+  const [hookResult, setHookResult] = useState<InstallHookResultDto | null>(null)
+
+  const installHook = async (): Promise<void> => {
+    setInstallingHook(true)
+    try {
+      const result = await call('triggers.installHook', undefined)
+      setHookResult(result)
+      toast.notify('ok', result.changed ? 'session-end hook installed' : 'hook already installed')
+      hookStatus.reload()
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setInstallingHook(false)
+    }
+  }
 
   /** Live pull subscriptions — severed when each pull ends and on unmount. */
   const unsubsRef = useRef<(() => void)[]>([])
@@ -335,6 +353,56 @@ export default function SettingsPanel(): React.JSX.Element {
             )}
             <div className="text-[11px] text-ink-faint">
               {'the token replaces <token> in the command. treat it like a password.'}
+            </div>
+          </div>
+        </section>
+
+        {/* ── session-end hook (phase 11) ──────────────────────────────────── */}
+        <section className="max-w-3xl border-t border-line pt-5">
+          <SectionHeader meta="claude code posts finished sessions to the extraction queue">
+            session-end hook
+          </SectionHeader>
+          <div className="flex flex-col gap-3">
+            <div className="text-[12px] text-ink-mute">
+              {hookStatus.data === null
+                ? 'checking ~/.claude/settings.json…'
+                : hookStatus.data.hook.installed === true
+                  ? 'installed - sessions extract automatically when they end'
+                  : hookStatus.data.hook.installed === false
+                    ? 'not installed - one click merges the hook into ~/.claude/settings.json (existing hooks are preserved; a backup is written)'
+                    : 'state unknown - settings.json could not be read'}
+            </div>
+            <div>
+              <Button
+                variant="primary"
+                testId="settings-install-hook"
+                disabled={installingHook}
+                onClick={() => void installHook()}
+              >
+                {installingHook
+                  ? 'installing…'
+                  : hookStatus.data?.hook.installed === true
+                    ? 'reinstall / repair hook'
+                    : 'install hook'}
+              </Button>
+            </div>
+            {hookResult !== null && (
+              <div className="flex flex-col gap-2" data-testid="hook-install-result">
+                <div className="text-[12px]">
+                  {hookResult.changed
+                    ? `settings updated${hookResult.backupPath !== null ? ` (backup: ${hookResult.backupPath})` : ''}`
+                    : 'already installed - nothing changed'}
+                </div>
+                {hookResult.diff !== '' && (
+                  <pre className="max-h-56 overflow-y-auto rounded-md bg-raised p-3 font-mono text-[11px] whitespace-pre-wrap">
+                    {hookResult.diff}
+                  </pre>
+                )}
+              </div>
+            )}
+            <div className="text-[11px] text-ink-faint">
+              if the app is closed when a session ends, the hook spools the session and it is picked up at the next
+              launch. the fallback for other mcp clients: 30 minutes of call-log silence.
             </div>
           </div>
         </section>

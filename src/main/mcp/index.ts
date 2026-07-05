@@ -10,5 +10,5 @@ export {
   sampleMcpJson,
   writeSampleMcpJson
 } from './connection'
-export { AgenticOsMcpServer, type AgenticOsMcpServerDeps } from './server'
+export { AgenticOsMcpServer, type AgenticOsMcpServerDeps, type SessionEndHook } from './server'
 export { MCP_TOOLS, ToolError, type McpToolDef, type ToolContext, type ToolErrorCode } from './tools'

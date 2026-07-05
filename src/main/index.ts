@@ -4,12 +4,17 @@ import { createRequire } from 'node:module'
 import {
   appDataPaths,
   DENO_VERSION,
+  HOOK_SESSION_END_URL,
   MCP_HOST,
   MCP_PORT,
   MCP_SERVERS_CONFIG_FILENAME,
   PRODUCT_NAME,
+  RULES_DIR,
   RYU_EXTENSION_VERSION_DIR,
-  RYUGRAPH_VERSION_PIN
+  RYUGRAPH_VERSION_PIN,
+  SPOOL_DIR,
+  TRIGGER_STATE_FILENAME,
+  WATCHED_FOLDERS_CONFIG_FILENAME
 } from './config'
 import { openAppData, openRyuGraphEngine, type AppData } from './storage'
 import {
@@ -28,7 +33,9 @@ import { ContextManager, Kernel, LangGraphRunner } from './kernel'
 import {
   AuditLog,
   createInjectionScanner,
+  DenoLane,
   detectDocker,
+  DockerLane,
   PermissionEngine,
   registerInternalAgents,
   type InjectionScanner
@@ -36,6 +43,22 @@ import {
 import { createRetriever } from './retrieval'
 import { AgenticOsMcpServer, claudeMcpAddCommand, McpClientManager, writeSampleMcpJson } from './mcp'
 import { createExtractionAgent, type ExtractionAgent } from './agents'
+import { WatchedFolderStore } from './ingest'
+import {
+  createSessionEndHookHandler,
+  drainSessionSpool,
+  DurableTaskQueue,
+  InactivityMonitor,
+  loadRules,
+  registerExtractionHandler,
+  registerIngestHandlers,
+  registerMaintenanceHandlers,
+  registerRuleActionHandler,
+  registerRuleAgents,
+  TriggerSchedules,
+  TriggerWatchers,
+  type RuleLoadResult
+} from './triggers'
 import { registerIpcHandlers } from './ipc'
 
 // Native modules are CJS; load them through require so the bundler leaves them
@@ -63,10 +86,16 @@ let reranker: Reranker | null = null
 let mcpServer: AgenticOsMcpServer | null = null
 let mcpClientManager: McpClientManager | null = null
 void mcpClientManager
-/** Extraction agent (phase 08) — manual runExtraction(sessionId) until the
- * phase-11 session-end triggers call it. */
+/** Extraction agent (phase 08) — the phase-11 session-end triggers call it. */
 let extractionAgent: ExtractionAgent | null = null
-void extractionAgent
+/** Trigger runtime (phase 11): queue + schedules + watchers + session-end. */
+let triggerInstances: {
+  queue: DurableTaskQueue
+  schedules: TriggerSchedules
+  watchers: TriggerWatchers
+  inactivity: InactivityMonitor
+  rules: RuleLoadResult
+} | null = null
 
 /** Native-module pipeline sanity: versions logged from Electron main. */
 function logNativeModuleVersions(): void {
@@ -256,9 +285,9 @@ async function bootMcp(): Promise<void> {
 
 /**
  * Phase-08 agents boot: the extraction agent's workflow registers on the
- * kernel runner; `runExtraction(sessionId)` stays a MANUAL entry point until
- * phase 11 wires the SessionEnd hook + inactivity fallback to it. The cloud
- * tier (escalation + independent verification) activates only when the active
+ * kernel runner; the phase-11 session-end triggers (hook endpoint + spool +
+ * inactivity fallback) drive `runExtraction(sessionId)`. The cloud tier
+ * (escalation + independent verification) activates only when the active
  * provider has an API key in the keychain — without one, low-confidence
  * extractions stage for human review instead.
  */
@@ -286,9 +315,102 @@ function bootAgents(): void {
     ...(securityInstances !== null ? { audit: securityInstances.audit } : {})
   })
   console.log(
-    `[agents] extraction agent ready — runExtraction(sessionId) is manual until phase 11 (cloud tier: ${
+    `[agents] extraction agent ready — the phase-11 session-end triggers drive it (cloud tier: ${
       cloud ? settings.cloudProvider : 'not configured — low-confidence extractions stage for review'
     })`
+  )
+}
+
+/**
+ * Phase-11 triggers boot: the system becomes autonomous. Durable queue over
+ * the §8 tasks mirror, §20 schedules, the §6 session-end chain (hook endpoint
+ * on the MCP server + spool drain + inactivity fallback → the phase-08
+ * extraction agent), watched-folder chokidar ingestion, and user rules
+ * (§17 #5) registered as §13 agents with no standing grants — their actions
+ * run in the phase-09 sandbox lanes only.
+ */
+async function bootTriggers(): Promise<void> {
+  if (appData === null || kernelInstances === null || securityInstances === null) {
+    console.warn('[triggers] storage/kernel unavailable — triggers disabled this launch')
+    return
+  }
+  const userDataDir = app.getPath('userData')
+  const paths = appDataPaths(userDataDir)
+  const queue = new DurableTaskQueue({
+    db: appData.db,
+    // §8: live MCP work is prioritized; background dispatch yields (capped).
+    shouldYield: () => (mcpServer?.inflightCalls ?? 0) > 0
+  })
+
+  if (extractionAgent !== null) {
+    registerExtractionHandler(queue, { agent: extractionAgent, runner: kernelInstances.runner })
+  } else {
+    console.warn('[triggers] extraction agent unavailable — session-end tasks will defer to a later launch')
+  }
+  const folderStore = new WatchedFolderStore({ configPath: join(userDataDir, WATCHED_FOLDERS_CONFIG_FILENAME) })
+  if (engine !== null) {
+    registerMaintenanceHandlers(queue, { engine, audit: securityInstances.audit, exportsDir: paths.exportsDir })
+    if (ollama !== null) {
+      registerIngestHandlers(queue, {
+        knowledge: {
+          engine,
+          embedder: ollama,
+          scanner: securityInstances.scanner,
+          audit: { log: securityInstances.audit, agentId: 'system' }
+        },
+        folderStore,
+        kernel: kernelInstances.kernel
+      })
+    }
+  }
+
+  // User rules (§17 shape, ~/.agentic-os/rules/*.rule.json) → §13 agents.
+  const rules = loadRules(RULES_DIR)
+  registerRuleAgents(securityInstances.permissions, rules.rules)
+  for (const failure of rules.errors) {
+    console.warn(`[triggers] invalid rule ${failure.file}: ${failure.error}`)
+  }
+  const docker = await detectDocker()
+  registerRuleActionHandler(queue, {
+    kernel: kernelInstances.kernel,
+    rules: () => new Map(rules.rules.map((rule) => [rule.id, rule])),
+    denoLane: new DenoLane({ binDir: join(userDataDir, 'bin') }),
+    dockerLane: docker.available ? new DockerLane() : null
+  })
+
+  // §6 tier 1: the hook endpoint (same HTTP server, dedicated token). While
+  // the app is down the hook script spools; drain that spool BEFORE start()
+  // so the reload pass picks the tasks up in one go.
+  if (mcpServer !== null && keychain !== null) {
+    mcpServer.setSessionEndHook({
+      token: keychain.ensureSessionEndHookToken(),
+      handle: createSessionEndHookHandler(queue)
+    })
+  }
+  const spool = drainSessionSpool(queue, SPOOL_DIR)
+
+  const { reloaded } = queue.start()
+  const schedules = new TriggerSchedules({ queue })
+  schedules.start()
+  // §6 tier 2: the 30-min mcp_calls inactivity fallback (any client).
+  const inactivity = new InactivityMonitor({ db: appData.db, queue })
+  inactivity.start()
+  const watchers = new TriggerWatchers({
+    queue,
+    kernel: kernelInstances.kernel,
+    rules: rules.rules,
+    folderStore,
+    stateFile: join(userDataDir, TRIGGER_STATE_FILENAME)
+  })
+  await watchers.start()
+  triggerInstances = { queue, schedules, watchers, inactivity, rules }
+
+  const status = watchers.status()
+  console.log(
+    `[triggers] durable queue ready — ${reloaded} task(s) reloaded, spool drained (${spool.enqueued} new, ${spool.deduped} dup, ${spool.malformed} bad); schedules armed (skill 02:00, prune 03:00, export Sun 03:30)`
+  )
+  console.log(
+    `[triggers] session-end: hook endpoint ${mcpServer !== null ? `armed at ${HOOK_SESSION_END_URL}` : 'NOT armed (MCP server down — spool only)'}; inactivity fallback 30 min; watchers: ${status.folders.length} folder(s), ${rules.rules.length} rule(s)${rules.errors.length > 0 ? ` (${rules.errors.length} invalid — see warnings)` : ''}`
   )
 }
 
@@ -314,6 +436,15 @@ function bootIpc(): void {
     reranker,
     keychain,
     mcpUrl: mcpServer?.url ?? null,
+    triggers:
+      triggerInstances !== null
+        ? {
+            queue: triggerInstances.queue,
+            schedules: triggerInstances.schedules,
+            watchers: triggerInstances.watchers,
+            ruleErrors: triggerInstances.rules.errors
+          }
+        : null,
     userDataDir,
     subsystems: {
       storage: engine !== null && appData !== null,
@@ -388,6 +519,11 @@ void app.whenReady().then(async () => {
     console.error('[agents] agents boot FAILED', err)
   }
   try {
+    await bootTriggers()
+  } catch (err) {
+    console.error('[triggers] triggers boot FAILED', err)
+  }
+  try {
     bootIpc()
   } catch (err) {
     console.error('[ipc] dashboard IPC boot FAILED', err)
@@ -407,30 +543,41 @@ let quitting = false
 app.on('will-quit', (event) => {
   if (quitting) return
   quitting = true
+  event.preventDefault()
   // MCP first: closeAllConnections() severs sockets synchronously, so no new
   // tool call can reach appdata.db after this line; the rest of stop() (SDK
   // session teardown) finishes in the background.
   void mcpServer?.stop().catch(() => undefined)
   mcpServer = null
   mcpClientManager = null
-  // Telemetry flushes synchronously (SimpleSpanProcessor + better-sqlite3);
-  // shutdown just stops accepting spans before the db handle closes.
-  void telemetry?.shutdown().catch(() => undefined)
-  telemetry = null
-  extractionAgent = null
-  kernelInstances = null
-  securityInstances = null
-  appData?.close()
-  appData = null
-  if (engine) {
-    event.preventDefault()
-    const closing = engine
-    engine = null
-    void closing
-      .close({ skipDatabaseClose: true })
-      .catch((err) => console.error('[storage] close failed', err))
-      .finally(() => app.exit(0))
-  }
+  // Triggers next (phase 11): schedules/watchers/inactivity stop taking new
+  // work synchronously; the queue's in-flight task gets a bounded grace
+  // window before the db handle closes — a task cut off here stays 'running'
+  // in the mirror and the next launch re-runs it (handlers are idempotent).
+  const triggers = triggerInstances
+  triggerInstances = null
+  triggers?.inactivity.stop()
+  triggers?.schedules.stop()
+  const stopping = Promise.all([
+    triggers?.queue.stop() ?? Promise.resolve(),
+    triggers?.watchers.stop().catch(() => undefined) ?? Promise.resolve()
+  ])
+  void stopping
+    .then(() => {
+      // Telemetry flushes synchronously (SimpleSpanProcessor + better-sqlite3);
+      // shutdown just stops accepting spans before the db handle closes.
+      void telemetry?.shutdown().catch(() => undefined)
+      telemetry = null
+      extractionAgent = null
+      kernelInstances = null
+      securityInstances = null
+      appData?.close()
+      appData = null
+      const closing = engine
+      engine = null
+      return closing?.close({ skipDatabaseClose: true }).catch((err) => console.error('[storage] close failed', err))
+    })
+    .finally(() => app.exit(0))
 })
 
 app.on('window-all-closed', () => {

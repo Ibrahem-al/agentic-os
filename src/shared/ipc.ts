@@ -351,6 +351,44 @@ export interface OllamaPullProgressDto {
   readonly error?: string
 }
 
+// ── triggers & automation (phase 11) ─────────────────────────────────────────
+
+export interface ScheduleStatusDto {
+  readonly name: string
+  readonly cron: string
+  readonly taskKind: string
+  readonly nextRunAt: string | null
+}
+
+export interface TriggersStatusDto {
+  /** false = the trigger runtime did not boot this launch. */
+  readonly available: boolean
+  readonly queue: {
+    readonly counts: Readonly<Record<string, number>>
+    readonly runningTaskId: string | null
+  }
+  readonly schedules: readonly ScheduleStatusDto[]
+  readonly watchedFolders: readonly { readonly name: string; readonly path: string }[]
+  readonly rules: readonly { readonly id: string; readonly trigger: string }[]
+  /** Rule files that failed §17 validation, with the exact reason. */
+  readonly ruleErrors: readonly { readonly file: string; readonly error: string }[]
+  readonly hook: {
+    readonly endpoint: string
+    readonly spoolDir: string
+    readonly settingsPath: string
+    /** null = settings.json unreadable; the installer will say more. */
+    readonly installed: boolean | null
+  }
+}
+
+export interface InstallHookResultDto {
+  readonly changed: boolean
+  readonly command: string
+  readonly settingsPath: string
+  readonly backupPath: string | null
+  readonly diff: string
+}
+
 // ── channel map ───────────────────────────────────────────────────────────────
 
 /**
@@ -412,6 +450,9 @@ export interface IpcChannels {
     req: { root: string; project?: string; runId: string }
     res: IngestCodebaseResultDto
   }
+
+  'triggers.status': { req: void; res: TriggersStatusDto }
+  'triggers.installHook': { req: void; res: InstallHookResultDto }
 
   'settings.get': { req: void; res: SettingsDto }
   'settings.save': { req: ModelSettingsPatchDto; res: SettingsDto }

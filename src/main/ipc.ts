@@ -13,6 +13,8 @@
  * this layer only relays it.
  */
 import { app, BrowserWindow, dialog, ipcMain, type IpcMainInvokeEvent } from 'electron'
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type BetterSqlite3 from 'better-sqlite3'
 import type {
@@ -50,7 +52,9 @@ import { IPC_EVENT_INGEST_PROGRESS, IPC_EVENT_OLLAMA_PULL, IPC_INVOKE_PREFIX, IP
 import {
   CLOUD_DEFAULT_MODELS,
   CLOUD_PROVIDERS,
+  HOOK_SESSION_END_URL,
   SPEND_CEILING_USD_DEFAULT,
+  SPOOL_DIR,
   WATCHED_FOLDERS_CONFIG_FILENAME,
   type CloudProvider
 } from './config'
@@ -95,6 +99,22 @@ import {
   type KnowledgeIngestDeps
 } from './ingest'
 import { claudeMcpAddCommand } from './mcp'
+import {
+  HookInstallError,
+  installSessionEndHook,
+  type DurableTaskQueue,
+  type RuleLoadError,
+  type TriggerSchedules,
+  type TriggerWatchers
+} from './triggers'
+
+/** The phase-11 trigger runtime the status/installer channels read. */
+export interface IpcTriggerDeps {
+  readonly queue: DurableTaskQueue
+  readonly schedules: TriggerSchedules
+  readonly watchers: TriggerWatchers
+  readonly ruleErrors: readonly RuleLoadError[]
+}
 
 /** Everything the dashboard reads/writes. Null = subsystem didn't boot. */
 export interface IpcDeps {
@@ -107,6 +127,7 @@ export interface IpcDeps {
   readonly reranker: Reranker | null
   readonly keychain: Keychain | null
   readonly mcpUrl: string | null
+  readonly triggers: IpcTriggerDeps | null
   readonly userDataDir: string
   readonly subsystems: AppStatusDto['subsystems']
 }
@@ -127,6 +148,7 @@ const errorCode = (err: unknown): IpcErrorCode => {
   if (err instanceof UndoError) return err.code
   if (err instanceof IngestError) return err.code
   if (err instanceof OllamaError) return 'OLLAMA_ERROR'
+  if (err instanceof HookInstallError) return 'INVALID_STATE'
   return 'INTERNAL'
 }
 
@@ -429,6 +451,8 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     const permissions = need.permissions()
     if (decision === 'approved') permissions.approve(id, DASHBOARD_USER)
     else permissions.deny(id, DASHBOARD_USER)
+    // Phase 11: tasks parked behind this approval retry (or fail) immediately.
+    deps.triggers?.queue.onApprovalDecided(id, decision)
     return null
   })
 
@@ -609,6 +633,66 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       ingested: result.ingested.map((r) => ({ file: r.file, status: r.status, chunkCount: r.chunkCount })),
       skipped: result.skipped.map((r) => ({ file: r.file, reason: r.reason })),
       failed: result.failed.map((r) => ({ file: r.file, error: r.error }))
+    }
+  })
+
+  // ── triggers & automation (phase 11) ───────────────────────────────────────
+
+  const claudeSettingsPath = join(homedir(), '.claude', 'settings.json')
+
+  register('triggers.status', () => {
+    let installed: boolean | null = null
+    try {
+      installed = readFileSync(claudeSettingsPath, 'utf8').includes('session-end.')
+    } catch (err) {
+      installed = (err as NodeJS.ErrnoException).code === 'ENOENT' ? false : null
+    }
+    const hook = {
+      endpoint: HOOK_SESSION_END_URL,
+      spoolDir: SPOOL_DIR,
+      settingsPath: claudeSettingsPath,
+      installed
+    }
+    const triggers = deps.triggers
+    if (triggers === null) {
+      return {
+        available: false,
+        queue: { counts: {}, runningTaskId: null },
+        schedules: [],
+        watchedFolders: [],
+        rules: [],
+        ruleErrors: [],
+        hook
+      }
+    }
+    const watcherStatus = triggers.watchers.status()
+    return {
+      available: true,
+      queue: { counts: triggers.queue.counts(), runningTaskId: triggers.queue.runningTaskId },
+      schedules: triggers.schedules.status(),
+      watchedFolders: watcherStatus.folders,
+      rules: watcherStatus.rules,
+      ruleErrors: triggers.ruleErrors.map((e) => ({ file: e.file, error: e.error })),
+      hook
+    }
+  })
+
+  register('triggers.installHook', () => {
+    const keychain = need.keychain()
+    const token = keychain.ensureSessionEndHookToken()
+    const result = installSessionEndHook({
+      token,
+      scriptsDir: join(app.getAppPath(), 'scripts', 'hooks')
+    })
+    // §21 rule 7 discipline: the token lives in settings.json (the recorded
+    // phase-11 placement) but never renders in the dashboard.
+    const redact = (text: string): string => text.replaceAll(token, '<hook-token>')
+    return {
+      changed: result.changed,
+      command: redact(result.command),
+      settingsPath: result.settingsPath,
+      backupPath: result.backupPath,
+      diff: redact(result.diff)
     }
   })
 
