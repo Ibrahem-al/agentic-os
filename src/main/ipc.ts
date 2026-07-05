@@ -705,7 +705,11 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     const token = keychain.ensureSessionEndHookToken()
     const result = installSessionEndHook({
       token,
-      scriptsDir: join(app.getAppPath(), 'scripts', 'hooks')
+      // Packaged builds ship the hook scripts as extraResources — an external
+      // shell must execute them, so they cannot live inside asar (phase 13).
+      scriptsDir: app.isPackaged
+        ? join(process.resourcesPath, 'hooks')
+        : join(app.getAppPath(), 'scripts', 'hooks')
     })
     // §21 rule 7 discipline: the token lives in settings.json (the recorded
     // phase-11 placement) but never renders in the dashboard.
@@ -903,6 +907,19 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   }
 
   register('skills.improvement', ({ skillId }) => improvementDto(skillId))
+
+  // Rail-level drift visibility (phase-13 polish): open flags = drift detected
+  // by the §20 nightly watch, not yet cleared, reverted, or rolled back.
+  register('skills.driftSummary', () => {
+    const row = need
+      .db()
+      .prepare(
+        `SELECT count(*) AS flagged FROM skill_improvements
+         WHERE drift_flagged_at IS NOT NULL AND drift_resolved_at IS NULL AND rolled_back_at IS NULL`
+      )
+      .get() as { flagged: number }
+    return { flagged: row.flagged }
+  })
 
   register('skills.improvementSettings', ({ skillId, mode, autoRevert }) => {
     setSkillSettings(need.db(), skillId, { mode, autoRevert })

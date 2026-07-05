@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import {
   appDataPaths,
+  CLOUD_BASE_URL_OVERRIDE,
   DENO_VERSION,
   HOOK_SESSION_END_URL,
   MCP_HOST,
@@ -29,7 +30,7 @@ import {
   settingsPath
 } from './models'
 import { createTelemetry, type Telemetry } from './telemetry'
-import { ContextManager, Kernel, LangGraphRunner } from './kernel'
+import { ContextManager, createInflightYield, Kernel, LangGraphRunner } from './kernel'
 import {
   AuditLog,
   createInjectionScanner,
@@ -66,6 +67,7 @@ import {
   type RuleLoadResult
 } from './triggers'
 import { registerIpcHandlers } from './ipc'
+import { bootUpdater } from './updater'
 
 // Native modules are CJS; load them through require so the bundler leaves them
 // external and Electron resolves them from node_modules at runtime.
@@ -75,6 +77,15 @@ const require = createRequire(import.meta.url)
 // smoke tests away from real data). Must be set before app is ready.
 const userDataOverride = process.env['AGENTIC_OS_USER_DATA_DIR']
 if (userDataOverride) app.setPath('userData', userDataOverride)
+// CI seam (linux only, recorded rule-12): headless runners have no keyring,
+// so Chromium's os_crypt falls back in ways that can leave safeStorage
+// unavailable and the keychain (bearer/hook tokens) dead. Setting
+// AGENTIC_OS_LINUX_PASSWORD_STORE=basic pins the basic_text backend so the
+// golden-path e2e can boot the real keychain on a runner. Never set in
+// production; secrets there ride the OS keyring per §21 rule 7.
+if (process.platform === 'linux' && process.env['AGENTIC_OS_LINUX_PASSWORD_STORE']) {
+  app.commandLine.appendSwitch('password-store', process.env['AGENTIC_OS_LINUX_PASSWORD_STORE'])
+}
 
 let engine: Awaited<ReturnType<typeof openRyuGraphEngine>> | null = null
 let appData: AppData | null = null
@@ -105,6 +116,30 @@ let triggerInstances: {
   rules: RuleLoadResult
 } | null = null
 
+/**
+ * Phase-13 test seam (rule 12, recorded): AGENTIC_OS_RERANKER_FILES points at
+ * a JSON file matching RerankerOptions['files'] ({model, tokenizer,
+ * tokenizerConfig} PinnedFile descriptors). The golden-path e2e/CI passes a
+ * tiny valid ONNX fixture (with ITS real sha256) so the production retrieval
+ * path runs the REAL onnxruntime session without the 570 MB download. Unset
+ * in normal operation.
+ */
+function rerankerFilesOverride(): { files: NonNullable<ConstructorParameters<typeof Reranker>[0]['files']> } | Record<string, never> {
+  const path = process.env['AGENTIC_OS_RERANKER_FILES']
+  if (!path) return {}
+  const { readFileSync } = require('node:fs') as typeof import('node:fs')
+  try {
+    const files = JSON.parse(readFileSync(path, 'utf8')) as NonNullable<
+      ConstructorParameters<typeof Reranker>[0]['files']
+    >
+    console.log(`[models] reranker file pins overridden from ${path} (test seam)`)
+    return { files }
+  } catch (err) {
+    console.warn(`[models] AGENTIC_OS_RERANKER_FILES unreadable (${String(err)}) — using pinned defaults`)
+    return {}
+  }
+}
+
 /** Native-module pipeline sanity: versions logged from Electron main. */
 function logNativeModuleVersions(): void {
   const ortPkg = require('onnxruntime-node/package.json') as { version: string }
@@ -131,7 +166,10 @@ async function bootStorage(): Promise<void> {
   // Electron-targeted build and stamps this marker; until then, skip.
   if (process.platform === 'win32') {
     const marker = join(app.getAppPath(), 'node_modules', 'ryugraph', '.electron-safe')
-    if (!existsSync(marker)) {
+    // Packaged builds are gated at PACK time instead (scripts/build/
+    // before-pack.cjs refuses to pack without the rebuilt binary), so a
+    // missing marker inside the archive is a packaging bug, not a user error.
+    if (!existsSync(marker) && !app.isPackaged) {
       console.warn(
         '[storage] ryugraph prebuilt is not Electron-safe on win32 — run `npm run rebuild:native`; storage disabled this launch'
       )
@@ -142,11 +180,19 @@ async function bootStorage(): Promise<void> {
   const paths = appDataPaths(app.getPath('userData'))
   appData = openAppData(paths.appDb)
   console.log(`[storage] appdata.db open (WAL: traces, tasks, mcp_calls, staged_writes, spend) at ${appData.path}`)
+  if (appData.backupCreated !== null) {
+    console.log(`[storage] pre-upgrade appdata backup: ${appData.backupCreated}`)
+  }
 
   engine = await openRyuGraphEngine({
     graphDir: paths.graphDir,
     backupsDir: paths.backupsDir,
-    extensionsDir: join(app.getAppPath(), 'resources', 'extensions', RYU_EXTENSION_VERSION_DIR)
+    // Packaged builds ship the vendored extensions as extraResources (they are
+    // loaded by absolute path by NATIVE code and cannot live inside asar);
+    // dev/test runs load them from the repo (§21 rule 2 — never fetched).
+    extensionsDir: app.isPackaged
+      ? join(process.resourcesPath, 'extensions', RYU_EXTENSION_VERSION_DIR)
+      : join(app.getAppPath(), 'resources', 'extensions', RYU_EXTENSION_VERSION_DIR)
   })
   const counts = await engine.cypher('MATCH (n) RETURN count(n) AS c')
   const backupNote = engine.backupCreated ? `, pre-migration backup: ${engine.backupCreated}` : ''
@@ -210,7 +256,16 @@ function bootKernel(): void {
   const scanner = createInjectionScanner({ db: appData.db, ...(ollama !== null ? { llm: ollama } : {}) })
   securityInstances = { permissions, audit, scanner }
   const kernel = new Kernel({ telemetry, permissions, audit })
-  const runner = new LangGraphRunner({ db: appData.db, telemetry, executor: kernel })
+  // §8 phase-13: cooperative yield at step boundaries — a running multi-step
+  // workflow defers to live MCP calls between steps (the queue's pre-dispatch
+  // yield covers only task starts). The closure reads mcpServer at call time;
+  // it is null until bootMcp() and that is fine (0 inflight = no wait).
+  const runner = new LangGraphRunner({
+    db: appData.db,
+    telemetry,
+    executor: kernel,
+    yieldPoint: createInflightYield(() => mcpServer?.inflightCalls ?? 0)
+  })
   const contextManager = new ContextManager({ llm: ollama ?? new OllamaClient(), telemetry })
   kernelInstances = { kernel, runner, contextManager }
   console.log('[kernel] workflow runner ready (LangGraph + SQLite checkpointer) — spans → traces table')
@@ -242,7 +297,7 @@ async function bootMcp(): Promise<void> {
   }
   const userDataDir = app.getPath('userData')
   const paths = appDataPaths(userDataDir)
-  reranker ??= new Reranker({ modelsDir: paths.modelsDir })
+  reranker ??= new Reranker({ modelsDir: paths.modelsDir, ...rerankerFilesOverride() })
   const retrievalDeps = { engine, embedder: ollama, reranker }
   const retriever = createRetriever({ ...retrievalDeps, llm: ollama })
   const server = new AgenticOsMcpServer({
@@ -308,7 +363,14 @@ function bootAgents(): void {
   const apiKey = keychain?.getApiKey(settings.cloudProvider)
   const cloud = apiKey
     ? {
-        brain: createCloudBrain(settings.cloudProvider, { apiKey, model: activeCloudModel(settings) }),
+        brain: createCloudBrain(settings.cloudProvider, {
+          apiKey,
+          model: activeCloudModel(settings),
+          // Phase-13 test seam: the golden-path e2e fronts the cloud tier
+          // with a scripted provider server (adapters accepted baseUrl since
+          // phase 02; this only wires it through boot). Unset in production.
+          ...(CLOUD_BASE_URL_OVERRIDE !== undefined ? { baseUrl: CLOUD_BASE_URL_OVERRIDE } : {})
+        }),
         meter: new SpendMeter({ db: appData.db })
       }
     : null
@@ -419,6 +481,12 @@ async function bootTriggers(): Promise<void> {
       token: keychain.ensureSessionEndHookToken(),
       handle: createSessionEndHookHandler(queue)
     })
+    // Dev/e2e escape hatch, mirror of AGENTIC_OS_PRINT_MCP_TOKEN (phase-13
+    // test seam, recorded): the golden-path e2e POSTs the session-end hook
+    // itself, so it needs the dedicated hook token. Never printed by default.
+    if (process.env['AGENTIC_OS_PRINT_HOOK_TOKEN'] === '1') {
+      console.log(`[triggers] dev: session-end hook token: ${keychain.ensureSessionEndHookToken()}`)
+    }
   }
   const spool = drainSessionSpool(queue, SPOOL_DIR)
 
@@ -457,7 +525,7 @@ function bootIpc(): void {
   if (reranker === null && appData !== null && engine !== null && ollama !== null) {
     // MCP boot was skipped (e.g. port in use) — memory search still needs
     // the ONE shared reranker instance.
-    reranker = new Reranker({ modelsDir: appDataPaths(userDataDir).modelsDir })
+    reranker = new Reranker({ modelsDir: appDataPaths(userDataDir).modelsDir, ...rerankerFilesOverride() })
   }
   registerIpcHandlers({
     engine,
@@ -521,6 +589,14 @@ function createWindow(): void {
 
 void app.whenReady().then(async () => {
   console.log(`[boot] ${PRODUCT_NAME} main process starting (MCP reserved at ${MCP_HOST}:${MCP_PORT})`)
+  // Second half of the linux CI keystore seam (see the top-of-file switch):
+  // headless runners have no keyring, and the password-store switch alone
+  // does not make safeStorage report available — Electron's sanctioned
+  // escape hatch is the explicit plaintext opt-in. Never set in production.
+  if (process.platform === 'linux' && process.env['AGENTIC_OS_LINUX_PASSWORD_STORE'] === 'basic') {
+    safeStorage.setUsePlainTextEncryption(true)
+    console.log('[models] AGENTIC_OS_LINUX_PASSWORD_STORE=basic — safeStorage plaintext opt-in (test seam)')
+  }
   try {
     logNativeModuleVersions()
   } catch (err) {
@@ -561,6 +637,10 @@ void app.whenReady().then(async () => {
   } catch (err) {
     console.error('[ipc] dashboard IPC boot FAILED', err)
   }
+  // Phase 13: background auto-update (log-only; no-op in dev builds). An
+  // installed update runs migrations WITH the pre-migration backup at its
+  // first boot (§3/§21.9 — proven by scripts/smoke/packaged-smoke.mjs).
+  bootUpdater()
 
   createWindow()
 

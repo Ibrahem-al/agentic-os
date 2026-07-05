@@ -5,8 +5,8 @@
  * resume() continues from the last good checkpoint in the SAME trace.
  * (Kill-the-process resume lives in kernel.kill.test.ts.)
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { WorkflowJobError, type WorkflowStep } from '../../src/main/kernel'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { LangGraphRunner, WorkflowJobError, type WorkflowStep } from '../../src/main/kernel'
 import { DEMO_WORKFLOW_NAME, demoSteps } from '../fixtures/demo-workflow'
 import { openKernelStack, spanAttributes, spanRows, type KernelTestStack } from '../fixtures/kernel-helpers'
 
@@ -150,6 +150,100 @@ describe('failure + resume in-process (same trace)', () => {
     expect(job!.status).toBe('done')
     expect(job!.attempts).toBe(1) // untouched
     expect(spanRows(stack.appData, 'kernel.workflow-step')).toHaveLength(stepSpansBefore)
+  })
+})
+
+describe('§8 cooperative yield at step boundaries', () => {
+  /** A runner over the shared stack with an injected yieldPoint. */
+  const yieldingRunner = (yieldPoint: () => Promise<void>): LangGraphRunner =>
+    new LangGraphRunner({ db: stack.appData.db, telemetry: stack.telemetry, executor: stack.kernel, yieldPoint })
+
+  const loggingStep = (name: string, events: string[], value: number): WorkflowStep => ({
+    name,
+    run: () => {
+      events.push(`step:${name}`)
+      return { [name]: value }
+    }
+  })
+
+  it('awaits the yieldPoint once per step, in order, before each step runs (3 steps = 3 yields)', async () => {
+    const events: string[] = []
+    const runner = yieldingRunner(() => {
+      events.push('yield')
+      return Promise.resolve()
+    })
+    runner.define('yield-order', [
+      loggingStep('one', events, 1),
+      loggingStep('two', events, 2),
+      loggingStep('three', events, 3)
+    ])
+    await runner.run('yield-order', {}, { jobId: 'yield-order-1' })
+    expect(events).toEqual(['yield', 'step:one', 'yield', 'step:two', 'yield', 'step:three'])
+  })
+
+  it('a blocked yieldPoint delays the next step; the previous checkpoint is already durable', async () => {
+    const events: string[] = []
+    let release: (() => void) | undefined
+    let yields = 0
+    const runner = yieldingRunner(() => {
+      yields += 1
+      if (yields === 2) {
+        // Live session in flight at the step-1 → step-2 boundary: hold the
+        // yield until the test releases it.
+        return new Promise<void>((resolve) => {
+          release = resolve
+        })
+      }
+      return Promise.resolve()
+    })
+    runner.define('yield-blocked', [loggingStep('one', events, 1), loggingStep('two', events, 2)])
+
+    const running = runner.run('yield-blocked', {}, { jobId: 'yield-blocked-1' })
+    await vi.waitFor(() => {
+      expect(release).toBeDefined()
+    })
+    // Step 1 ran and its checkpoint committed; step 2 has provably not started.
+    expect(events).toEqual(['step:one'])
+    const parked = await runner.getJob('yield-blocked-1')
+    expect(parked!.status).toBe('running')
+    expect(parked!.state).toEqual({ one: 1 })
+
+    release!()
+    await running
+    expect(events).toEqual(['step:one', 'step:two'])
+    expect((await runner.getJob('yield-blocked-1'))!.status).toBe('done')
+  })
+
+  it('resume() flows through the same node closures — resumed steps yield too', async () => {
+    const events: string[] = []
+    let allowTwo = false
+    const runner = yieldingRunner(() => {
+      events.push('yield')
+      return Promise.resolve()
+    })
+    runner.define('yield-resume', [
+      loggingStep('one', events, 1),
+      {
+        name: 'two',
+        run: () => {
+          if (!allowTwo) throw new Error('gate closed')
+          events.push('step:two')
+          return { two: 2 }
+        }
+      },
+      loggingStep('three', events, 3)
+    ])
+
+    await expect(runner.run('yield-resume', {}, { jobId: 'yield-resume-1' })).rejects.toThrow(WorkflowJobError)
+    // run(): yield → step one → yield → step two threw (yield precedes even a
+    // failing step — the wait happens before the step does any work).
+    expect(events).toEqual(['yield', 'step:one', 'yield'])
+
+    allowTwo = true
+    await runner.resume('yield-resume-1')
+    // resume(): yield → step two → yield → step three; step one NOT re-run.
+    expect(events).toEqual(['yield', 'step:one', 'yield', 'yield', 'step:two', 'yield', 'step:three'])
+    expect((await runner.getJob('yield-resume-1'))!.status).toBe('done')
   })
 })
 

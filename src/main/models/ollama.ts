@@ -10,10 +10,12 @@
  *
  * Plain fetch against the local HTTP API; nothing here touches the network
  * beyond OLLAMA_BASE_URL. No secrets are involved and nothing is logged.
+ * Model work (embed/generate) runs in the §8 local pool (see Semaphore below).
  */
 import {
   EMBEDDING_DIM,
   EMBEDDING_MODEL,
+  LOCAL_POOL_CONCURRENCY,
   OLLAMA_BASE_URL,
   OLLAMA_INSTALL_URL,
   OLLAMA_REQUIRED_MODELS,
@@ -21,6 +23,40 @@ import {
 } from '../config'
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
+
+/**
+ * §8 "cheap local work runs in a parallel pool" — phase-13 scheduler policy:
+ * a counting semaphore bounds concurrent Ollama HTTP requests process-wide at
+ * LOCAL_POOL_CONCURRENCY. Applied to embed()/generate() ONLY: status()
+ * bypasses so the dashboard always gets an answer while the pool is busy, and
+ * pull() bypasses so a long model download never starves the pool nor is
+ * starved by it.
+ */
+class Semaphore {
+  private available: number
+  private readonly waiters: (() => void)[] = []
+
+  constructor(limit: number) {
+    this.available = limit
+  }
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.available > 0) {
+      this.available -= 1
+    } else {
+      await new Promise<void>((resolve) => this.waiters.push(resolve))
+    }
+    try {
+      return await task()
+    } finally {
+      const next = this.waiters.shift()
+      if (next !== undefined) next()
+      else this.available += 1
+    }
+  }
+}
+
+const localPool = new Semaphore(LOCAL_POOL_CONCURRENCY)
 
 /**
  * Guided-install state machine (§4). `daemon-not-running` → link
@@ -159,24 +195,33 @@ export class OllamaClient {
     return this.status()
   }
 
-  /** Embed texts with bge-m3 (POST /api/embed) → number[EMBEDDING_DIM][]. */
+  /**
+   * Embed texts with bge-m3 (POST /api/embed) → number[EMBEDDING_DIM][].
+   * Rides the §8 local pool: bursts of background embeds queue here instead
+   * of monopolizing the daemon.
+   */
   async embed(texts: string[]): Promise<number[][]> {
     if (texts.length === 0) return []
-    const response = await this.request('/api/embed', { model: EMBEDDING_MODEL, input: texts })
-    const body = (await response.json()) as { embeddings?: number[][] }
-    const embeddings = body.embeddings
-    if (!embeddings || embeddings.length !== texts.length) {
-      throw new OllamaError(`Ollama /api/embed returned ${embeddings?.length ?? 0} embeddings for ${texts.length} inputs`)
-    }
-    for (const [i, embedding] of embeddings.entries()) {
-      if (embedding.length !== EMBEDDING_DIM) {
-        throw new OllamaError(`embedding ${i} has ${embedding.length} dims, expected ${EMBEDDING_DIM} (${EMBEDDING_MODEL})`)
+    return localPool.run(async () => {
+      const response = await this.request('/api/embed', { model: EMBEDDING_MODEL, input: texts })
+      const body = (await response.json()) as { embeddings?: number[][] }
+      const embeddings = body.embeddings
+      if (!embeddings || embeddings.length !== texts.length) {
+        throw new OllamaError(`Ollama /api/embed returned ${embeddings?.length ?? 0} embeddings for ${texts.length} inputs`)
       }
-    }
-    return embeddings
+      for (const [i, embedding] of embeddings.entries()) {
+        if (embedding.length !== EMBEDDING_DIM) {
+          throw new OllamaError(`embedding ${i} has ${embedding.length} dims, expected ${EMBEDDING_DIM} (${EMBEDDING_MODEL})`)
+        }
+      }
+      return embeddings
+    })
   }
 
-  /** One-shot completion with the small local LLM (POST /api/generate). */
+  /**
+   * One-shot completion with the small local LLM (POST /api/generate).
+   * Rides the §8 local pool alongside embed().
+   */
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult> {
     const model = options.model ?? SMALL_LLM_MODEL
     const payload: Record<string, unknown> = {
@@ -193,23 +238,25 @@ export class OllamaClient {
     if (options.stop !== undefined) ollamaOptions['stop'] = options.stop
     if (Object.keys(ollamaOptions).length > 0) payload['options'] = ollamaOptions
 
-    const response = await this.request('/api/generate', payload)
-    const body = (await response.json()) as {
-      response?: string
-      model?: string
-      prompt_eval_count?: number
-      eval_count?: number
-      error?: string
-    }
-    if (typeof body.response !== 'string') {
-      throw new OllamaError(`Ollama /api/generate returned no response text${body.error ? `: ${body.error}` : ''}`)
-    }
-    return {
-      text: body.response,
-      model: body.model ?? model,
-      inputTokens: body.prompt_eval_count ?? 0,
-      outputTokens: body.eval_count ?? 0
-    }
+    return localPool.run(async () => {
+      const response = await this.request('/api/generate', payload)
+      const body = (await response.json()) as {
+        response?: string
+        model?: string
+        prompt_eval_count?: number
+        eval_count?: number
+        error?: string
+      }
+      if (typeof body.response !== 'string') {
+        throw new OllamaError(`Ollama /api/generate returned no response text${body.error ? `: ${body.error}` : ''}`)
+      }
+      return {
+        text: body.response,
+        model: body.model ?? model,
+        inputTokens: body.prompt_eval_count ?? 0,
+        outputTokens: body.eval_count ?? 0
+      }
+    })
   }
 
   private async request(path: string, payload: unknown): Promise<Response> {

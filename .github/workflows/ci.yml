@@ -2,7 +2,12 @@ name: ci
 
 on:
   push:
+    tags:
+      - 'v*'
+    branches:
+      - '**'
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -11,6 +16,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -21,6 +27,15 @@ jobs:
 
       - run: npm ci
 
+      # Diagnostic evidence for the ryugraph 25.9.1 vector-extension defect
+      # (environment-conditional: a re-embedded vector can be served as zeros
+      # → exact-match distance exactly 1; unreproducible on dev machines).
+      # Never gates the build — the output + CPU model feed the upstream
+      # issue and prove which runner pools are affected.
+      - name: RyuGraph vector probe (diagnostic, non-gating)
+        continue-on-error: true
+        run: node scripts/diag/ryu-vector-probe.mjs "${{ runner.temp }}/ryu-probe" resources/extensions/v25.9.0
+
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
@@ -29,16 +44,19 @@ jobs:
         if: runner.os == 'Linux'
         run: sha256sum -c resources/extensions/SHA256SUMS
 
-      # Offline storage check (spec §21 rule 2): the real storage layer's
-      # integration suite must pass with networking disabled — vector + FTS
-      # load from resources/extensions/ by absolute path, never fetched.
+      # Offline storage check (spec §21 rule 2): the storage layer's suite must
+      # pass with networking disabled — vector + FTS load from
+      # resources/extensions/ by absolute path, never fetched. Scoped to the
+      # storage suite: since phase 05 the wider integration suite contains
+      # legitimate localhost servers (MCP HTTP, session-end hook, sandbox
+      # probes) that a blanket network kill breaks by design.
       - name: Offline storage check (Linux, network namespace)
         if: runner.os == 'Linux'
-        run: sudo unshare -n -- "$(which node)" node_modules/vitest/vitest.mjs run tests/integration
+        run: sudo unshare -n -- "$(which node)" node_modules/vitest/vitest.mjs run tests/integration/storage.
 
       - name: Offline storage check (macOS, sandbox deny-network)
         if: runner.os == 'macOS'
-        run: sandbox-exec -p '(version 1)(allow default)(deny network*)' node node_modules/vitest/vitest.mjs run tests/integration
+        run: sandbox-exec -p '(version 1)(allow default)(deny network*)' node node_modules/vitest/vitest.mjs run tests/integration/storage.
 
       - name: Offline storage check (Windows, outbound firewall block)
         if: runner.os == 'Windows'
@@ -47,20 +65,43 @@ jobs:
           $node = (Get-Command node).Source
           New-NetFirewallRule -DisplayName "block-node-egress" -Direction Outbound -Program $node -Action Block | Out-Null
           try {
-            node node_modules\vitest\vitest.mjs run tests/integration
+            node node_modules\vitest\vitest.mjs run tests/integration/storage.
             if ($LASTEXITCODE -ne 0) { throw "storage integration failed offline: $LASTEXITCODE" }
           } finally {
             Remove-NetFirewallRule -DisplayName "block-node-egress"
           }
 
+      # Perf sanity (phase 13): retrieval p50 < 500 ms on a 10k-node graph,
+      # asserted where minutes are cheapest. Numbers land in the job log.
+      - name: Retrieval perf on a 10k-node graph
+        if: runner.os == 'Linux'
+        run: PERF=1 node node_modules/vitest/vitest.mjs run tests/integration/retrieval.perf.test.ts --no-file-parallelism
+
       # Electron ABI check (spec §5): the full storage integration suite runs
       # under Electron's runtime (ELECTRON_RUN_AS_NODE). Skipped on Windows:
       # the ryugraph npm prebuilt needs the rebuild:native source build there
-      # (~25 min, exercised on dev machines); Windows Electron coverage of the
-      # other native modules stays below.
+      # (~25 min, exercised on dev machines and in the package job's cache).
+      # The Electron-runtime suite needs the dual-ABI better-sqlite3 stash
+      # (build/Release/better_sqlite3-electron.node) that rebuild:native
+      # produces; the ryugraph half no-ops off Windows. ~2-4 min.
+      - name: rebuild:native (Electron-ABI better-sqlite3 stash)
+        if: runner.os != 'Windows'
+        run: npm run rebuild:native
+
       - name: Electron ABI check (storage suite under Electron runtime)
         if: runner.os != 'Windows'
-        run: ELECTRON_RUN_AS_NODE=1 ELECTRON_NO_ATTACH_CONSOLE=1 ./node_modules/electron/dist/electron${{ runner.os == 'macOS' && '.app/Contents/MacOS/Electron' || '' }} node_modules/vitest/vitest.mjs run tests/integration
+        # macOS: the binary is Electron.app (capital E) — the old lowercase
+        # concatenation never ran before phase 13 (earlier steps failed
+        # first). The install.js re-run self-heals a dist/ the npm ci left
+        # unmaterialized (observed on ubuntu runners) and prints the layout.
+        run: |
+          BIN="${{ runner.os == 'macOS' && 'node_modules/electron/dist/Electron.app/Contents/MacOS/Electron' || 'node_modules/electron/dist/electron' }}"
+          if [ ! -x "$BIN" ]; then
+            echo "electron binary missing at $BIN — re-running electron's installer"
+            node node_modules/electron/install.js
+            ls node_modules/electron/dist | head -5
+          fi
+          ELECTRON_RUN_AS_NODE=1 ELECTRON_NO_ATTACH_CONSOLE=1 "./$BIN" node_modules/vitest/vitest.mjs run tests/integration
 
       - name: Electron ABI check (better-sqlite3 + onnxruntime-node, Windows)
         if: runner.os == 'Windows'
@@ -86,3 +127,106 @@ jobs:
           node node_modules\electron\cli.js scripts\ci\electron-keychain-check.cjs
           if ($LASTEXITCODE -ne 0) { throw "electron keychain check failed: $LASTEXITCODE" }
           Get-Content "$env:TEMP\agentic-os-keychain-check.json"
+
+  # Golden-path E2E (phase 13, the release gate): the production build under
+  # Playwright's Electron driver with scripted models over HTTP. Linux runs on
+  # every push (cheap minutes); macOS runs on main and tags (10× minute
+  # multiplier on private repos). Windows e2e is covered on dev machines — the
+  # ryugraph Electron source build makes it uneconomical here (recorded).
+  e2e-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # better-sqlite3 Electron-ABI stash (dual-ABI resolver needs it under
+      # Electron); the ryugraph half of rebuild:native no-ops off Windows.
+      - run: npm run rebuild:native
+      - name: Golden-path E2E (xvfb)
+        env:
+          AGENTIC_OS_LINUX_PASSWORD_STORE: basic
+        run: xvfb-run -a npx playwright test
+      - name: Upload Playwright output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-linux-results
+          path: test-results/
+          if-no-files-found: ignore
+
+  e2e-macos:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run rebuild:native
+      - name: Golden-path E2E
+        run: npx playwright test
+      - name: Upload Playwright output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-macos-results
+          path: test-results/
+          if-no-files-found: ignore
+
+  # Installer artifacts (phase 13): electron-builder targets per OS. Runs on
+  # version tags and manual dispatch only — building three installers on every
+  # push would burn the private-repo minute budget for no signal.
+  package:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Windows: the Electron-safe ryugraph binary is a ~30-60 min MSVC source
+      # build — cache it keyed on the ryugraph pin + Electron version so only
+      # the first tag pays. rebuild:native no-ops in seconds on a warm cache
+      # (the .electron-safe marker records the Electron version).
+      - name: Cache ryugraph Electron build (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules/ryugraph/ryujs.node
+            node_modules/ryugraph/.electron-safe
+            node_modules/ryugraph/ryujs-node-prebuilt.node
+          key: ryugraph-electron-${{ runner.os }}-ryu25.9.1-electron43.0.0
+      - run: npm run rebuild:native
+      - run: npm run build
+      - name: Build installers
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder --publish never
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.os }}
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.zip
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.blockmap
+            dist/latest*.yml
+          if-no-files-found: error

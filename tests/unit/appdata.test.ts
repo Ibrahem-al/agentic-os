@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { openAppData } from '../../src/main/storage/appdata'
 
 const TABLES = [
@@ -194,5 +194,89 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     first.db.pragma('user_version = 99')
     first.close()
     expect(() => openAppData(dbPath)).toThrow(/newer than this build/)
+  })
+
+  it('snapshots an upgrading db via VACUUM INTO before touching it (§21 rule 9, §3)', () => {
+    dir = mkdtempSync(join(tmpdir(), 'appdata-'))
+    const dbPath = join(dir, 'appdata.db')
+    // Old-version rig (same approach as the v1-upgrade test above): a marker
+    // row + a dropped v6 table make the upgrade — and the snapshot — real.
+    const first = openAppData(dbPath)
+    first.db.prepare('INSERT INTO tasks (id, kind) VALUES (?, ?)').run('pre-upgrade-marker', 'probe')
+    first.db.exec('DROP TABLE skill_settings; DROP TABLE skill_improvements')
+    first.db.pragma('user_version = 1')
+    first.close()
+
+    const upgraded = openAppData(dbPath)
+    try {
+      // Main db really upgraded in place.
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(6)
+      expect(
+        upgraded.db.prepare("SELECT count(*) AS c FROM sqlite_master WHERE name = 'skill_settings'").get()
+      ).toEqual({ c: 1 })
+      // Snapshot at the derived default location: <db parent>/backups/<stamp>-pre-appdata-v6/appdata.db.
+      const snapshot = upgraded.backupCreated
+      expect(snapshot).not.toBeNull()
+      expect(existsSync(snapshot as string)).toBe(true)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v6$/)
+      expect(dirname(dirname(snapshot as string))).toBe(join(dir, 'backups'))
+      // The snapshot is a valid sqlite db frozen at the OLD version: header
+      // magic + user_version (byte 60, big-endian) read straight off disk —
+      // no direct better-sqlite3 construction (dual-ABI: the default binding
+      // does not load under the Electron-runtime suite).
+      const header = readFileSync(snapshot as string)
+      expect(header.subarray(0, 16).toString('latin1')).toBe('SQLite format 3\u0000')
+      expect(header.readUInt32BE(60)).toBe(1)
+      // …and openable: a copy round-trips through openAppData with the marker intact.
+      const copyPath = join(dir, 'snapshot-check', 'appdata.db')
+      mkdirSync(dirname(copyPath), { recursive: true })
+      copyFileSync(snapshot as string, copyPath)
+      const reopened = openAppData(copyPath)
+      try {
+        expect(
+          (reopened.db.prepare('SELECT kind FROM tasks WHERE id = ?').get('pre-upgrade-marker') as { kind: string })
+            .kind
+        ).toBe('probe')
+      } finally {
+        reopened.close()
+      }
+    } finally {
+      upgraded.close()
+    }
+  })
+
+  it('honors an explicit backupsDir over the derived sibling default', () => {
+    dir = mkdtempSync(join(tmpdir(), 'appdata-'))
+    const dbPath = join(dir, 'appdata.db')
+    const first = openAppData(dbPath)
+    first.db.pragma('user_version = 5')
+    first.close()
+
+    const elsewhere = join(dir, 'elsewhere')
+    const upgraded = openAppData(dbPath, elsewhere)
+    try {
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(6)
+      expect(upgraded.backupCreated).not.toBeNull()
+      expect(dirname(dirname(upgraded.backupCreated as string))).toBe(elsewhere)
+      expect(existsSync(upgraded.backupCreated as string)).toBe(true)
+      expect(existsSync(join(dir, 'backups'))).toBe(false)
+    } finally {
+      upgraded.close()
+    }
+  })
+
+  it('fresh create and current-version reopen take no snapshot (no backups dir)', () => {
+    dir = mkdtempSync(join(tmpdir(), 'appdata-'))
+    const dbPath = join(dir, 'appdata.db')
+    const fresh = openAppData(dbPath)
+    expect(fresh.backupCreated).toBeNull()
+    fresh.close()
+    const reopened = openAppData(dbPath) // already at the current version
+    try {
+      expect(reopened.backupCreated).toBeNull()
+      expect(existsSync(join(dir, 'backups'))).toBe(false)
+    } finally {
+      reopened.close()
+    }
   })
 })

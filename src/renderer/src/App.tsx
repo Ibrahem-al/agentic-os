@@ -30,20 +30,17 @@ const PANELS = [
 
 type PanelKey = (typeof PANELS)[number]['key']
 
-/** Review work waiting on the operator — shown as a count in the rail. */
-function usePendingCount(): number {
-  const [pending, setPending] = useState(0)
+/** Poll a rail count every 20s; failures keep the last value (the owning panel reports the outage). */
+function usePolledCount(fetchCount: () => Promise<number>): number {
+  const [count, setCount] = useState(0)
   useEffect(() => {
     let cancelled = false
     const refresh = async (): Promise<void> => {
       try {
-        const [staged, approvals] = await Promise.all([
-          call('review.staged.list', { status: 'staged' }),
-          call('review.approvals.list', { status: 'pending' })
-        ])
-        if (!cancelled) setPending(staged.length + approvals.length)
+        const value = await fetchCount()
+        if (!cancelled) setCount(value)
       } catch {
-        // Subsystem unavailable — the review panel says so; the rail stays quiet.
+        // Subsystem unavailable — the owning panel says so; the rail stays quiet.
       }
     }
     void refresh()
@@ -52,8 +49,23 @@ function usePendingCount(): number {
       cancelled = true
       clearInterval(timer)
     }
-  }, [])
-  return pending
+  }, [fetchCount])
+  return count
+}
+
+/** Review work waiting on the operator — shown as a count in the rail. */
+const fetchPendingCount = async (): Promise<number> => {
+  const [staged, approvals] = await Promise.all([
+    call('review.staged.list', { status: 'staged' }),
+    call('review.approvals.list', { status: 'pending' })
+  ])
+  return staged.length + approvals.length
+}
+
+/** Open drift flags on adopted skill versions (§20 nightly watch) — a warning in the rail. */
+const fetchDriftCount = async (): Promise<number> => {
+  const summary = await call('skills.driftSummary', undefined)
+  return summary.flagged
 }
 
 function SubsystemStatus(): React.JSX.Element {
@@ -92,7 +104,8 @@ function SubsystemStatus(): React.JSX.Element {
 
 export default function App(): React.JSX.Element {
   const [active, setActive] = useState<PanelKey>('memory')
-  const pending = usePendingCount()
+  const pending = usePolledCount(fetchPendingCount)
+  const drift = usePolledCount(fetchDriftCount)
   const ActivePanel = PANELS.find((p) => p.key === active)?.component ?? MemoryPanel
 
   return (
@@ -121,6 +134,12 @@ export default function App(): React.JSX.Element {
                     {panel.key === 'review' && pending > 0 && (
                       <span className="rounded-full bg-warn/15 px-1.5 font-mono text-[11px] text-warn" data-testid="review-pending-count">
                         {pending}
+                      </span>
+                    )}
+                    {panel.key === 'skills' && drift > 0 && (
+                      <span className="rounded-full bg-warn/15 px-1.5 font-mono text-[11px] text-warn" data-testid="drift-flagged-count">
+                        {drift}
+                        <span className="sr-only"> drift-flagged skill versions</span>
                       </span>
                     )}
                   </button>

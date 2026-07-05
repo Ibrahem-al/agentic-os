@@ -11,7 +11,7 @@
  * whichever loads in the current runtime via the documented `nativeBinding`
  * option and remembers the winner.
  */
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import type BetterSqlite3 from 'better-sqlite3'
@@ -21,6 +21,8 @@ const require = createRequire(import.meta.url)
 export interface AppData {
   readonly db: BetterSqlite3.Database
   readonly path: string
+  /** Pre-upgrade snapshot taken by this open (null when none was needed) — mirrors engine.backupCreated. */
+  readonly backupCreated: string | null
   close(): void
 }
 
@@ -278,8 +280,33 @@ function openWithBinding(
   )
 }
 
-/** Open (creating if needed) appdata.db, apply pragmas + schema idempotently. */
-export function openAppData(dbPath: string): AppData {
+/**
+ * Pre-upgrade snapshot of appdata.db into
+ * `<backupsDir>/<stamp>-pre-appdata-v<target>/appdata.db` via VACUUM INTO —
+ * synchronous, atomic, and valid on an open WAL database. Naming mirrors the
+ * graph's `<stamp>-pre-migration-v<N>` backups. Returns the snapshot file.
+ */
+function backupAppDataDb(db: BetterSqlite3.Database, backupsDir: string): string {
+  const stamp = new Date().toISOString().replaceAll(':', '-').replace(/\.\d+Z$/, 'Z')
+  const base = join(backupsDir, `${stamp}-pre-appdata-v${APPDATA_USER_VERSION}`)
+  let dest = base
+  for (let n = 2; existsSync(dest); n++) dest = `${base}-${n}`
+  mkdirSync(dest, { recursive: true })
+  const file = join(dest, 'appdata.db')
+  db.prepare('VACUUM INTO ?').run(file)
+  return file
+}
+
+/**
+ * Open (creating if needed) appdata.db, apply pragmas + schema idempotently.
+ *
+ * `backupsDir` receives the §21-rule-9 pre-upgrade snapshot (§3 — the same
+ * discipline the graph store gets). When omitted it derives to the sibling
+ * `backups/` of the db file's parent, which is exactly the boot layout:
+ * config.appDataPaths() puts `appdata.db` and `backups/` under the same
+ * userData parent, so the derived default and the configured dir coincide.
+ */
+export function openAppData(dbPath: string, backupsDir?: string): AppData {
   mkdirSync(dirname(dbPath), { recursive: true })
   const Database = require('better-sqlite3') as typeof BetterSqlite3
   const bs3Dir = dirname(require.resolve('better-sqlite3/package.json'))
@@ -292,6 +319,14 @@ export function openAppData(dbPath: string): AppData {
     throw new Error(
       `${dbPath} has user_version ${existingVersion}, newer than this build understands (${APPDATA_USER_VERSION}) — it belongs to a different build; refusing to touch it`
     )
+  }
+  // §21 rule 9 applied to the SQLite side (§3): a REAL upgrade of an existing
+  // store (0 < on-disk version < target) is snapshotted BEFORE any schema
+  // statement — or even a pragma — touches it. Fresh creates (version 0) and
+  // already-current stores take no backup.
+  let backupCreated: string | null = null
+  if (existingVersion > 0 && existingVersion < APPDATA_USER_VERSION) {
+    backupCreated = backupAppDataDb(db, backupsDir ?? join(dirname(dbPath), 'backups'))
   }
   db.pragma('journal_mode = WAL')
   db.pragma('synchronous = NORMAL')
@@ -314,6 +349,7 @@ export function openAppData(dbPath: string): AppData {
   return {
     db,
     path: dbPath,
+    backupCreated,
     close: () => {
       db.close()
     }

@@ -486,6 +486,8 @@ export interface IpcChannels {
   }
   'skills.improveNow': { req: { skillId: string }; res: { taskId: string; deduped: boolean } }
   'skills.rollback': { req: { skillId: string }; res: SkillImprovementDto }
+  /** Open (unresolved, un-reverted) drift flags — the rail badge's source. */
+  'skills.driftSummary': { req: void; res: { flagged: number } }
 
   'ingest.pick': { req: { kind: 'file' | 'folder' }; res: { path: string | null } }
   'ingest.document': {

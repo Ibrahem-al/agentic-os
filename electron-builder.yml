@@ -1,0 +1,153 @@
+# Packaging config (phase 13). electron-vite externalizes every dependency,
+# so the packaged app ships out/** + production node_modules; native modules
+# and wasm-loading packages are asar-UNPACKED so absolute-path/dlopen loading
+# keeps working. RyuGraph extensions + the session-end hook scripts are
+# extraResources: native code / an external shell load them by absolute path,
+# which cannot point inside an asar archive.
+#
+# appId: dev.agentic-os.desktop — §21 rule 12 pick (no org domain exists;
+# reverse-DNS of a plausible product domain), recorded in the phase-13 report.
+appId: dev.agentic-os.desktop
+productName: agentic-os
+
+directories:
+  output: dist
+
+# CRITICAL: electron-builder must NEVER rebuild natives. `npm run
+# rebuild:native` owns the dual-ABI better-sqlite3 stash and the win32
+# Electron-safe ryujs.node (+ .electron-safe marker); an electron-builder
+# rebuild would clobber both with bindings that crash or lose the marker.
+# scripts/build/before-pack.cjs asserts the rebuild artifacts are in place.
+npmRebuild: false
+buildDependenciesFromSource: false
+
+beforePack: scripts/build/before-pack.cjs
+
+asar: true
+asarUnpack:
+  - "**/*.node"
+  - node_modules/better-sqlite3/**
+  - node_modules/onnxruntime-node/**
+  - node_modules/ryugraph/**
+  - node_modules/web-tree-sitter/**
+  - node_modules/tree-sitter-typescript/**
+  - node_modules/tree-sitter-javascript/**
+  - node_modules/tree-sitter-python/**
+
+# out/{main,preload,renderer} only — out/smoke holds dev-only selftest
+# bundles. Production node_modules are collected automatically; the negative
+# patterns trim dead weight:
+#   - ryugraph/ryu-source: the full C++ engine source (~404 MB) — install-time
+#     build input only.
+#   - ryugraph/prebuilt (~93 MB): per-platform npm prebuilts; runtime loads
+#     ONLY the top-level ryujs.node (ryu_native.js does
+#     dlopen(join(__dirname, 'ryujs.node'))). On win32 that file is the
+#     Electron-safe local rebuild — the npm prebuilt (kept in the repo as
+#     ryujs-node-prebuilt.node) hard-crashes electron.exe and must NOT ship.
+#   - better-sqlite3 build intermediates (obj/pdb/iobj/lib/exp, ~55 MB) and
+#     sqlite source deps/ — runtime needs only build/Release/*.node (the
+#     default binding + the better_sqlite3-electron.node stash that
+#     openAppData() picks via nativeBinding under Electron).
+#   - tree-sitter-* prebuilds/ + grammar C sources: we parse through
+#     web-tree-sitter + the .wasm builds only.
+# The .electron-safe marker is listed POSITIVELY: electron-builder's default
+# filters can drop dotfiles, and the packaged app's storage boot gates
+# RyuGraph on that marker existing next to ryujs.node.
+files:
+  - out/main/**
+  - out/preload/**
+  - out/renderer/**
+  - package.json
+  - node_modules/ryugraph/.electron-safe
+  - "!node_modules/ryugraph/ryu-source/**"
+  - "!node_modules/ryugraph/prebuilt/**"
+  - "!node_modules/ryugraph/ryujs-node-prebuilt.node"
+  - "!node_modules/better-sqlite3/build/deps/**"
+  - "!node_modules/better-sqlite3/build/Release/obj/**"
+  - "!node_modules/better-sqlite3/build/Release/*.pdb"
+  - "!node_modules/better-sqlite3/build/Release/*.ipdb"
+  - "!node_modules/better-sqlite3/build/Release/*.iobj"
+  - "!node_modules/better-sqlite3/build/Release/*.lib"
+  - "!node_modules/better-sqlite3/build/Release/*.exp"
+  - "!node_modules/better-sqlite3/build/Release/test_extension.*"
+  - "!node_modules/better-sqlite3/build/*.sln"
+  - "!node_modules/better-sqlite3/build/*.vcxproj"
+  - "!node_modules/better-sqlite3/build/*.filters"
+  - "!node_modules/better-sqlite3/deps/**"
+  - "!node_modules/tree-sitter-typescript/prebuilds/**"
+  - "!node_modules/tree-sitter-javascript/prebuilds/**"
+  - "!node_modules/tree-sitter-python/prebuilds/**"
+
+# Loaded by absolute path at runtime (process.resourcesPath when packaged):
+#   extensions/v25.9.0/<platform>/{vector,fts}/*.ryu_extension — RyuGraph
+#     native extension loading (cannot read inside asar).
+#   hooks/session-end.{ps1,sh} — executed by the user's EXTERNAL shell via the
+#     installed Claude Code SessionEnd hook (cannot execute from inside asar).
+extraResources:
+  - from: resources/extensions/v25.9.0
+    to: extensions/v25.9.0
+  - from: scripts/hooks
+    to: hooks
+
+artifactName: "${productName}-${version}-${os}-${arch}.${ext}"
+
+# onnxruntime-node ships every platform's runtime under bin/napi-v6/<os>/<arch>
+# (~260 MB total); each platform build keeps only its own. Note: the win/linux
+# filters also drop the non-built arch (win arm64 is not a target; linux
+# builds default to the build host's arch — adjust if a linux arm64 build is
+# ever added). onnxruntime-node 1.27.0 ships NO darwin/x64 binary, so the mac
+# x64 build carries only the arm64-absent dir it has (recorded in the report).
+# NOTE (verified live): a platform `files` list holding ONLY negative
+# patterns makes electron-builder prepend its default `**/*` base to that
+# matcher, which pulls the entire project dir into the asar. The leading
+# `package.json` positive (already shipped by the top-level list) anchors each
+# platform matcher so only the negatives take effect.
+win:
+  target:
+    - nsis
+  files:
+    - package.json
+    - "!node_modules/onnxruntime-node/bin/napi-v6/darwin/**"
+    - "!node_modules/onnxruntime-node/bin/napi-v6/linux/**"
+    - "!node_modules/onnxruntime-node/bin/napi-v6/win32/arm64/**"
+
+# Recorded picks: oneClick per-user install (background cockpit app — no
+# elevation prompt, no install wizard).
+nsis:
+  oneClick: true
+  perMachine: false
+
+# identity: null — unsigned mac build (no Apple Developer identity available;
+# recorded). Both arches as required; dmg + zip (zip additionally feeds
+# electron-updater's mac feed).
+mac:
+  identity: null
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+  files:
+    - package.json
+    - "!node_modules/onnxruntime-node/bin/napi-v6/linux/**"
+    - "!node_modules/onnxruntime-node/bin/napi-v6/win32/**"
+
+linux:
+  category: Utility
+  target:
+    - AppImage
+    - deb
+  files:
+    - package.json
+    - "!node_modules/onnxruntime-node/bin/napi-v6/darwin/**"
+    - "!node_modules/onnxruntime-node/bin/napi-v6/win32/**"
+
+# Feed for electron-updater (src/main/updater.ts). The repo is private today:
+# until it (or at least its releases) goes public, packaged apps log an auth
+# error on check and continue — harmless by design.
+publish:
+  provider: github
+  owner: Ibrahem-al
+  repo: agentic-os
+  releaseType: release

@@ -16,10 +16,15 @@ export default function globalSetup(): void {
     console.log('[e2e] building the app (electron-vite build)…')
     execSync('npm run build', { cwd: repoRoot, stdio: 'inherit' })
   }
-  // The seed runs as a child process per spec (see launch.ts) — bundle it.
+  // The seeds run as child processes per spec (see launch.ts) — bundle them.
   console.log('[e2e] bundling the dashboard seed…')
   execSync(
     'npx esbuild tests/fixtures/dashboard-seed.ts --bundle --platform=node --format=esm --outfile=out/smoke/dashboard-seed.mjs --log-level=warning',
+    { cwd: repoRoot, stdio: 'inherit' }
+  )
+  console.log('[e2e] bundling the golden-path seed…')
+  execSync(
+    'npx esbuild tests/fixtures/golden-seed.ts --bundle --platform=node --format=esm --outfile=out/smoke/golden-seed.mjs --log-level=warning',
     { cwd: repoRoot, stdio: 'inherit' }
   )
 }

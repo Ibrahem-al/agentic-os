@@ -6,8 +6,12 @@
  * crashes and reboots. The dashboard's tasks panel reads this same table.
  *
  * Semantics:
- *  - Ordering: effective priority = priority + floor(waited / aging interval)
- *    (§8 "aging prevents background starvation"), FIFO within a priority.
+ *  - Ordering: effective priority = priority + min(floor(waited / aging
+ *    interval), TASK_AGING_MAX_BONUS) (§8 "aging prevents background
+ *    starvation"), FIFO within a priority. Priority classes (§8 "live MCP >
+ *    user-initiated > background") are numeric bands on the priority column
+ *    (TASK_CLASS_BAND); the aging cap sits below the band width, so aging
+ *    never lifts a task across a class boundary.
  *    Dispatch is serial and cooperative — one task at a time, never preempted
  *    mid-run (§8 "no mid-generation preemption"); heavy resources serialize
  *    in their own lanes anyway (write lane, cloud lane).
@@ -39,6 +43,7 @@ import {
   JOB_RETRY_ATTEMPTS,
   JOB_RETRY_BACKOFF_MS,
   TASK_AGING_INTERVAL_MS,
+  TASK_AGING_MAX_BONUS,
   TASK_YIELD_MAX_MS,
   TASK_YIELD_RECHECK_MS
 } from '../config'
@@ -159,6 +164,15 @@ export class DurableTaskQueue {
   /** The id of the task executing right now (dashboard status). */
   get runningTaskId(): string | null {
     return this.current?.task.id ?? null
+  }
+
+  /**
+   * The appdata handle behind the mirror. The nightly retention sweep
+   * (jobs.ts) prunes finished rows from this same table via the queue
+   * reference the prune handler already holds — no extra boot wiring.
+   */
+  get mirrorDb(): BetterSqlite3.Database {
+    return this.db
   }
 
   enqueue(request: EnqueueRequest): EnqueueResult {
@@ -353,7 +367,14 @@ export class DurableTaskQueue {
         continue
       }
       const waited = Math.max(0, now - task.enqueuedAtMs)
-      const score = task.priority + Math.floor(waited / TASK_AGING_INTERVAL_MS)
+      // Priority classes are numeric bands on the priority column
+      // (TASK_CLASS_BAND in config.ts); capping aging below the band width
+      // means a background task can never out-rank a user-initiated one,
+      // while within-class aging still prevents starvation (§8). The 'live'
+      // class is the shouldYield gate below — live MCP work is not a queue
+      // task.
+      const aging = Math.min(TASK_AGING_MAX_BONUS, Math.floor(waited / TASK_AGING_INTERVAL_MS))
+      const score = task.priority + aging
       if (score > bestScore || (score === bestScore && best !== null && task.seq < best.seq)) {
         best = task
         bestScore = score

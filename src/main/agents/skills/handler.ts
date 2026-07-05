@@ -9,7 +9,7 @@
  * phase-11 extraction-handler pattern): checkpointed cloud calls are never
  * re-bought by a retry.
  */
-import { TASK_PRIORITY } from '../../config'
+import { TASK_CLASS_BAND, TASK_PRIORITY } from '../../config'
 import type { WorkflowRunner } from '../../kernel'
 import { TaskFatalError, type DurableTaskQueue, type EnqueueResult } from '../../triggers/queue'
 import type { SkillImprovementAgent } from './agent'
@@ -72,7 +72,9 @@ export function enqueueManualImprovement(queue: DurableTaskQueue, skillId: strin
   return queue.enqueue({
     id: `skill-manual-${skillId}-${stamp}`,
     kind: SKILL_IMPROVEMENT_TASK_KIND,
-    priority: TASK_PRIORITY.skillImprove,
+    // §8 priority classes: "improve now" comes from the dashboard, so it
+    // rides the user band; the nightly 02:00 slot stays background.
+    priority: TASK_CLASS_BAND.user + TASK_PRIORITY.skillImprove,
     payload: { skillId }
   })
 }

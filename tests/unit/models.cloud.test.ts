@@ -1,9 +1,16 @@
 /**
  * Cloud adapter unit tests — mocked HTTP for all four providers. Each adapter
  * is checked for wire shape (URL, auth header, body), response parsing
- * (text + usage + stop reason), and §21-rule-7 key redaction in errors.
+ * (text + usage + stop reason), §21-rule-7 key redaction in errors, and the
+ * §8 scheduler policy (one FIFO lane + per-provider spacing + 429 handling).
  */
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  CLOUD_LANE_MIN_INTERVAL_MS,
+  CLOUD_RATE_LIMIT_DEFAULT_WAIT_MS,
+  CLOUD_RATE_LIMIT_MAX_WAIT_MS,
+  CLOUD_RATE_LIMIT_RETRIES
+} from '../../src/main/config'
 import {
   AnthropicAdapter,
   CloudBrainError,
@@ -11,6 +18,7 @@ import {
   OpenAIAdapter,
   OpenRouterAdapter,
   createCloudBrain,
+  resetCloudLaneForTests,
   type ChatMessage
 } from '../../src/main/models'
 
@@ -20,6 +28,10 @@ const MESSAGES: ChatMessage[] = [
   { role: 'assistant', content: 'hi there' },
   { role: 'user', content: 'summarize' }
 ]
+
+// The lane + spacing state is module-level by design (§8: process-wide);
+// isolate tests from each other's spacing bookkeeping.
+beforeEach(() => resetCloudLaneForTests())
 
 type Call = { url: string; headers: Headers; body: Record<string, unknown> }
 
@@ -202,5 +214,156 @@ describe('shared adapter behavior', () => {
       model: 'claude-haiku-4-5'
     })
     expect(calls[0]!.body['model']).toBe('claude-haiku-4-5')
+  })
+})
+
+// ── §8 scheduler policy: one cloud lane + per-provider spacing + 429s ────────
+
+/** One macrotask turn — lets queued lane work start (or provably not start). */
+const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+/** Minimal 200 body every adapter parses without complaint. */
+const okResponse = () => new Response(JSON.stringify({ content: [{ type: 'text', text: 'ok' }] }), { status: 200 })
+
+const rateLimited = (retryAfter?: string, body = '{"error":{"message":"rate limited"}}') =>
+  new Response(body, { status: 429, headers: retryAfter === undefined ? {} : { 'retry-after': retryAfter } })
+
+/** Sleep spy that records requested waits and never really waits. */
+function recordingSleep() {
+  const sleeps: number[] = []
+  const sleep = async (ms: number) => {
+    sleeps.push(ms)
+  }
+  return { sleeps, sleep }
+}
+
+describe('cloud lane (§8: single lane, FIFO, per-provider spacing)', () => {
+  it('serializes ALL completions process-wide — the second fetch starts only after the first resolved', async () => {
+    const events: string[] = []
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const fetchMock = vi.fn(async (url: string) => {
+      const who = url.includes('anthropic') ? 'anthropic' : 'openai'
+      events.push(`start:${who}`)
+      if (who === 'anthropic') {
+        await firstGate
+        events.push('end:anthropic')
+      }
+      return okResponse()
+    })
+    const first = new AnthropicAdapter({ apiKey: API_KEY, fetch: fetchMock })
+    const second = new OpenAIAdapter({ apiKey: API_KEY, fetch: fetchMock })
+
+    const p1 = first.complete(MESSAGES)
+    const p2 = second.complete(MESSAGES)
+    await settle()
+    // The lane is held by the first call — the second's fetch has NOT started.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    releaseFirst()
+    await Promise.all([p1, p2])
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(events).toEqual(['start:anthropic', 'end:anthropic', 'start:openai'])
+  })
+
+  it('spaces consecutive same-provider calls CLOUD_LANE_MIN_INTERVAL_MS apart, start-to-start', async () => {
+    const { sleeps, sleep } = recordingSleep()
+    let clock = 1_000_000
+    const now = () => clock
+    const { fetchMock } = capture({ content: [] })
+    const brain = new AnthropicAdapter({ apiKey: API_KEY, fetch: fetchMock, sleep, now })
+
+    await brain.complete(MESSAGES) // first call: no predecessor → no wait
+    expect(sleeps).toEqual([])
+    clock += 40 // 40 ms elapse between the two starts
+    await brain.complete(MESSAGES) // second call waits out the remainder
+    expect(sleeps).toEqual([CLOUD_LANE_MIN_INTERVAL_MS - 40])
+  })
+
+  it('a DIFFERENT provider never waits on another provider spacing — only on the lane', async () => {
+    const { sleeps, sleep } = recordingSleep()
+    const now = () => 5_000 // frozen clock: same-provider spacing would be the full interval
+    const opts = { apiKey: API_KEY, sleep, now }
+    await new AnthropicAdapter({ ...opts, fetch: capture({ content: [] }).fetchMock }).complete(MESSAGES)
+    await new OpenAIAdapter({ ...opts, fetch: capture({ choices: [] }).fetchMock }).complete(MESSAGES)
+    expect(sleeps).toEqual([]) // openai immediately after anthropic: no spacing wait
+    await new AnthropicAdapter({ ...opts, fetch: capture({ content: [] }).fetchMock }).complete(MESSAGES)
+    expect(sleeps).toEqual([CLOUD_LANE_MIN_INTERVAL_MS]) // anthropic again: full spacing
+  })
+})
+
+describe('cloud 429 handling (§8: provider rate limits, in-lane retries)', () => {
+  it('honors Retry-After seconds: one retry, success, exactly 2 fetches', async () => {
+    const { sleeps, sleep } = recordingSleep()
+    let call = 0
+    const fetchMock = vi.fn(async () => (++call === 1 ? rateLimited('1') : okResponse()))
+    const completion = await new AnthropicAdapter({ apiKey: API_KEY, fetch: fetchMock, sleep }).complete(MESSAGES)
+    expect(completion.text).toBe('ok')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(sleeps).toEqual([1000])
+  })
+
+  it('429 forever: default wait per retry, then the normal scrubbed CloudBrainError', async () => {
+    const { sleeps, sleep } = recordingSleep()
+    // Hostile case: the provider echoes the key back in the 429 body.
+    const fetchMock = vi.fn(async () => rateLimited(undefined, `{"error":"slow down, ${API_KEY}"}`))
+    const brain = new OpenAIAdapter({ apiKey: API_KEY, fetch: fetchMock, sleep })
+    const error = (await brain.complete(MESSAGES).catch((e: unknown) => e)) as CloudBrainError
+    expect(error).toBeInstanceOf(CloudBrainError)
+    expect(error.status).toBe(429)
+    expect(error.message).toContain('HTTP 429')
+    expect(error.message).not.toContain(API_KEY)
+    expect(error.message).toContain('[redacted]')
+    expect(fetchMock).toHaveBeenCalledTimes(CLOUD_RATE_LIMIT_RETRIES + 1)
+    expect(sleeps).toEqual(Array.from({ length: CLOUD_RATE_LIMIT_RETRIES }, () => CLOUD_RATE_LIMIT_DEFAULT_WAIT_MS))
+  })
+
+  it('caps a huge Retry-After at CLOUD_RATE_LIMIT_MAX_WAIT_MS', async () => {
+    const { sleeps, sleep } = recordingSleep()
+    let call = 0
+    const fetchMock = vi.fn(async () => (++call === 1 ? rateLimited('3600') : okResponse()))
+    await new AnthropicAdapter({ apiKey: API_KEY, fetch: fetchMock, sleep }).complete(MESSAGES)
+    expect(sleeps).toEqual([CLOUD_RATE_LIMIT_MAX_WAIT_MS])
+  })
+
+  it('parses an HTTP-date Retry-After relative to now', async () => {
+    const { sleeps, sleep } = recordingSleep()
+    const base = Date.parse('2026-07-05T12:00:00Z')
+    const now = () => base
+    let call = 0
+    const fetchMock = vi.fn(async () => (++call === 1 ? rateLimited(new Date(base + 5000).toUTCString()) : okResponse()))
+    await new AnthropicAdapter({ apiKey: API_KEY, fetch: fetchMock, sleep, now }).complete(MESSAGES)
+    expect(sleeps).toEqual([5000])
+  })
+
+  it('HOLDS the lane across the 429 wait — a parallel caller cannot stampede the provider', async () => {
+    let releaseWait!: () => void
+    const waitGate = new Promise<void>((resolve) => {
+      releaseWait = resolve
+    })
+    const sleep = vi.fn(() => waitGate) // the retry wait, under test control
+    let call = 0
+    const fetchMock = vi.fn(async () => (++call === 1 ? rateLimited('1') : okResponse()))
+    const limited = new AnthropicAdapter({ apiKey: API_KEY, fetch: fetchMock, sleep })
+    const bystander = new OpenAIAdapter({ apiKey: API_KEY, fetch: fetchMock, sleep })
+
+    const p1 = limited.complete(MESSAGES)
+    const p2 = bystander.complete(MESSAGES)
+    await settle()
+    // p1 got its 429 and is waiting IN-lane; p2's fetch must not have started.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    releaseWait()
+    await Promise.all([p1, p2])
+    expect(fetchMock).toHaveBeenCalledTimes(3) // 429 + retry + bystander
+  })
+
+  it('non-429 HTTP errors are never retried here (the task queue owns coarse retries, §20)', async () => {
+    const { sleeps, sleep } = recordingSleep()
+    const fetchMock = vi.fn(async () => new Response('{"error":"boom"}', { status: 500 }))
+    const brain = new GeminiAdapter({ apiKey: API_KEY, fetch: fetchMock, sleep })
+    await expect(brain.complete(MESSAGES)).rejects.toThrow(/HTTP 500/)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(sleeps).toEqual([])
   })
 })

@@ -21,6 +21,7 @@ export {
   type KernelDeps
 } from './kernel'
 export { LangGraphRunner, type LangGraphRunnerDeps } from './runner'
+export { createInflightYield, type InflightYieldOptions } from './yield'
 export {
   WorkflowJobError,
   type ActionExecutor,

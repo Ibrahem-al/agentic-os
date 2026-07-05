@@ -54,6 +54,62 @@ const initialSchema: Migration = {
 /** The production migration registry, ascending by version. */
 export const MIGRATIONS: readonly Migration[] = [initialSchema]
 
+// ── Update-path probe (phase-13 test seam) ───────────────────────────────────
+
+/**
+ * Env var that appends the update-path probe to the default registry — a
+ * recorded rule-12 test seam, same hermeticity family as
+ * AGENTIC_OS_USER_DATA_DIR. The production registry is [v1], so proving the
+ * §3 update path ("migrations run, with the pre-migration backup" — §21
+ * rule 9) on a REAL packaged boot needs a genuine pending migration without
+ * shipping a fake production one. The packaged-app smoke launches once
+ * normally (the store lands at v1), relaunches with this set to '1' ("the
+ * update"), and asserts the `<stamp>-pre-migration-v1000` backup dir plus the
+ * v1000 sidecar.
+ */
+export const UPDATE_PATH_PROBE_ENV = 'AGENTIC_OS_TEST_MIGRATION_V2'
+
+/**
+ * The probe itself: a tiny node table + one row, idempotent like every
+ * migration (§21 rule 9). Version 1000 so genuine future migrations
+ * (2, 3, …) never collide with a store that once ran the probe.
+ */
+export const UPDATE_PATH_PROBE_MIGRATION: Migration = {
+  version: 1000,
+  name: 'update-path-probe',
+  async up(ctx) {
+    await ctx.cypher('CREATE NODE TABLE IF NOT EXISTS UpdatePathProbe(id STRING, PRIMARY KEY(id))')
+    await ctx.cypher("MERGE (p:UpdatePathProbe {id: 'update-path-probe'})")
+  }
+}
+
+/**
+ * Default registry for one engine open. The env is read at OPEN time — never
+ * at module load — so one build can be launched, updated (env set) and
+ * downgraded (env cleared) across processes, which is exactly what the
+ * packaged smoke does.
+ */
+export function defaultMigrations(): readonly Migration[] {
+  return process.env[UPDATE_PATH_PROBE_ENV] === '1' ? [...MIGRATIONS, UPDATE_PATH_PROBE_MIGRATION] : MIGRATIONS
+}
+
+// ── Downgrade guard ──────────────────────────────────────────────────────────
+
+/**
+ * §3 "Updates & migration": an update that is actually a rollback must never
+ * touch accumulated memory (§21 rule 9). Thrown when the on-disk schema is
+ * NEWER than this build's registry — before any write to the store or the
+ * sidecar. Wording mirrors appdata.ts's user_version guard.
+ */
+export class GraphSchemaNewerError extends Error {
+  constructor(graphDir: string, onDisk: number, latest: number) {
+    super(
+      `graph store at ${graphDir} is schema v${onDisk}, newer than this build understands (v${latest}) — it belongs to a newer build; refusing to touch it`
+    )
+    this.name = 'GraphSchemaNewerError'
+  }
+}
+
 /** Validates uniqueness/ordering and returns an ascending-sorted copy. */
 export function validateMigrations(migrations: readonly Migration[]): Migration[] {
   const sorted = [...migrations].sort((a, b) => a.version - b.version)

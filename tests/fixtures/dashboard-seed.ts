@@ -19,9 +19,9 @@
  * Embeddings default to the deterministic offline fakes (retrieval quality
  * is irrelevant for panel demos); --real-embeddings uses the local Ollama.
  */
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { RYU_EXTENSION_VERSION_DIR } from '../../src/main/config'
 import { OllamaClient } from '../../src/main/models'
 import { openAppData, openRyuGraphEngine } from '../../src/main/storage'
@@ -298,7 +298,11 @@ export async function seedDashboardDemo(
 }
 
 // CLI entry (esbuild-bundled; see module header).
-const isMain = process.argv[1] !== undefined && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href
+// pathToFileURL, NOT a hand-built `file:///${argv[1]}`: POSIX absolute paths
+// already start with '/', so the hand-built form produced file:////home/…,
+// the comparison never matched, and the CLI block silently no-oped on Linux
+// (exit 0, empty stdout — found on the first linux CI e2e run).
+const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href
 if (isMain) {
   const dir = process.argv[2]
   if (dir === undefined || dir === '') {
@@ -308,7 +312,10 @@ if (isMain) {
   seedDashboardDemo(dir, { realEmbeddings: process.argv.includes('--real-embeddings') })
     .then((result) => {
       if (process.argv.includes('--json')) {
-        console.log(JSON.stringify(result))
+        // writeSync, not console.log: process.exit(0) below drops async-
+        // buffered pipe writes on Linux (console.log to a pipe is async
+        // there; Windows pipe writes are sync, which masked this locally).
+        writeSync(1, JSON.stringify(result) + '\n')
       } else {
         console.log(`[dashboard-seed] demo data seeded at ${result.userDataDir}`)
         console.log(`[dashboard-seed]   staged correction: ${result.stagedCorrectionId}`)

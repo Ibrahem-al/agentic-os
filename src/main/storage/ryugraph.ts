@@ -56,8 +56,9 @@ import {
 } from './schema'
 import {
   backupGraphDir,
+  defaultMigrations,
+  GraphSchemaNewerError,
   graphDirHasData,
-  MIGRATIONS,
   readSchemaSidecar,
   validateMigrations,
   writeSchemaSidecar,
@@ -188,6 +189,67 @@ function validatePropValue(name: string, type: PropertyType, value: unknown, lab
 }
 
 /**
+ * Embeddings are NEVER bound as bare number[] parameters: ryugraph 25.9.1's
+ * NAPI layer infers a JS array's list type from element[0] alone — a vector
+ * whose first element is integral (0 is common) binds as LIST[INT64] and
+ * every fractional element's float64 bits are reinterpreted as int64
+ * (~4.6e18 garbage) before the CAST, silently corrupting the stored vector;
+ * the corrupted magnitudes then overflow float32 cosine accumulation in a
+ * CPU-dependent way (found on CI — the phase-13 report has the mechanism).
+ * The lossless, parameter-speed fix: prepend a FRACTIONAL sentinel so
+ * element[0] forces LIST[DOUBLE] (every element then binds losslessly) and
+ * strip it in Cypher via list_slice (probe-verified against the poison
+ * vector; Float64Array binds as a STRUCT and inline literals cost ~90 ms of
+ * parse per search — both rejected).
+ */
+const EMBEDDING_PARAM_SENTINEL = 0.5
+/**
+ * Per-element half of the workaround. The binding converts each element by
+ * its own kind (integral → INT64) and then bit-reinterprets it into the
+ * list's inferred type, so inside a LIST[DOUBLE] a non-zero integral element
+ * is destroyed (1 → 5e-324) while zeros survive by bit-identity. The nudge
+ * `v·(1+2⁻²⁶)` makes such elements fractional at a relative error of
+ * 1.5e-8 — BELOW HALF A FLOAT32 ULP, so the stored FLOAT[1024] value rounds
+ * back to exactly `v`: provably lossless at column precision. (|v| ≥ 2²⁶
+ * stays integral after the multiply; +0.4999999 is float32-invisible there.)
+ */
+function sanitizeVectorElements(value: readonly number[]): number[] {
+  return value.map((v) => {
+    if (v === 0 || !Number.isInteger(v)) return v
+    const nudged = v * (1 + 2 ** -26)
+    return Number.isInteger(nudged) ? v + 0.4999999 : nudged
+  })
+}
+function embeddingParam(value: unknown, context: string): number[] {
+  if (!Array.isArray(value)) throw new Error(`${context}: embedding must be a number[]`)
+  for (const v of value) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new Error(`${context}: embedding elements must be finite numbers`)
+    }
+  }
+  // The fractional sentinel pins the list's inferred type to DOUBLE (it is
+  // taken from element[0] alone); sanitize protects the other elements.
+  return [EMBEDDING_PARAM_SENTINEL, ...sanitizeVectorElements(value as number[])]
+}
+/** The Cypher expression recovering the real vector from a sentinel param. */
+function embeddingParamExpr(key: string): string {
+  // list_slice is 1-based and inclusive: elements 2..DIM+1 = the vector.
+  return `CAST(list_slice($${key}, 2, ${EMBEDDING_DIM + 1}) AS FLOAT[${EMBEDDING_DIM}])`
+}
+/**
+ * QUERY-side twin of embeddingParam: QUERY_VECTOR_INDEX arguments accept only
+ * LITERAL/PARAMETER/PATTERN — no list_slice expression, so no sentinel.
+ * Elements are sanitized the same lossless way; a zero first element (the
+ * one case sanitize leaves integral) becomes 1e-8, a query-side-only
+ * perturbation shifting cosine distances by ~1e-16. Nothing stored changes.
+ */
+function queryVectorParam(embedding: readonly number[]): number[] {
+  const q = sanitizeVectorElements(embedding)
+  if (q.length > 0 && q[0] === 0) q[0] = 1e-8
+  return q
+}
+
+/**
  * Property-map / SET fragment builder. Returns the Cypher expression for a
  * validated property and appends its encoded parameter to `params`.
  */
@@ -204,8 +266,9 @@ function propExpression(
     return `timestamp($${key})`
   }
   if (type === 'EMBEDDING') {
-    params[key] = value
-    return `CAST($${key} AS FLOAT[${EMBEDDING_DIM}])`
+    // See embeddingParam: a bare number[] here corrupts the stored vector.
+    params[key] = embeddingParam(value, `property "${name}"`)
+    return embeddingParamExpr(key)
   }
   params[key] = value
   return `$${key}`
@@ -246,7 +309,9 @@ export class RyuGraphEngine implements StorageEngine {
 
   /** Open (creating/migrating as needed). The only way to construct an engine. */
   static async open(options: RyuGraphEngineOptions): Promise<RyuGraphEngine> {
-    const migrations = validateMigrations(options.migrations ?? MIGRATIONS)
+    // Default registry resolved at open time (defaultMigrations reads the
+    // AGENTIC_OS_TEST_MIGRATION_V2 seam per open, never at module load).
+    const migrations = validateMigrations(options.migrations ?? defaultMigrations())
     const latest = migrations.length > 0 ? (migrations[migrations.length - 1] as Migration).version : 0
 
     if (existsSync(options.graphDir) && !statSync(options.graphDir).isDirectory()) {
@@ -255,10 +320,18 @@ export class RyuGraphEngine implements StorageEngine {
       )
     }
 
+    // §3 downgrade guard, layer 1 (sidecar): a store proclaiming a NEWER
+    // schema than this registry means the app was rolled back — refuse before
+    // the db is opened, before any backup, before any sidecar write (§21
+    // rule 9: accumulated memory is never corrupted).
+    const sidecarVersion = readSchemaSidecar(options.graphDir)
+    if (sidecarVersion !== null && sidecarVersion > latest) {
+      throw new GraphSchemaNewerError(options.graphDir, sidecarVersion, latest)
+    }
+
     // §21 rule 9: back up BEFORE the db is opened/locked. The sidecar tells us
     // the version without opening; missing sidecar with data present → back up
     // defensively.
-    const sidecarVersion = readSchemaSidecar(options.graphDir)
     let backupCreated: string | null = null
     if (graphDirHasData(options.graphDir) && (sidecarVersion === null || sidecarVersion < latest)) {
       backupCreated = backupGraphDir(options.graphDir, options.backupsDir, latest)
@@ -278,8 +351,23 @@ export class RyuGraphEngine implements StorageEngine {
       backupCreated,
       options.laneJournalCapacity
     )
-    await engine.loadExtensions(options.extensionsDir)
-    await engine.migrate(migrations)
+    try {
+      await engine.loadExtensions(options.extensionsDir)
+      await engine.migrate(migrations)
+    } catch (err) {
+      // A refused/failed open must not leak native handles (the downgrade
+      // guard's layer 2 fires after the db is open; callers — and test
+      // teardown — need the file locks released). Nothing was written, so a
+      // plain close of the handles suffices.
+      try {
+        readConn.closeSync()
+        writeConn.closeSync()
+        db.closeSync()
+      } catch {
+        // Best-effort: the original error is the one that matters.
+      }
+      throw err
+    }
     return engine
   }
 
@@ -308,7 +396,13 @@ export class RyuGraphEngine implements StorageEngine {
   }
 
   private async migrate(migrations: readonly Migration[]): Promise<void> {
+    const latest = migrations.length > 0 ? (migrations[migrations.length - 1] as Migration).version : 0
     const current = await this.readSchemaVersionFromGraph()
+    // §3 downgrade guard, layer 2 (authoritative SchemaVersion nodes): the
+    // sidecar can be lost or stale, so re-check against the graph itself —
+    // BEFORE any migration write, and before the sidecar-repair below could
+    // rewrite the sidecar to the newer number.
+    if (current > latest) throw new GraphSchemaNewerError(this.graphDir, current, latest)
     const pending = migrations.filter((m) => m.version > current)
     let applied = current
     for (const m of pending) {
@@ -354,7 +448,27 @@ export class RyuGraphEngine implements StorageEngine {
       if (typeof value === 'number' && !Number.isFinite(value)) {
         throw new Error(`cypher param $${key}: non-finite number`)
       }
-      if (Array.isArray(value)) assertFiniteNumbersIfNumeric(value, key)
+      if (Array.isArray(value)) {
+        assertFiniteNumbersIfNumeric(value, key)
+        // ryugraph 25.9.1 NAPI defect (see embeddingParam): the list type is
+        // inferred from element[0], each element converts by its own kind,
+        // and mismatches are bit-reinterpreted — an INT64-typed list mangles
+        // fractional elements, a DOUBLE-typed list mangles non-zero integral
+        // ones (zeros survive by bit-identity). All-integral lists and
+        // fractional-with-zeros lists bind losslessly; the poison mixes are
+        // refused rather than silently corrupted.
+        const first = value[0]
+        if (typeof first === 'number') {
+          const poisoned = Number.isInteger(first)
+            ? value.some((v) => typeof v === 'number' && !Number.isInteger(v))
+            : value.some((v) => typeof v === 'number' && v !== 0 && Number.isInteger(v))
+          if (poisoned) {
+            throw new Error(
+              `cypher param $${key}: numeric list mixing integral and fractional elements would be silently corrupted by the ryugraph 25.9.1 binding (type inferred from element[0], mismatched elements bit-reinterpreted) — use the engine's upsertNode/vectorSearch for embeddings, or keep list elements the same numeric kind (zeros are safe)`
+            )
+          }
+        }
+      }
       encoded[key] = value === undefined ? null : value
     }
     return encoded
@@ -408,8 +522,9 @@ export class RyuGraphEngine implements StorageEngine {
       throw new Error(`vectorSearch(${label}): expected ${EMBEDDING_DIM}-dim embedding, got ${embedding.length}`)
     }
     assertFiniteNumbers(embedding, `vectorSearch(${label})`)
+    // Query vector sanitized against the NAPI list mangle (queryVectorParam).
     const query = `CALL QUERY_VECTOR_INDEX('${label}', '${vectorIndexName(label)}', $q, $k) RETURN node.id AS id, distance ORDER BY distance, id`
-    const params = { q: [...embedding], k }
+    const params = { q: queryVectorParam(embedding), k }
     let rows: Row[]
     try {
       rows = await this.run(this.readConn, query, params)
@@ -589,9 +704,10 @@ export class RyuGraphEngine implements StorageEngine {
     const doRebuild = async (): Promise<void> => {
       await this.run(this.writeConn, `CALL DROP_VECTOR_INDEX('${label}', '${vectorIndexName(label)}')`)
       try {
-        const expr = embedding === null ? 'NULL' : `CAST($e AS FLOAT[${EMBEDDING_DIM}])`
+        // Sentinel param — see embeddingParam (a bare number[] corrupts).
+        const expr = embedding === null ? 'NULL' : embeddingParamExpr('e')
         const params: Record<string, unknown> = { id, __now: nowIso }
-        if (embedding !== null) params['e'] = [...embedding]
+        if (embedding !== null) params['e'] = embeddingParam([...embedding], `rebuildEmbedding(${label})`)
         await this.run(
           this.writeConn,
           `MATCH (n:${label} {id: $id}) SET n.embedding = ${expr}, n.updated_at = timestamp($__now)`,
@@ -604,6 +720,33 @@ export class RyuGraphEngine implements StorageEngine {
           `CALL CREATE_VECTOR_INDEX('${label}', '${vectorIndexName(label)}', 'embedding')`
         )
       }
+      // Phase-13 hardening: on some hardware RyuGraph 25.9.1's vector
+      // extension serves a just-re-embedded vector as zeros — the exact-match
+      // query returns the right node at distance EXACTLY 1 (found on CI
+      // runners; environment-conditional upstream defect, unreproducible on
+      // dev machines — see the phase-13 report). Verify the index actually
+      // serves the new embedding; heal once (CHECKPOINT flushes the WAL so
+      // the recreate reads on-disk state, then rebuild the index fresh); a
+      // second miss fails the caller's lane job LOUDLY — a silently broken
+      // index would degrade every retrieval until the next rebuild (§21).
+      if (embedding !== null) {
+        if (await this.indexServes(label, id, embedding)) return
+        await this.run(this.writeConn, 'CHECKPOINT')
+        await this.run(this.writeConn, `CALL DROP_VECTOR_INDEX('${label}', '${vectorIndexName(label)}')`)
+        await this.run(
+          this.writeConn,
+          `CALL CREATE_VECTOR_INDEX('${label}', '${vectorIndexName(label)}', 'embedding')`
+        )
+        if (await this.indexServes(label, id, embedding)) {
+          console.warn(
+            `[storage] vector index for ${label} healed after a checkpoint+rebuild — ryugraph 25.9.1 re-embed defect (see phase-13 report)`
+          )
+          return
+        }
+        throw new Error(
+          `rebuildEmbedding(${label}, ${id}): the vector index does not serve the updated embedding even after a checkpoint+rebuild — ryugraph 25.9.1 vector-extension defect on this environment; refusing to leave a silently broken index`
+        )
+      }
     }
     const rebuild = doRebuild()
     this.vectorRebuilds.set(label, rebuild)
@@ -612,6 +755,16 @@ export class RyuGraphEngine implements StorageEngine {
     } finally {
       if (this.vectorRebuilds.get(label) === rebuild) this.vectorRebuilds.delete(label)
     }
+  }
+
+  /** True when an exact-match query serves this node at float32 tolerance. */
+  private async indexServes(label: RetrievableLabel, id: string, embedding: readonly number[]): Promise<boolean> {
+    const rows = await this.run(
+      this.writeConn,
+      `CALL QUERY_VECTOR_INDEX('${label}', '${vectorIndexName(label)}', $q, $k) RETURN node.id AS id, distance ORDER BY distance, id`,
+      { q: queryVectorParam(embedding), k: 4 }
+    )
+    return rows.some((r) => String(r['id']) === id && Number(r['distance']) < 0.001)
   }
 
   private validateEdge(type: EdgeType, from: NodeRef, to: NodeRef, props?: EdgeProps): void {
@@ -675,7 +828,7 @@ function assertFiniteNumbersIfNumeric(values: readonly unknown[], key: string): 
   }
 }
 
-/** Open the embedded graph store (§5): backup-if-migrating, open, migrate. */
+/** Open the embedded graph store (§5): downgrade guard (§3) → backup-if-migrating → open → migrate. */
 export async function openRyuGraphEngine(options: RyuGraphEngineOptions): Promise<RyuGraphEngine> {
   return RyuGraphEngine.open(options)
 }

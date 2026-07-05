@@ -6,6 +6,8 @@
  *    distilled Session stub and every extracted node/edge stay. The whole
  *    prune is ONE structured, audited write-lane job (per-property pre-images
  *    recorded), so it is undoable from the dashboard like any §13 action.
+ *    Phase 13: the same slot also sweeps finished task rows and dead
+ *    workflow checkpoints (runTaskRetentionSweep below).
  *  - 'export' (§5 memory insurance): the phase-01 exportGraph dump into
  *    exports/<date>/ (CSV + Cypher + manifest).
  *
@@ -13,10 +15,12 @@
  * phase 12 (registerSkillImprovementHandler in src/main/agents/skills) — the
  * phase-11 no-op stub is gone.
  */
-import { TRANSCRIPT_RETENTION_DAYS } from '../config'
+import type BetterSqlite3 from 'better-sqlite3'
+import { TASK_ROW_RETENTION_DAYS, TRANSCRIPT_RETENTION_DAYS } from '../config'
 import type { AuditLog } from '../security'
 import { exportGraph, type StorageEngine, type WriteTx } from '../storage'
 import type { DurableTaskQueue } from './queue'
+import { EXTRACTION_TASK_KIND } from './sessionEnd'
 
 export interface MaintenanceJobDeps {
   readonly engine: StorageEngine
@@ -64,15 +68,70 @@ export async function runPruneJob(deps: MaintenanceJobDeps, now: Date = new Date
   return { pruned: ids, cutoffIso }
 }
 
+export interface TaskSweepResult {
+  /** done/failed task rows deleted (§6 dedup tokens excluded). */
+  readonly taskRows: number
+  /** workflow_checkpoints + workflow_checkpoint_writes rows deleted. */
+  readonly checkpointRows: number
+  readonly cutoffIso: string
+}
+
+/**
+ * Phase-13 hardening: sweep task rows with status done/failed older than
+ * TASK_ROW_RETENTION_DAYS, plus the checkpoints of finished workflow jobs.
+ * Deliberately NOT audited — the §13 audit discipline covers graph + file
+ * writes; task rows are queue bookkeeping (appdata-only operational state,
+ * like spend rows).
+ *
+ * Kept forever: kind='extraction' rows and kind='workflow' rows whose id
+ * starts with 'extract-' — those ids are the §6 exactly-once dedup tokens
+ * (the mcp_calls inactivity sweep and the spool drain rely on the row
+ * existing; a swept row would allow re-extraction). Checkpoints of DONE
+ * workflow jobs go regardless (resume() no-ops on done rows) — that includes
+ * extract-*-wf checkpoints, safe because their task rows are kept and done
+ * tasks never re-fire.
+ */
+export function runTaskRetentionSweep(db: BetterSqlite3.Database, now: Date = new Date()): TaskSweepResult {
+  // tasks.updated_at is TEXT strftime('%Y-%m-%dT%H:%M:%fZ') — the same shape
+  // as Date.toISOString(), so lexicographic comparison is chronological.
+  const cutoffIso = new Date(now.getTime() - TASK_ROW_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString()
+  // Checkpoints first: their thread_id subquery must still see the finished
+  // workflow rows the task sweep below deletes.
+  const checkpointRows =
+    db
+      .prepare(
+        `DELETE FROM workflow_checkpoints WHERE thread_id IN (
+           SELECT id FROM tasks WHERE kind = 'workflow' AND status = 'done' AND updated_at < ?)`
+      )
+      .run(cutoffIso).changes +
+    db
+      .prepare(
+        `DELETE FROM workflow_checkpoint_writes WHERE thread_id IN (
+           SELECT id FROM tasks WHERE kind = 'workflow' AND status = 'done' AND updated_at < ?)`
+      )
+      .run(cutoffIso).changes
+  const taskRows = db
+    .prepare(
+      `DELETE FROM tasks
+       WHERE status IN ('done', 'failed') AND updated_at < ?
+         AND kind != ? AND NOT (kind = 'workflow' AND id LIKE 'extract-%')`
+    )
+    .run(cutoffIso, EXTRACTION_TASK_KIND).changes
+  return { taskRows, checkpointRows, cutoffIso }
+}
+
 /** Register the prune/export schedule-slot handlers on the queue. */
 export function registerMaintenanceHandlers(queue: DurableTaskQueue, deps: MaintenanceJobDeps): void {
   queue.registerHandler('prune', async () => {
     const result = await runPruneJob(deps)
+    // The nightly 03:00 slot doubles as the appdata retention sweep.
+    const sweep = runTaskRetentionSweep(queue.mirrorDb)
+    const pruneNote =
+      result.pruned.length === 0
+        ? `no sessions older than ${TRANSCRIPT_RETENTION_DAYS}d carry a transcript_ref`
+        : `dropped transcript_ref from ${result.pruned.length} session(s), stubs kept`
     return {
-      note:
-        result.pruned.length === 0
-          ? `no sessions older than ${TRANSCRIPT_RETENTION_DAYS}d carry a transcript_ref`
-          : `dropped transcript_ref from ${result.pruned.length} session(s), stubs kept`
+      note: `${pruneNote}; swept ${sweep.taskRows} task row(s), ${sweep.checkpointRows} checkpoint row(s)`
     }
   })
 

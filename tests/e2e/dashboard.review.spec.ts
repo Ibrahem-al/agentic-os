@@ -2,14 +2,20 @@
  * Phase-10 DoD e2e 1: approve a staged write from the review queue and see
  * the graph reflect it in the memory browser (§13 staged → validated →
  * committed, driven end to end through the real UI + IPC + write lane).
+ *
+ * Ollama-gated like the ingest spec (phase 13): approving a correction that
+ * patches a Preference statement re-embeds it at commit (embedOnCommit, real
+ * bge-m3) — on a runner without Ollama the commit honestly fails with
+ * COMMIT_FAILED. CI keeps staged-approve coverage through the golden path,
+ * which approves a staged extraction on scripted models.
  */
 import { expect, test } from '@playwright/test'
-import { launchSeededApp, type LaunchedApp } from './launch'
+import { launchSeededApp, ollamaAvailable, type LaunchedApp } from './launch'
 
-let ctx: LaunchedApp
+let ctx: LaunchedApp | undefined
 
 test.beforeAll(async () => {
-  ctx = await launchSeededApp('review')
+  if (await ollamaAvailable()) ctx = await launchSeededApp('review')
 })
 
 test.afterAll(async () => {
@@ -17,7 +23,8 @@ test.afterAll(async () => {
 })
 
 test('approve a staged correction from the review queue', async () => {
-  const { page, seed } = ctx
+  test.skip(ctx === undefined, 'Ollama not reachable — the approve→commit path re-embeds with real bge-m3')
+  const { page, seed } = ctx!
 
   await page.getByTestId('nav-review').click()
 

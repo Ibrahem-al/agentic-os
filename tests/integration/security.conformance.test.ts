@@ -18,7 +18,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { DenoLane, ensureDenoBinary } from '../../src/main/security/deno'
-import { DockerLane, detectDocker } from '../../src/main/security/docker'
+import { DockerLane, detectDocker, dockerHostUserArgs, interpretDockerProbe } from '../../src/main/security/docker'
 import type { SandboxResult } from '../../src/main/security/sandbox'
 import {
   ALLOWED_SERVER_BODY,
@@ -150,6 +150,50 @@ function assertOutcome(result: SandboxResult, expected: ExpectedOutcome, label: 
     expect(probe.data, `${label}: probe data mismatch`).toBe(expected.data)
   }
 }
+
+// Pure pins for the Docker lane's environment handling — these run on every
+// machine, including CI runners with no Docker or a Windows-containers daemon
+// (where the container cases above skip). They pin the two CI root causes:
+// a windows daemon must be detected as unavailable-with-guidance, and on
+// POSIX hosts the container must run as the HOST user so rw bind mounts obey
+// host DAC (native-Linux daemons expose real uid/gid; --cap-drop ALL strips
+// CAP_DAC_OVERRIDE from container root).
+describe('docker lane environment handling (pure pins)', () => {
+  it('detection is available only for a linux-containers daemon', () => {
+    expect(interpretDockerProbe(0, 'linux 28.0.4\n', '')).toEqual({ available: true, version: '28.0.4' })
+  })
+
+  it('a windows-containers daemon is unavailable with switch-to-Linux guidance', () => {
+    const detection = interpretDockerProbe(0, 'windows 27.3.1\n', '')
+    expect(detection.available).toBe(false)
+    if (!detection.available) {
+      expect(detection.guidance).toContain('Windows-containers mode — switch to Linux containers')
+    }
+  })
+
+  it('an unreachable daemon keeps the install/start guidance with the stderr detail', () => {
+    const detection = interpretDockerProbe(1, '', 'error during connect: the docker daemon is not running\nmore')
+    expect(detection.available).toBe(false)
+    if (!detection.available) {
+      expect(detection.guidance).toContain('Docker is not reachable')
+      expect(detection.guidance).toContain('error during connect: the docker daemon is not running')
+    }
+  })
+
+  it('--user matches the host user on POSIX and is omitted where getuid does not exist', () => {
+    expect(dockerHostUserArgs(() => 1001, () => 118)).toEqual(['--user', '1001:118'])
+    // NOTE: passing explicit undefined would still resolve the DEFAULT
+    // parameters (process.getuid), so the win32 "omitted" branch is asserted
+    // via the real-platform check below, not a stub — explicit undefined
+    // returned the runner's real uid on the first ubuntu CI run.
+    const real = dockerHostUserArgs()
+    if (process.getuid !== undefined && process.getgid !== undefined) {
+      expect(real).toEqual(['--user', `${process.getuid()}:${process.getgid()}`])
+    } else {
+      expect(real).toEqual([])
+    }
+  })
+})
 
 describe('sandbox conformance — one capability table, two lanes (§11)', () => {
   for (const conformanceCase of CONFORMANCE_CASES) {

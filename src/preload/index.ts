@@ -29,8 +29,10 @@ const subscribe = <T>(eventChannel: string) => {
   }
 }
 
+// NOTE: no appVersion here — npm_package_version is absent in packaged builds
+// and would freeze a stale string. The real version crosses via `app.status`
+// (the rail footer renders it); nothing in the renderer read the preload copy.
 const api = {
-  appVersion: process.env['npm_package_version'] ?? '0.0.1',
   platform: process.platform,
   invoke,
   /** Subscribe to codebase-ingest progress pushes; returns unsubscribe. */

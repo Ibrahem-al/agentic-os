@@ -32,7 +32,7 @@ export const MCP_INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000
 export const MCP_ENDPOINT_PATH = '/mcp'
 export const MCP_URL = `http://${MCP_HOST}:${MCP_PORT}${MCP_ENDPOINT_PATH}`
 export const MCP_SERVER_NAME = PRODUCT_NAME
-export const MCP_SERVER_VERSION = '0.0.1'
+export const MCP_SERVER_VERSION = '0.1.0'
 /**
  * Values below are not in §20 — conservative rule-12 picks, recorded in the
  * phase-05 report.
@@ -89,6 +89,14 @@ export const EMBEDDING_MODEL = 'bge-m3'
 export const EMBEDDING_DIM = 1024
 /** Small local LLM (Ollama); user-swappable in settings. */
 export const SMALL_LLM_MODEL = 'qwen3:4b'
+/**
+ * §8 "cheap local work runs in a parallel pool" — phase-13 scheduler policy:
+ * at most this many Ollama HTTP requests in flight at once (the daemon
+ * serializes per model anyway; the client-side bound keeps a burst of
+ * background embeds from monopolizing the daemon ahead of a live MCP call).
+ * Rule-12 pick, recorded in the phase-13 report.
+ */
+export const LOCAL_POOL_CONCURRENCY = 4
 /** In-process cross-encoder reranker. */
 export const RERANKER_MODEL = 'BAAI/bge-reranker-v2-m3'
 export const RERANKER_QUANTIZATION = 'int8' as const
@@ -99,8 +107,12 @@ export const RERANKER_IDLE_UNLOAD_MS = 5 * 60 * 1000
 /**
  * Ollama daemon endpoint. Not a §20 value — this is Ollama's own upstream
  * default port, adopted per §21 rule 12 (recorded in the phase-02 report).
+ * AGENTIC_OS_OLLAMA_BASE_URL is a phase-13 test seam (same hermeticity family
+ * as AGENTIC_OS_USER_DATA_DIR): the golden-path e2e and the packaged-app smoke
+ * point the PRODUCTION app at a scripted local-model HTTP server (or a dead
+ * port, to prove the guided-install flow) without touching production code.
  */
-export const OLLAMA_BASE_URL = 'http://127.0.0.1:11434'
+export const OLLAMA_BASE_URL = process.env['AGENTIC_OS_OLLAMA_BASE_URL'] ?? 'http://127.0.0.1:11434'
 /** Installer link shown by the guided-install flow when no daemon is found. */
 export const OLLAMA_INSTALL_URL = 'https://ollama.com/download'
 /** The models the one-click pull installs (§4 setup): embeddings + small LLM. */
@@ -151,6 +163,30 @@ export const CLOUD_DEFAULT_MODELS: Readonly<Record<CloudProvider, string>> = {
 }
 /** Default completion cap — spend-conservative; callers raise it as needed. */
 export const CLOUD_MAX_TOKENS_DEFAULT = 4096
+/**
+ * Phase-13 test seam (rule 12, recorded): when set, boot passes this base URL
+ * to the active provider adapter so the golden-path e2e can stand a scripted
+ * cloud-provider HTTP server in front of the PRODUCTION skill-improvement /
+ * extraction cloud tier. Adapters already accept `baseUrl` (phase 02, "tests,
+ * proxies"); this only wires the existing option through boot. Unset in
+ * normal operation — real provider endpoints are the compiled-in defaults.
+ */
+export const CLOUD_BASE_URL_OVERRIDE = process.env['AGENTIC_OS_CLOUD_BASE_URL']
+/**
+ * §8 "Cloud brain = a single lane (also respecting provider rate limits)" —
+ * phase-13 scheduler policy. All CloudBrain completions serialize through one
+ * global lane; consecutive calls to the SAME provider keep at least this much
+ * spacing. Values are rule-12 picks (recorded in the phase-13 report): a
+ * single desktop user is nowhere near provider limits, so the spacing exists
+ * to be a good citizen and to give 429 handling room to breathe.
+ */
+export const CLOUD_LANE_MIN_INTERVAL_MS = 250
+/** HTTP 429: honor Retry-After up to this cap, then retry (still in-lane). */
+export const CLOUD_RATE_LIMIT_MAX_WAIT_MS = 60_000
+/** Retries per completion on 429 before the error propagates. */
+export const CLOUD_RATE_LIMIT_RETRIES = 2
+/** Fallback wait before a 429 retry when the server sent no Retry-After. */
+export const CLOUD_RATE_LIMIT_DEFAULT_WAIT_MS = 2_000
 
 // ── Kernel / context manager (§9, §10) ──────────────────────────────────────
 /**
@@ -314,6 +350,33 @@ export const JOB_RETRY_BACKOFF_MS = [60_000, 300_000, 1_500_000] as const
  */
 /** Waiting time that lifts a queued task's effective priority by +1 (§8 aging). */
 export const TASK_AGING_INTERVAL_MS = 5 * 60 * 1000
+/**
+ * Phase-13 scheduler policy — priority CLASSES (§8 "live MCP > user-initiated
+ * > background", phase-13 build item). Classes are numeric bands on the
+ * existing `tasks.priority` mirror column (no schema change, durable across
+ * restarts): a task's enqueue priority = its class band + its kind priority.
+ * Aging (§8) still prevents starvation, but its total bonus is capped below
+ * the band width so a background task can NEVER out-rank a user-initiated
+ * one, no matter how long it waited — within a class, aging works exactly as
+ * before. The "live" class has no band: live MCP work is not a queue task;
+ * it is represented by the dispatch/step-boundary yield gate (§8 "no
+ * mid-generation preemption" — cooperative yield only).
+ */
+export const TASK_CLASS_BAND = {
+  /** User-initiated work (e.g. the dashboard's "improve now"). */
+  user: 1000,
+  /** Autonomous background work (triggers, schedules, watchers). */
+  background: 0
+} as const
+/** Max total aging bonus — strictly below the band width (rule-12 pick). */
+export const TASK_AGING_MAX_BONUS = 500
+/**
+ * Phase-13 hardening: done/failed task rows (and the checkpoints of finished
+ * workflow jobs) older than this are swept by the nightly prune. Matches the
+ * §20 transcript retention window (rule-12 pick, recorded). Rows whose ids
+ * are §6 exactly-once tokens (extraction) are never swept.
+ */
+export const TASK_ROW_RETENTION_DAYS = 14
 /** Re-check cadence while background dispatch yields to a live MCP call (§8). */
 export const TASK_YIELD_RECHECK_MS = 1000
 /** Max total yield per dispatch — §8 aging: background must never starve. */

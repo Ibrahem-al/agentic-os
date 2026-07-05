@@ -66,5 +66,12 @@ export {
   type SandboxSuccess
 } from './sandbox'
 export { DenoLane, ensureDenoBinary } from './deno'
-export { detectDocker, DockerLane, resetDockerDetection } from './docker'
+export {
+  detectDocker,
+  DockerLane,
+  dockerHostUserArgs,
+  interpretDockerProbe,
+  resetDockerDetection,
+  type DockerDetection
+} from './docker'
 export { extractZipEntry } from './zip'

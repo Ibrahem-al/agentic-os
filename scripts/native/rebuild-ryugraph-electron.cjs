@@ -38,9 +38,38 @@ const electronVersion = JSON.parse(
   fs.readFileSync(path.join(repoRoot, 'node_modules', 'electron', 'package.json'), 'utf8')
 ).version
 
+/**
+ * A matching marker is NOT proof the binary is still the Electron build:
+ * `npm install` re-runs ryugraph's install script, which copies the npm
+ * prebuilt back over ryujs.node and leaves the stale marker in place (found
+ * live in phase 13 — the clobbered binary hard-crashes electron.exe). Trust
+ * the marker only when ryujs.node differs byte-wise from every prebuilt copy.
+ */
+function clobberedByPrebuilt() {
+  const installed = path.join(ryuDir, 'ryujs.node')
+  if (!fs.existsSync(installed)) return true
+  const prebuiltCopies = [
+    path.join(ryuDir, 'ryujs-node-prebuilt.node'),
+    path.join(ryuDir, 'prebuilt', 'ryujs-win32-x64.node')
+  ]
+  const installedBytes = fs.readFileSync(installed)
+  return prebuiltCopies.some((p) => fs.existsSync(p) && installedBytes.equals(fs.readFileSync(p)))
+}
+
 if (fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').trim() === electronVersion) {
-  console.log(`[ryu-rebuild] ryujs.node already rebuilt for Electron ${electronVersion}, skipping`)
-  process.exit(0)
+  if (!clobberedByPrebuilt()) {
+    console.log(`[ryu-rebuild] ryujs.node already rebuilt for Electron ${electronVersion}, skipping`)
+    process.exit(0)
+  }
+  // Fast path: the incremental build tree usually still holds the last
+  // Electron-safe output — restore it instead of paying a rebuild.
+  const cached = path.join(srcDir, 'tools', 'nodejs_api', 'build', 'ryujs.node')
+  if (fs.existsSync(cached) && !fs.readFileSync(cached).equals(fs.readFileSync(path.join(ryuDir, 'prebuilt', 'ryujs-win32-x64.node')))) {
+    fs.copyFileSync(cached, path.join(ryuDir, 'ryujs.node'))
+    console.log('[ryu-rebuild] ryujs.node was clobbered by an npm install — restored the Electron-safe build from the incremental tree')
+    process.exit(0)
+  }
+  console.log('[ryu-rebuild] ryujs.node was clobbered by an npm install and no cached build exists — rebuilding')
 }
 
 function findVsTool(rel) {

@@ -1,10 +1,11 @@
 /**
  * Ollama client unit tests — all HTTP mocked. Covers the §4 guided-install
  * state machine, one-click pull (NDJSON progress stream), embed dims
- * validation, and generate defaults (think:false, stream:false).
+ * validation, generate defaults (think:false, stream:false), and the §8
+ * local pool (LOCAL_POOL_CONCURRENCY bound on embed/generate).
  */
 import { describe, expect, it, vi } from 'vitest'
-import { EMBEDDING_DIM } from '../../src/main/config'
+import { EMBEDDING_DIM, LOCAL_POOL_CONCURRENCY } from '../../src/main/config'
 import { OllamaClient, OllamaError } from '../../src/main/models'
 
 type FetchMock = ReturnType<typeof vi.fn<(input: string, init?: RequestInit) => Promise<Response>>>
@@ -158,5 +159,67 @@ describe('ollama generate', () => {
   it('surfaces HTTP errors with status and detail', async () => {
     const fetchMock = vi.fn(async () => new Response('{"error":"boom"}', { status: 500 }))
     await expect(new OllamaClient({ fetch: fetchMock }).generate('x')).rejects.toThrow(/HTTP 500.*boom/)
+  })
+})
+
+describe('ollama local pool (§8: cheap local work runs in a parallel pool)', () => {
+  const embedding = () => Array.from({ length: EMBEDDING_DIM }, () => 0.5)
+  /** One macrotask turn — lets queued pool work start (or provably not start). */
+  const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+  it('bounds concurrent embed() requests at LOCAL_POOL_CONCURRENCY and completes all 8', async () => {
+    let inFlight = 0
+    let maxInFlight = 0
+    const gates: (() => void)[] = []
+    const fetchMock = vi.fn(async () => {
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      await new Promise<void>((resolve) => gates.push(resolve))
+      inFlight -= 1
+      return jsonResponse({ embeddings: [embedding()] })
+    })
+    const client = new OllamaClient({ fetch: fetchMock })
+    const jobs = Array.from({ length: 8 }, (_, i) => client.embed([`text ${i}`]))
+
+    await settle()
+    // First wave only — the other 4 are queued on the semaphore, not in HTTP.
+    expect(fetchMock).toHaveBeenCalledTimes(LOCAL_POOL_CONCURRENCY)
+    expect(inFlight).toBe(LOCAL_POOL_CONCURRENCY)
+
+    // Release every request as it arrives; queued work flows in behind.
+    let released = 0
+    while (released < 8) {
+      const gate = gates.shift()
+      if (gate !== undefined) {
+        gate()
+        released += 1
+      }
+      await settle()
+    }
+    const results = await Promise.all(jobs)
+    expect(results).toHaveLength(8)
+    expect(fetchMock).toHaveBeenCalledTimes(8)
+    expect(maxInFlight).toBe(LOCAL_POOL_CONCURRENCY)
+  })
+
+  it('status() bypasses the pool — the dashboard gets an answer while it is saturated', async () => {
+    const gates: (() => void)[] = []
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/tags')) {
+        return jsonResponse({ models: [{ name: 'bge-m3' }, { name: 'qwen3:4b' }] })
+      }
+      await new Promise<void>((resolve) => gates.push(resolve))
+      return jsonResponse({ embeddings: [embedding()] })
+    })
+    const client = new OllamaClient({ fetch: fetchMock })
+    const jobs = Array.from({ length: LOCAL_POOL_CONCURRENCY }, () => client.embed(['x']))
+    await settle()
+    expect(gates).toHaveLength(LOCAL_POOL_CONCURRENCY) // every permit held
+
+    const status = await client.status() // resolves NOW — it never queues
+    expect(status.state).toBe('ready')
+
+    for (const gate of gates) gate()
+    await expect(Promise.all(jobs)).resolves.toHaveLength(LOCAL_POOL_CONCURRENCY)
   })
 })

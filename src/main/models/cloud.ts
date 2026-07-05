@@ -10,8 +10,20 @@
  *
  * Streaming is listed as optional in the phase doc and is deferred: the only
  * callers are background agents that consume whole completions.
+ *
+ * Scheduling (§8, phase 13): every completion rides ONE module-level lane —
+ * at most one cloud HTTP call in flight process-wide, FIFO, with per-provider
+ * start-to-start spacing — and HTTP 429 is retried in-lane per Retry-After.
  */
-import { CLOUD_DEFAULT_MODELS, CLOUD_MAX_TOKENS_DEFAULT, type CloudProvider } from '../config'
+import {
+  CLOUD_DEFAULT_MODELS,
+  CLOUD_LANE_MIN_INTERVAL_MS,
+  CLOUD_MAX_TOKENS_DEFAULT,
+  CLOUD_RATE_LIMIT_DEFAULT_WAIT_MS,
+  CLOUD_RATE_LIMIT_MAX_WAIT_MS,
+  CLOUD_RATE_LIMIT_RETRIES,
+  type CloudProvider
+} from '../config'
 import type { FetchLike } from './ollama'
 
 export type { CloudProvider }
@@ -65,6 +77,67 @@ export class CloudBrainError extends Error {
   }
 }
 
+// ── Cloud lane (§8: "Cloud brain = a single lane (also respecting provider
+//    rate limits)" — phase-13 scheduler policy) ───────────────────────────────
+
+type SleepFn = (ms: number) => Promise<void>
+type NowFn = () => number
+
+const realSleep: SleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Module-level lane state: at most one cloud HTTP call in flight process-wide,
+ * FIFO across ALL adapters and providers, plus per-provider start-to-start
+ * spacing (CLOUD_LANE_MIN_INTERVAL_MS — different providers never wait on each
+ * other's spacing, only on the lane itself). The lane is HELD across a call's
+ * 429 retry waits so parallel callers cannot stampede a rate-limited provider.
+ */
+interface CloudLane {
+  tail: Promise<void>
+  lastStartByProvider: Map<CloudProvider, number>
+}
+
+let cloudLane: CloudLane = { tail: Promise.resolve(), lastStartByProvider: new Map() }
+
+/** Test seam: fresh lane + spacing bookkeeping (in-flight holders keep their captured lane). */
+export function resetCloudLaneForTests(): void {
+  cloudLane = { tail: Promise.resolve(), lastStartByProvider: new Map() }
+}
+
+async function runInCloudLane<T>(provider: CloudProvider, now: NowFn, sleep: SleepFn, task: () => Promise<T>): Promise<T> {
+  const lane = cloudLane
+  const turn = lane.tail
+  let release!: () => void
+  lane.tail = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await turn // FIFO: every earlier caller (any provider) finishes first
+  try {
+    // Same-provider spacing, start-to-start. Marked once per completion — a
+    // 429 retry is part of the same call, and its wait (Retry-After / default)
+    // dwarfs the spacing anyway.
+    const lastStart = lane.lastStartByProvider.get(provider)
+    if (lastStart !== undefined) {
+      const wait = lastStart + CLOUD_LANE_MIN_INTERVAL_MS - now()
+      if (wait > 0) await sleep(wait)
+    }
+    lane.lastStartByProvider.set(provider, now())
+    return await task()
+  } finally {
+    release()
+  }
+}
+
+/** Retry-After per RFC 9110: integer seconds or an HTTP-date; absent/garbage → the §20 default wait. */
+function retryAfterMs(header: string | null, now: NowFn): number {
+  if (header === null) return CLOUD_RATE_LIMIT_DEFAULT_WAIT_MS
+  const trimmed = header.trim()
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000
+  const dateMs = Date.parse(trimmed)
+  if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - now())
+  return CLOUD_RATE_LIMIT_DEFAULT_WAIT_MS
+}
+
 export interface CloudAdapterOptions {
   apiKey: string
   /** Override the model for every call (settings-driven). */
@@ -72,6 +145,10 @@ export interface CloudAdapterOptions {
   /** Override the provider base URL (tests, proxies). */
   baseUrl?: string
   fetch?: FetchLike
+  /** Test seam: lane/429 tests observe waits instead of really waiting. */
+  sleep?: SleepFn
+  /** Test seam: injectable clock for spacing / Retry-After-date arithmetic. */
+  now?: NowFn
 }
 
 abstract class BaseAdapter implements CloudBrain {
@@ -80,6 +157,8 @@ abstract class BaseAdapter implements CloudBrain {
   protected readonly apiKey: string
   protected readonly baseUrl: string
   private readonly fetchImpl: FetchLike
+  private readonly sleep: SleepFn
+  private readonly now: NowFn
 
   constructor(defaultBaseUrl: string, defaultModel: string, options: CloudAdapterOptions) {
     if (!options.apiKey) throw new Error('cloud adapter requires an API key (store it via the keychain)')
@@ -87,36 +166,51 @@ abstract class BaseAdapter implements CloudBrain {
     this.model = options.model ?? defaultModel
     this.baseUrl = (options.baseUrl ?? defaultBaseUrl).replace(/\/$/, '')
     this.fetchImpl = options.fetch ?? ((input, init) => globalThis.fetch(input, init))
+    this.sleep = options.sleep ?? realSleep
+    this.now = options.now ?? (() => Date.now())
   }
 
   abstract complete(messages: ChatMessage[], options?: CompleteOptions): Promise<Completion>
 
-  /** POST JSON; non-2xx throws a CloudBrainError with the key scrubbed out. */
+  /**
+   * POST JSON through the §8 cloud lane; non-2xx throws a CloudBrainError with
+   * the key scrubbed out. HTTP 429 honors Retry-After (capped at
+   * CLOUD_RATE_LIMIT_MAX_WAIT_MS; CLOUD_RATE_LIMIT_DEFAULT_WAIT_MS when
+   * absent) and retries up to CLOUD_RATE_LIMIT_RETRIES times while STILL
+   * HOLDING the lane. Every other failure throws immediately — the task queue
+   * owns coarse retries (§20 job-retry policy), not this module.
+   */
   protected async post(path: string, headers: Record<string, string>, payload: unknown): Promise<unknown> {
-    let response: Response
-    try {
-      response = await this.fetchImpl(`${this.baseUrl}${path}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', ...headers },
-        body: JSON.stringify(payload)
-      })
-    } catch (err) {
-      throw new CloudBrainError(`${this.provider} request failed: ${this.scrub(errorText(err))}`, this.provider)
-    }
-    if (!response.ok) {
-      let detail = ''
-      try {
-        detail = (await response.text()).slice(0, 500)
-      } catch {
-        /* body unreadable — status alone will have to do */
+    return runInCloudLane(this.provider, this.now, this.sleep, async () => {
+      for (let attempt = 0; ; attempt++) {
+        let response: Response
+        try {
+          response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...headers },
+            body: JSON.stringify(payload)
+          })
+        } catch (err) {
+          throw new CloudBrainError(`${this.provider} request failed: ${this.scrub(errorText(err))}`, this.provider)
+        }
+        if (response.ok) return response.json()
+        if (response.status === 429 && attempt < CLOUD_RATE_LIMIT_RETRIES) {
+          await this.sleep(Math.min(retryAfterMs(response.headers.get('retry-after'), this.now), CLOUD_RATE_LIMIT_MAX_WAIT_MS))
+          continue
+        }
+        let detail = ''
+        try {
+          detail = (await response.text()).slice(0, 500)
+        } catch {
+          /* body unreadable — status alone will have to do */
+        }
+        throw new CloudBrainError(
+          `${this.provider} returned HTTP ${response.status}${detail ? `: ${this.scrub(detail)}` : ''}`,
+          this.provider,
+          response.status
+        )
       }
-      throw new CloudBrainError(
-        `${this.provider} returned HTTP ${response.status}${detail ? `: ${this.scrub(detail)}` : ''}`,
-        this.provider,
-        response.status
-      )
-    }
-    return response.json()
+    })
   }
 
   /** Never let the API key appear in an error message or trace (§21 rule 7). */

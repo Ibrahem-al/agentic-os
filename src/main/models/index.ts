@@ -28,6 +28,7 @@ export {
   OpenAIAdapter,
   OpenRouterAdapter,
   createCloudBrain,
+  resetCloudLaneForTests,
   type ChatMessage,
   type ChatRole,
   type CloudAdapterOptions,

@@ -13,6 +13,10 @@
  * ActionExecutor chokepoint (span per action + PHASE-09 permission seam). The
  * root span's trace/span ids persist in the job payload, so a resume in a new
  * process continues the original trace (remote parent context).
+ *
+ * Scheduling (§8): an optional injected yieldPoint is awaited at every step
+ * boundary, so a running multi-step job cooperatively yields to live MCP work
+ * without any mid-step preemption (see yield.ts / createInflightYield).
  */
 import { randomUUID } from 'node:crypto'
 import type BetterSqlite3 from 'better-sqlite3'
@@ -73,6 +77,12 @@ export interface LangGraphRunnerDeps {
   db: BetterSqlite3.Database
   telemetry: Telemetry
   executor: ActionExecutor
+  /**
+   * §8 cooperative yield at step boundaries only — awaited before each step's
+   * work (production wires createInflightYield over the live MCP inflight
+   * counter). Optional: absent = the runner never waits.
+   */
+  yieldPoint?: () => Promise<void>
 }
 
 export class LangGraphRunner implements WorkflowRunner {
@@ -81,6 +91,7 @@ export class LangGraphRunner implements WorkflowRunner {
   private readonly checkpointer: SqliteCheckpointSaver
   private readonly telemetry: Telemetry
   private readonly executor: ActionExecutor
+  private readonly yieldPoint: (() => Promise<void>) | undefined
   private readonly insertJob: BetterSqlite3.Statement
   private readonly selectJob: BetterSqlite3.Statement
   private readonly updatePayload: BetterSqlite3.Statement
@@ -90,6 +101,7 @@ export class LangGraphRunner implements WorkflowRunner {
   constructor(deps: LangGraphRunnerDeps) {
     this.telemetry = deps.telemetry
     this.executor = deps.executor
+    this.yieldPoint = deps.yieldPoint
     this.checkpointer = new SqliteCheckpointSaver(deps.db)
     this.insertJob = deps.db.prepare(
       `INSERT INTO tasks (id, kind, payload_json, status, attempts) VALUES (?, 'workflow', ?, 'running', 1)`
@@ -146,6 +158,13 @@ export class LangGraphRunner implements WorkflowRunner {
       const node = async (state: WorkflowGraphState, config: LangGraphRunnableConfig): Promise<Partial<WorkflowGraphState>> => {
         const jobId = (config.configurable?.['thread_id'] as string | undefined) ?? 'unknown'
         const agentId = (config.configurable?.['agent_id'] as string | undefined) ?? 'system'
+        // §8 cooperative yield at step boundaries only: this runs after the
+        // previous step's checkpoint is durable (durability 'sync') and
+        // before this step does any work, so it cannot corrupt or reorder
+        // checkpoints; both run() and resume() flow through this same node
+        // closure. Awaited BEFORE kernel.execute so the step span's timing
+        // stays honest — the wait is never billed to the step.
+        if (this.yieldPoint !== undefined) await this.yieldPoint()
         const patch = await this.executor.execute(
           agentId,
           {

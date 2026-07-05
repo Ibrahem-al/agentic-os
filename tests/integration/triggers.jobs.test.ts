@@ -4,7 +4,9 @@
  *  - 'prune' (§6/§20): Sessions older than 14 days lose transcript_ref, the
  *    stubs and everything extracted stay; the prune is an AUDITED structured
  *    write — undoing it restores the pre-image (the §13 reversible-delta
- *    guarantee applies to the OS's own maintenance too);
+ *    guarantee applies to the OS's own maintenance too). Phase 13: the same
+ *    slot sweeps finished task rows + dead workflow checkpoints, sparing the
+ *    §6 exactly-once dedup tokens (extraction rows, extract-* workflow ids);
  *  - 'export': the §5 weekly dump lands in exports/<date>/ with a manifest;
  *  - 'skill-improvement': owned by the REAL phase-12 agent
  *    (agents.skillimprove.test.ts); here we pin that a launch WITHOUT the
@@ -17,9 +19,11 @@
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { TASK_ROW_RETENTION_DAYS } from '../../src/main/config'
 import { AuditLog } from '../../src/main/security'
 import { DurableTaskQueue, registerMaintenanceHandlers, runPruneJob } from '../../src/main/triggers'
+import { runTaskRetentionSweep } from '../../src/main/triggers/jobs'
 import { openKernelStack, type KernelTestStack } from '../fixtures/kernel-helpers'
 import { openTestStore, type TestStore } from './helpers'
 
@@ -141,5 +145,84 @@ describe('weekly export + nightly skill slot', () => {
     const settled = await waitForTask('skill-run-1')
     expect(settled.status).toBe('deferred')
     expect(settled.last_error).toContain("no handler registered for kind 'skill-improvement'")
+  })
+})
+
+describe('task-row retention sweep (phase 13: the prune slot also cleans appdata)', () => {
+  it('sweeps old finished rows + finished-workflow checkpoints, keeps the §6 dedup tokens', async () => {
+    const db = stack.appData.db
+    const insert = db.prepare(
+      `INSERT INTO tasks (id, kind, payload_json, status, attempts, priority) VALUES (?, ?, '{}', ?, 1, 0)`
+    )
+    insert.run('old-done-probe', 'ingest-file', 'done') // old + finished → swept
+    insert.run('old-failed-probe', 'watch-scan', 'failed') // old + finished → swept
+    insert.run('extract-abc', 'extraction', 'done') // §6 dedup token → kept forever
+    insert.run('extract-abc-wf', 'workflow', 'done') // extraction workflow id → kept
+    insert.run('skill-xyz-wf', 'workflow', 'done') // ordinary finished workflow → swept
+    insert.run('old-pending', 'ingest-file', 'pending') // not finished → kept
+    insert.run('fresh-done', 'ingest-file', 'done') // finished but fresh → kept
+    const backdated = new Date(Date.now() - (TASK_ROW_RETENTION_DAYS + 5) * DAY_MS).toISOString()
+    db.prepare(
+      `UPDATE tasks SET updated_at = ? WHERE id IN
+       ('old-done-probe','old-failed-probe','extract-abc','extract-abc-wf','skill-xyz-wf','old-pending')`
+    ).run(backdated)
+    // Checkpoints of BOTH finished workflow jobs — dead weight either way
+    // (extract-abc-wf keeps its task row, but its checkpoints still go).
+    const insertCp = db.prepare(
+      `INSERT INTO workflow_checkpoints (thread_id, checkpoint_ns, checkpoint_id, checkpoint, metadata)
+       VALUES (?, '', ?, x'00', x'00')`
+    )
+    const insertCpWrite = db.prepare(
+      `INSERT INTO workflow_checkpoint_writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value)
+       VALUES (?, '', ?, 'wt', 0, 'ch', 'json', x'00')`
+    )
+    insertCp.run('extract-abc-wf', 'cp-1')
+    insertCp.run('extract-abc-wf', 'cp-2')
+    insertCpWrite.run('extract-abc-wf', 'cp-2')
+    insertCp.run('skill-xyz-wf', 'cp-1')
+    insertCpWrite.run('skill-xyz-wf', 'cp-1')
+
+    const logSpy = vi.spyOn(console, 'log')
+    try {
+      queue.enqueue({ id: 'prune-run-2', kind: 'prune' })
+      const settled = await waitForTask('prune-run-2')
+      expect(settled.status).toBe('done')
+      // The handler note carries the sweep counts (3 task rows, 5 checkpoint
+      // rows across both checkpoint tables).
+      const noteLine = logSpy.mock.calls.map((args) => args.join(' ')).find((line) => line.includes('prune-run-2'))
+      expect(noteLine).toContain('swept 3 task row(s), 5 checkpoint row(s)')
+    } finally {
+      logSpy.mockRestore()
+    }
+
+    const has = (id: string): boolean => db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(id) !== undefined
+    expect(has('old-done-probe')).toBe(false)
+    expect(has('old-failed-probe')).toBe(false)
+    expect(has('skill-xyz-wf')).toBe(false)
+    expect(has('extract-abc')).toBe(true) // re-extraction stays impossible
+    expect(has('extract-abc-wf')).toBe(true)
+    expect(has('old-pending')).toBe(true)
+    expect(has('fresh-done')).toBe(true)
+
+    const checkpointCount = (threadId: string): number =>
+      Number(
+        (db.prepare('SELECT count(*) AS c FROM workflow_checkpoints WHERE thread_id = ?').get(threadId) as { c: number })
+          .c
+      ) +
+      Number(
+        (
+          db.prepare('SELECT count(*) AS c FROM workflow_checkpoint_writes WHERE thread_id = ?').get(threadId) as {
+            c: number
+          }
+        ).c
+      )
+    expect(checkpointCount('extract-abc-wf')).toBe(0)
+    expect(checkpointCount('skill-xyz-wf')).toBe(0)
+  }, 30_000)
+
+  it('is idempotent: a rerun finds nothing left to sweep', () => {
+    const sweep = runTaskRetentionSweep(stack.appData.db)
+    expect(sweep.taskRows).toBe(0)
+    expect(sweep.checkpointRows).toBe(0)
   })
 })

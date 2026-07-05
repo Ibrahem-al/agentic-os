@@ -313,14 +313,28 @@ export function DataTable<T>({
                 data-rowkey={key}
                 onClick={clickable ? () => onRowClick(row) : undefined}
                 // Clickable rows are keyboard-operable (WCAG 2.1.1): focusable,
-                // activated with Enter/Space like the button they act as.
+                // activated with Enter/Space like the button they act as, with
+                // ArrowUp/ArrowDown moving focus between sibling rows
+                // (listbox-style; phase-10 recorded P2). Guarded on
+                // target === currentTarget so controls inside cells keep their
+                // own key handling.
                 tabIndex={clickable ? 0 : undefined}
                 onKeyDown={
                   clickable
                     ? (e) => {
-                        if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+                        if (e.target !== e.currentTarget) return
+                        if (e.key === 'Enter' || e.key === ' ') {
                           e.preventDefault()
                           onRowClick(row)
+                        } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                          const sibling =
+                            e.key === 'ArrowDown'
+                              ? e.currentTarget.nextElementSibling
+                              : e.currentTarget.previousElementSibling
+                          if (sibling instanceof HTMLElement && sibling.tabIndex >= 0) {
+                            e.preventDefault() // keep the scroll container still; focus is the move
+                            sibling.focus()
+                          }
                         }
                       }
                     : undefined
@@ -378,6 +392,10 @@ export function Timestamp({ iso, ms }: { iso?: string | null; ms?: number }): Re
 
 // ── modal ─────────────────────────────────────────────────────────────────────
 
+/** Tabbable-element query for the modal focus trap (disabled controls excluded). */
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+
 export function Modal({
   title,
   onClose,
@@ -392,13 +410,51 @@ export function Modal({
   wide?: boolean
 }): React.JSX.Element {
   const dialogRef = useRef<HTMLDivElement | null>(null)
+
+  // Focus lifecycle (runs once per modal): move focus into the dialog so
+  // keyboard users land where they acted; return it to the invoking element
+  // when the dialog closes (WCAG 2.4.3 focus order).
+  useEffect(() => {
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    dialogRef.current?.focus()
+    return () => opener?.focus()
+  }, [])
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') {
+        onClose()
+        return
+      }
+      // Focus trap: Tab/Shift+Tab cycle within the dialog's focusable
+      // elements (aria-modal promises this; phase-10 recorded P2).
+      if (e.key !== 'Tab') return
+      const dialog = dialogRef.current
+      if (dialog === null) return
+      const focusables = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+        (el) => el.offsetParent !== null
+      )
+      const first = focusables[0]
+      const last = focusables[focusables.length - 1]
+      if (first === undefined || last === undefined) {
+        // Nothing tabbable — keep focus parked on the dialog container.
+        e.preventDefault()
+        dialog.focus()
+        return
+      }
+      const active = document.activeElement
+      const inside = active instanceof Node && dialog.contains(active)
+      if (e.shiftKey) {
+        if (!inside || active === first || active === dialog) {
+          e.preventDefault()
+          last.focus()
+        }
+      } else if (!inside || active === last) {
+        e.preventDefault()
+        first.focus()
+      }
     }
     window.addEventListener('keydown', onKey)
-    // Move focus into the dialog so keyboard users land where they acted.
-    dialogRef.current?.focus()
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
   return (

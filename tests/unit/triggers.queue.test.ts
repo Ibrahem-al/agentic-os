@@ -10,7 +10,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { JOB_RETRY_BACKOFF_MS, TASK_YIELD_MAX_MS } from '../../src/main/config'
+import {
+  JOB_RETRY_BACKOFF_MS,
+  TASK_AGING_INTERVAL_MS,
+  TASK_AGING_MAX_BONUS,
+  TASK_CLASS_BAND,
+  TASK_PRIORITY,
+  TASK_YIELD_MAX_MS
+} from '../../src/main/config'
 import { KernelApprovalPendingError } from '../../src/main/kernel'
 import { openAppData, type AppData } from '../../src/main/storage'
 import { DurableTaskQueue, TaskFatalError } from '../../src/main/triggers'
@@ -153,6 +160,67 @@ describe('DurableTaskQueue (§8 mirror + §20 retry + §13 approvals)', () => {
     await tick()
     await tick()
     expect(order).toEqual(['old-low', 'fresh-high'])
+  })
+
+  it('caps the aging bonus at TASK_AGING_MAX_BONUS (§8 within-class aging only)', async () => {
+    const queue = makeQueue()
+    const order: string[] = []
+    let release: (() => void) | null = null
+    queue.registerHandler('blocker', () => new Promise<void>((resolve) => (release = resolve)))
+    queue.registerHandler('probe', (payload) => {
+      order.push(String(payload['tag']))
+      return Promise.resolve()
+    })
+    queue.start()
+    queue.enqueue({ id: 'block', kind: 'blocker' })
+    await tick()
+    queue.enqueue({ id: 'ancient', kind: 'probe', payload: { tag: 'ancient' }, priority: 0 })
+    // Far beyond cap × interval: uncapped, 'ancient' would score ~3× the cap;
+    // capped, its effective score is exactly 0 + TASK_AGING_MAX_BONUS — a
+    // fresh task one point above the cap must win.
+    await vi.advanceTimersByTimeAsync(3 * TASK_AGING_MAX_BONUS * TASK_AGING_INTERVAL_MS)
+    queue.enqueue({
+      id: 'above-cap',
+      kind: 'probe',
+      payload: { tag: 'above-cap' },
+      priority: TASK_AGING_MAX_BONUS + 1
+    })
+    release!()
+    await tick()
+    await tick()
+    expect(order).toEqual(['above-cap', 'ancient'])
+  })
+
+  it('a fresh user-band task outranks a long-starved background task (§8 classes)', async () => {
+    const queue = makeQueue()
+    const order: string[] = []
+    let release: (() => void) | null = null
+    queue.registerHandler('blocker', () => new Promise<void>((resolve) => (release = resolve)))
+    queue.registerHandler('probe', (payload) => {
+      order.push(String(payload['tag']))
+      return Promise.resolve()
+    })
+    queue.start()
+    queue.enqueue({ id: 'block', kind: 'blocker' })
+    await tick()
+    queue.enqueue({
+      id: 'bg-starved',
+      kind: 'probe',
+      payload: { tag: 'bg-starved' },
+      priority: TASK_CLASS_BAND.background + TASK_PRIORITY.extraction
+    })
+    // 30 days of waiting cannot lift a background task across the band.
+    await vi.advanceTimersByTimeAsync(30 * 24 * 60 * 60_000)
+    queue.enqueue({
+      id: 'user-fresh',
+      kind: 'probe',
+      payload: { tag: 'user-fresh' },
+      priority: TASK_CLASS_BAND.user + TASK_PRIORITY.skillImprove
+    })
+    release!()
+    await tick()
+    await tick()
+    expect(order).toEqual(['user-fresh', 'bg-starved'])
   })
 
   it('retries with the §20 backoff (1m / 5m / 25m) then defers + flags', async () => {

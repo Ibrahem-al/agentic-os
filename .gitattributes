@@ -1,1 +1,8 @@
 scripts/hooks/*.sh text eol=lf
+
+# The codebase-ingest pipeline hashes fixture BYTES (per-unit content hash,
+# §18): a CRLF checkout (GitHub's Windows runners default core.autocrlf=true)
+# makes every multi-line unit hash differently from the LF content the tests
+# write when "touching" a file — pin LF so working-tree bytes always match.
+# (tests/fixtures/sandbox-probes/ carries its own eol pin already.)
+tests/fixtures/mini-repo/** text eol=lf
