@@ -25,7 +25,10 @@ beforeAll(async () => {
     reranker: new FakeReranker(),
     llm: { generate: async () => ({ text: '{"score": 10, "missing": "none"}' }) }
   })
-})
+  // Seeding 48 embedded nodes + indexes can exceed the global 30s hook budget
+  // on a slow, contended CI runner (seen on the windows pool) — the LATENCY
+  // assertion below stays honest; only the setup gets headroom.
+}, 120_000)
 afterAll(async () => {
   await store.cleanup()
 })
