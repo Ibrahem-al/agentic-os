@@ -22,3 +22,7 @@ Thumbs.db
 
 # handoff artifacts (not source)
 agentic-os-handoff*.zip
+
+# playwright run artifacts (phase 10)
+test-results/
+playwright-report/

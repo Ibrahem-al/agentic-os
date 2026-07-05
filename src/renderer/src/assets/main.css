@@ -1,1 +1,84 @@
 @import 'tailwindcss';
+
+/*
+ * Agentic OS dashboard theme (phase 10) — dark, locked (DESIGN.md).
+ * These @theme values are the CSS authority; src/renderer/src/design-tokens.ts
+ * mirrors them for JS consumers. Change both together.
+ */
+@theme {
+  --color-*: initial;
+  --color-bg: oklch(0.145 0 0);
+  --color-surface: oklch(0.185 0 0);
+  --color-raised: oklch(0.225 0 0);
+  --color-line: oklch(1 0 0 / 9%);
+  --color-line-strong: oklch(1 0 0 / 16%);
+  --color-ink: oklch(0.93 0 0);
+  --color-ink-mute: oklch(0.72 0 0);
+  --color-ink-faint: oklch(0.62 0 0);
+  --color-accent: oklch(0.68 0.14 268);
+  --color-accent-ink: oklch(0.97 0.01 268);
+  --color-ok: oklch(0.75 0.15 155);
+  --color-warn: oklch(0.8 0.14 85);
+  --color-err: oklch(0.7 0.19 25);
+  --color-undo: oklch(0.72 0.12 315);
+
+  --font-sans: system-ui, 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-bg text-ink font-sans text-[13px] leading-normal antialiased;
+  overscroll-behavior: none;
+}
+
+/* MOTION 2: feedback transitions only; reduced motion collapses them. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0ms !important;
+    animation-duration: 0ms !important;
+  }
+}
+
+/* Focus is always visible (PRODUCT.md accessibility). */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Quiet scrollbars that still afford scrolling in dense tables. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-raised);
+  border: 2px solid var(--color-bg);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-line-strong);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Native form controls inherit the dark scheme. */
+input,
+select,
+textarea,
+button {
+  font: inherit;
+}

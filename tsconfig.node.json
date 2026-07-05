@@ -18,9 +18,12 @@
     "electron.vite.config.ts",
     "src/main/**/*.ts",
     "src/preload/**/*.ts",
+    "src/shared/**/*.ts",
     "tests/unit/**/*.ts",
     "tests/integration/**/*.ts",
-    "tests/fixtures/**/*.ts"
+    "tests/e2e/**/*.ts",
+    "tests/fixtures/**/*.ts",
+    "playwright.config.ts"
   ],
   "exclude": [
     "tests/fixtures/mini-repo",

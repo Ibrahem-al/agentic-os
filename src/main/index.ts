@@ -36,6 +36,7 @@ import {
 import { createRetriever } from './retrieval'
 import { AgenticOsMcpServer, claudeMcpAddCommand, McpClientManager, writeSampleMcpJson } from './mcp'
 import { createExtractionAgent, type ExtractionAgent } from './agents'
+import { registerIpcHandlers } from './ipc'
 
 // Native modules are CJS; load them through require so the bundler leaves them
 // external and Electron resolves them from node_modules at runtime.
@@ -56,6 +57,8 @@ let securityInstances: { permissions: PermissionEngine; audit: AuditLog; scanner
 /** Model-layer singletons (phase 02) — shared by the MCP server (phase 05). */
 let keychain: Keychain | null = null
 let ollama: OllamaClient | null = null
+/** ONE lazy reranker instance app-wide (phase-03: never re-instantiate models). */
+let reranker: Reranker | null = null
 /** MCP server + client manager (phase 05); the manager serves phases 08/10. */
 let mcpServer: AgenticOsMcpServer | null = null
 let mcpClientManager: McpClientManager | null = null
@@ -202,7 +205,7 @@ async function bootMcp(): Promise<void> {
   }
   const userDataDir = app.getPath('userData')
   const paths = appDataPaths(userDataDir)
-  const reranker = new Reranker({ modelsDir: paths.modelsDir })
+  reranker ??= new Reranker({ modelsDir: paths.modelsDir })
   const retrievalDeps = { engine, embedder: ollama, reranker }
   const retriever = createRetriever({ ...retrievalDeps, llm: ollama })
   const server = new AgenticOsMcpServer({
@@ -289,10 +292,48 @@ function bootAgents(): void {
   )
 }
 
+/**
+ * Phase-10 dashboard boot: register the typed IPC handlers over whatever
+ * singletons this launch produced (§21 rule 8). Missing subsystems surface
+ * as structured UNAVAILABLE errors in the panels, never as blank screens.
+ */
+function bootIpc(): void {
+  const userDataDir = app.getPath('userData')
+  if (reranker === null && appData !== null && engine !== null && ollama !== null) {
+    // MCP boot was skipped (e.g. port in use) — memory search still needs
+    // the ONE shared reranker instance.
+    reranker = new Reranker({ modelsDir: appDataPaths(userDataDir).modelsDir })
+  }
+  registerIpcHandlers({
+    engine,
+    db: appData?.db ?? null,
+    permissions: securityInstances?.permissions ?? null,
+    audit: securityInstances?.audit ?? null,
+    scanner: securityInstances?.scanner ?? null,
+    ollama,
+    reranker,
+    keychain,
+    mcpUrl: mcpServer?.url ?? null,
+    userDataDir,
+    subsystems: {
+      storage: engine !== null && appData !== null,
+      models: ollama !== null,
+      kernel: kernelInstances !== null,
+      mcp: mcpServer !== null,
+      agents: extractionAgent !== null
+    }
+  })
+  console.log('[ipc] dashboard IPC ready (typed contract, structured errors)')
+}
+
 function createWindow(): void {
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
+    // The cockpit's dense tables need a floor; below this the master-detail
+    // grids crush (audit finding, phase 10).
+    minWidth: 960,
+    minHeight: 600,
     title: PRODUCT_NAME,
     webPreferences: {
       preload: join(import.meta.dirname, '../preload/index.mjs'),
@@ -345,6 +386,11 @@ void app.whenReady().then(async () => {
     bootAgents()
   } catch (err) {
     console.error('[agents] agents boot FAILED', err)
+  }
+  try {
+    bootIpc()
+  } catch (err) {
+    console.error('[ipc] dashboard IPC boot FAILED', err)
   }
 
   createWindow()

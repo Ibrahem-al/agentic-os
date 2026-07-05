@@ -17,9 +17,16 @@ export type {
 export {
   EDGE_TYPES,
   NODE_LABELS,
+  NODE_TABLES,
+  REL_TABLES,
   RETRIEVABLE_LABELS,
+  nodeTable,
+  relTable,
   type EdgeType,
   type NodeLabel,
+  type NodeTableSpec,
+  type PropertySpec,
+  type RelTableSpec,
   type RetrievableLabel
 } from './schema'
 export { isMutatingCypher, openRyuGraphEngine, ryuPlatformDir, type RyuGraphEngineOptions } from './ryugraph'
