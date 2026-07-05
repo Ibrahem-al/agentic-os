@@ -82,7 +82,28 @@ export class WorkflowJobError extends Error {
   }
 }
 
-// ── Kernel actions (§13 chokepoint shape; enforcement lands in PHASE-09) ────
+// ── Kernel actions (§13 chokepoint shape; enforced by the phase-09 engine) ──
+
+/**
+ * The §13 capability declaration — the single source of truth for both the
+ * kernel's permission gates AND the sandbox lanes (§11: Deno permission flags
+ * and Docker mounts/network policy derive from this same object). The zod
+ * schema that validates untrusted declarations (user rule files) lives in
+ * security/capabilities.ts; this interface is the dependency-free contract.
+ * Empty arrays / zero = default-deny.
+ */
+export interface CapabilityDeclaration {
+  /** Absolute folder/file paths the agent may read. */
+  readonly fsRead: readonly string[]
+  /** Absolute folder/file paths the agent may create/modify files under. */
+  readonly fsWrite: readonly string[]
+  /** Network hosts (`host` or `host:port`, Deno --allow-net grammar). */
+  readonly netDomains: readonly string[]
+  /** Tool names the agent may invoke through the tool manager. */
+  readonly tools: readonly string[]
+  /** Cloud-spend ceiling for the agent's tasks (USD). */
+  readonly maxSpendUSD: number
+}
 
 export type KernelActionKind =
   | 'workflow-step'
@@ -92,17 +113,48 @@ export type KernelActionKind =
   | 'storage-write'
   | 'retrieval'
   | 'mcp-call'
+  // phase-09 scope-checked kinds (§13 tiered gates):
+  | 'fs-read'
+  | 'fs-write'
+  | 'net'
+  | 'spend'
+  | 'sandbox-run'
 
 export interface KernelAction {
   readonly kind: KernelActionKind
   readonly name: string
   /** Extra span attributes (string/number/boolean only). */
   readonly attributes?: Readonly<Record<string, string | number | boolean>>
+  // ── §13 scope facts (checked against the agent's CapabilityDeclaration) ──
+  /** Filesystem paths touched (fs-read / fs-write actions). */
+  readonly paths?: readonly string[]
+  /** Network host (`host` or `host:port`) contacted (net actions). */
+  readonly host?: string
+  /** Cloud spend requested in USD (spend actions). */
+  readonly usd?: number
+  /** The capabilities a sandbox run is requesting (sandbox-run actions). */
+  readonly sandbox?: { readonly capabilities: CapabilityDeclaration }
 }
 
 export interface PermissionDecision {
   readonly allowed: boolean
   readonly reason: string
+  /**
+   * Set when the action is queued behind a §13 pending-approval row (the
+   * dashboard surfaces it; headless it stays queued). `allowed` is false —
+   * the caller may retry the same action after approval.
+   */
+  readonly pendingApprovalId?: string
+}
+
+/**
+ * The §13 permission engine contract the Kernel consults before every action.
+ * Implemented by security/PermissionEngine (capability-based, default-deny,
+ * tiered gates); tests may use allow-all stand-ins where permissions are not
+ * under test.
+ */
+export interface PermissionChecker {
+  check(agentId: string, action: KernelAction): PermissionDecision
 }
 
 export interface AuditEvent {

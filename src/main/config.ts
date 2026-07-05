@@ -334,6 +334,60 @@ export const CODEBASE_README_PROMPT_MAX_CHARS = 6000
 /** Fallback Project summary length when the local LLM is unavailable. */
 export const CODEBASE_SUMMARY_FALLBACK_MAX_CHARS = 400
 
+// ── Security: sandbox lanes (§11, §13 — phase 09) ────────────────────────────
+/**
+ * Values below are not in §20 — conservative rule-12 picks, recorded in the
+ * phase-09 report.
+ */
+/** Wall-clock kill deadline for one sandbox run (both lanes). */
+export const SANDBOX_TIMEOUT_MS_DEFAULT = 30_000
+/** Memory cap per sandbox run (MiB): Deno --v8-flags=--max-old-space-size, Docker --memory. */
+export const SANDBOX_MEMORY_MB_DEFAULT = 256
+/**
+ * Managed Deno binary (§11 default lane): exact version + per-platform zip
+ * sha256, pinned from the official GitHub release (denoland/deno v2.9.1,
+ * released 2026-07-01; digests read from the release API on 2026-07-04 and
+ * re-verified against the downloaded archive). Downloaded on first use to
+ * userData/bin/ (checksum-verified, resumable) — same pattern as the phase-02
+ * reranker weights. Never fetched from anywhere else.
+ */
+export const DENO_VERSION = '2.9.1'
+export const DENO_DOWNLOAD_BASE = 'https://github.com/denoland/deno/releases/download'
+export interface DenoAssetPin {
+  readonly asset: string
+  readonly sha256: string
+}
+/** Key: `${process.platform}-${process.arch}`. */
+export const DENO_PLATFORM_ASSETS: Readonly<Record<string, DenoAssetPin>> = {
+  'win32-x64': {
+    asset: 'deno-x86_64-pc-windows-msvc.zip',
+    sha256: 'ab310b4232cca207d40ffa41867e93aaf9f893802bc76756e74f486a6b21b371'
+  },
+  'darwin-x64': {
+    asset: 'deno-x86_64-apple-darwin.zip',
+    sha256: '89cbc8c974247772d9200724741b4e692ef49fe470b2ff555da905817c3daa11'
+  },
+  'darwin-arm64': {
+    asset: 'deno-aarch64-apple-darwin.zip',
+    sha256: 'ee3473502118eab301eca93aa6b31d6b0b6c1602d0f59e4cb89d4a262b12f6e7'
+  },
+  'linux-x64': {
+    asset: 'deno-x86_64-unknown-linux-gnu.zip',
+    sha256: '710c54d63477d1100844ef4818f19507ce0dbf40510903b1d883f19e394446a2'
+  }
+}
+export function denoDownloadUrl(pin: DenoAssetPin): string {
+  return `${DENO_DOWNLOAD_BASE}/v${DENO_VERSION}/${pin.asset}`
+}
+/** Deny-by-default container image for the Docker (polyglot) lane's runs. */
+export const DOCKER_LANE_IMAGE = 'alpine:3.22'
+
+// ── Security: injection scanner (§13 detection layer — phase 09) ─────────────
+/** Content prefix (chars) fed to the local-LLM instruction scan (fits the 4096 window). */
+export const INJECTION_SCAN_LLM_MAX_CHARS = 4000
+/** Output cap for one scanner verdict ({"suspicious": bool, "reason": string}). */
+export const INJECTION_SCAN_LLM_MAX_TOKENS = 128
+
 // ── Storage engine ───────────────────────────────────────────────────────────
 /**
  * RyuGraph pin. Spec §5 pins "≥ v0.11.3" in Kùzu-lineage numbering; RyuGraph

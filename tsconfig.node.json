@@ -23,6 +23,7 @@
     "tests/fixtures/**/*.ts"
   ],
   "exclude": [
-    "tests/fixtures/mini-repo"
+    "tests/fixtures/mini-repo",
+    "tests/fixtures/sandbox-probes"
   ]
 }

@@ -171,11 +171,11 @@ describe('runner boundary', () => {
     await expect(stack.runner.run('handover', {}, { jobId: 'handover-1' })).rejects.toThrow(WorkflowJobError)
 
     // Fresh runner instance (same process, same db) — real re-instantiation.
-    const { Kernel, LangGraphRunner } = await import('../../src/main/kernel')
+    const { allowAllPermissions, Kernel, LangGraphRunner } = await import('../../src/main/kernel')
     const secondRunner = new LangGraphRunner({
       db: stack.appData.db,
       telemetry: stack.telemetry,
-      executor: new Kernel({ telemetry: stack.telemetry })
+      executor: new Kernel({ telemetry: stack.telemetry, permissions: allowAllPermissions() })
     })
     secondRunner.define('handover', steps)
     blockStep2 = false

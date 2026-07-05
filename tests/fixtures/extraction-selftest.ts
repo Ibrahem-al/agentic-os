@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url'
 import { createExtractionAgent, sessionNodeIdOf } from '../../src/main/agents'
 import { RYU_EXTENSION_VERSION_DIR } from '../../src/main/config'
 import { Kernel, LangGraphRunner, createAuditLogStub } from '../../src/main/kernel'
+import { PermissionEngine, registerInternalAgents } from '../../src/main/security'
 import { OllamaClient } from '../../src/main/models'
 import { openAppData, openRyuGraphEngine } from '../../src/main/storage'
 import { createTelemetry } from '../../src/main/telemetry'
@@ -31,7 +32,10 @@ async function main(): Promise<void> {
   })
   const appData = openAppData(join(scratchDir, 'appdata.db'))
   const telemetry = createTelemetry(appData.db)
-  const kernel = new Kernel({ telemetry, audit: createAuditLogStub() })
+  // The live selftest runs the REAL §13 permission engine, exactly like boot.
+  const permissions = new PermissionEngine({ db: appData.db })
+  registerInternalAgents(permissions)
+  const kernel = new Kernel({ telemetry, permissions, audit: createAuditLogStub() })
   const runner = new LangGraphRunner({ db: appData.db, telemetry, executor: kernel })
   const ollama = new OllamaClient()
 

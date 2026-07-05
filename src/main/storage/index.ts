@@ -22,7 +22,7 @@ export {
   type NodeLabel,
   type RetrievableLabel
 } from './schema'
-export { openRyuGraphEngine, ryuPlatformDir, type RyuGraphEngineOptions } from './ryugraph'
+export { isMutatingCypher, openRyuGraphEngine, ryuPlatformDir, type RyuGraphEngineOptions } from './ryugraph'
 export { MIGRATIONS, type Migration, type MigrationContext } from './migrations'
 export { exportGraph, type ExportResult } from './export'
 export { openAppData, type AppData } from './appdata'

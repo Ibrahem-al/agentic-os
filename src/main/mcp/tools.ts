@@ -23,9 +23,10 @@ import { RETRIEVAL_RECENT_EXAMPLES, SEARCH_MEMORY_MAX_K } from '../config'
 import { NODE_LABELS, RETRIEVABLE_LABELS, type StorageEngine } from '../storage'
 import { searchMemory, type RetrievalDeps, type Retriever } from '../retrieval'
 import { IngestError, ingestCodebase, ingestDocument, type ProjectSummarizer } from '../ingest'
+import type { AuditLog, InjectionScanner } from '../security'
 import { stableStringify } from './callLog'
 
-export type ToolErrorCode = 'INVALID_INPUT' | 'NOT_FOUND' | 'NOT_IMPLEMENTED'
+export type ToolErrorCode = 'INVALID_INPUT' | 'NOT_FOUND' | 'NOT_IMPLEMENTED' | 'PERMISSION_DENIED'
 
 /** A tool-level failure with a stable, machine-readable code. */
 export class ToolError extends Error {
@@ -49,6 +50,10 @@ export interface ToolContext {
   readonly db: BetterSqlite3.Database
   /** MCP transport session id (also the §6 correlation key). */
   readonly sessionId: string
+  /** §13 injection scanner for the ingest tools (phase 09; absent = no scan). */
+  readonly scanner?: InjectionScanner
+  /** §13 audit log — ingest writes record reversible deltas (phase 09). */
+  readonly audit?: AuditLog
 }
 
 export interface McpToolDef {
@@ -284,8 +289,15 @@ async function ingestDocumentTool(args: unknown, ctx: ToolContext): Promise<unkn
   try {
     // The phase-06 pipeline: chunk → embed (the read path's embedder) → one
     // write-lane job. Content-hash dedup means identical re-adds are no-ops.
+    // Phase 09: content rides in as UntrustedText, the §13 scanner flags
+    // suspicious docs, and the lane job logs an audited delta.
     return await ingestDocument(
-      { engine: ctx.engine, embedder: ctx.retrieval.embedder },
+      {
+        engine: ctx.engine,
+        embedder: ctx.retrieval.embedder,
+        ...(ctx.scanner !== undefined ? { scanner: ctx.scanner } : {}),
+        ...(ctx.audit !== undefined ? { audit: { log: ctx.audit, agentId: `mcp:${ctx.sessionId}` } } : {})
+      },
       input.path_or_content,
       input.tags ?? []
     )
@@ -306,7 +318,13 @@ async function ingestCodebaseTool(args: unknown, ctx: ToolContext): Promise<unkn
     // phase-06 knowledge pipeline. Per-unit content hashes make re-ingests of
     // unchanged code zero-write no-ops.
     const result = await ingestCodebase(
-      { engine: ctx.engine, embedder: ctx.retrieval.embedder, llm: ctx.llm },
+      {
+        engine: ctx.engine,
+        embedder: ctx.retrieval.embedder,
+        llm: ctx.llm,
+        ...(ctx.scanner !== undefined ? { scanner: ctx.scanner } : {}),
+        ...(ctx.audit !== undefined ? { audit: { log: ctx.audit, agentId: `mcp:${ctx.sessionId}` } } : {})
+      },
       input.path,
       input.project !== undefined ? { project: input.project } : {}
     )

@@ -34,7 +34,9 @@ const RYUGRAPH_REQUIRE_RESTRICTION = {
 export default tseslint.config(
   // tests/fixtures/mini-repo is parse-fodder for the codebase-ingestion tests,
   // not project source — it deliberately references packages we don't install.
-  { ignores: ['node_modules', 'out', 'dist', 'resources', 'spike-data', 'docs', 'tests/fixtures/mini-repo'] },
+  // tests/fixtures/sandbox-probes runs only inside the phase-09 sandbox lanes
+  // (Deno globals / POSIX sh) — never in the host toolchain.
+  { ignores: ['node_modules', 'out', 'dist', 'resources', 'spike-data', 'docs', 'tests/fixtures/mini-repo', 'tests/fixtures/sandbox-probes'] },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   {

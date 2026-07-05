@@ -19,7 +19,8 @@
  */
 import { createHash } from 'node:crypto'
 import type BetterSqlite3 from 'better-sqlite3'
-import type { EdgeProps, NodeLabel, NodeRef, StorageEngine } from '../../storage'
+import type { EdgeProps, NodeLabel, NodeRef, StorageEngine, WriteTx } from '../../storage'
+import type { AuditLog } from '../../security'
 import {
   extractionProvenance,
   itemKeyOf,
@@ -136,10 +137,15 @@ export interface GatedWriteOptions {
   readonly extraction: FuzzyExtractionState
   readonly resolution: ResolveState
   readonly verification: VerifyState
+  /**
+   * §13 audit (phase 09): when present, the session's ONE lane job records a
+   * reversible delta — the per-action complement of §18's undo-by-source.
+   */
+  readonly audit?: AuditLog
 }
 
 export async function performGatedWrite(options: GatedWriteOptions): Promise<ExtractionResult> {
-  const { engine, db, collected, plan, extraction, resolution, verification } = options
+  const { engine, db, collected, plan, extraction, resolution, verification, audit } = options
   const sessionNodeId = collected.sessionNodeId
   const sessionRef: NodeRef = { label: 'Session', id: sessionNodeId }
   const deterministic: EdgeProps = { extracted_by: extractionProvenance('deterministic'), confidence: 1.0 }
@@ -452,11 +458,12 @@ export async function performGatedWrite(options: GatedWriteOptions): Promise<Ext
     })
   }
 
-  // ── ONE lane job: nodes first, then every edge (§21 rule 1) ────────────────
+  // ── ONE lane job: nodes first, then every edge (§21 rule 1). Audited with
+  // a reversible delta when the §13 audit log is wired (phase 09) ────────────
   const tagNodes = [...tagsToCreateNow]
     .map((id) => tagById.get(id))
     .filter((t): t is PlannedTag => t !== undefined)
-  await engine.withWrite(async (tx) => {
+  const laneJob = async (tx: WriteTx): Promise<void> => {
     for (const node of nodes) {
       await tx.upsertNode(node.label, node.props)
     }
@@ -466,7 +473,12 @@ export async function performGatedWrite(options: GatedWriteOptions): Promise<Ext
     for (const edge of edges) {
       await tx.createEdge(edge.type as Parameters<typeof tx.createEdge>[0], edge.from, edge.to, edge.props)
     }
-  })
+  }
+  if (audit !== undefined) {
+    await audit.graphWrite(`extraction-agent:${sessionNodeId}`, `extraction of session ${sessionNodeId}`, laneJob)
+  } else {
+    await engine.withWrite(laneJob)
+  }
 
   // ── Review-queue staging (SQLite, not the graph — §13) ─────────────────────
   const insertStaged = db.prepare(

@@ -1,12 +1,15 @@
 /**
  * Shared setup for kernel/telemetry tests: a real appdata.db in a temp dir,
- * real telemetry (spans → traces table), the Kernel facade with the audit
- * stub, and a LangGraphRunner — the full phase-04 stack minus Electron.
+ * real telemetry (spans → traces table), the Kernel facade behind the REAL
+ * §13 permission engine (phase 09 — internal agents registered exactly as
+ * boot registers them, plus the fixture agents tests run under), and a
+ * LangGraphRunner — the full stack minus Electron.
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Kernel, LangGraphRunner, createAuditLogStub } from '../../src/main/kernel'
+import { EMPTY_CAPABILITIES, PermissionEngine, registerInternalAgents } from '../../src/main/security'
 import { openAppData, type AppData } from '../../src/main/storage'
 import { createTelemetry, type Telemetry } from '../../src/main/telemetry'
 
@@ -16,6 +19,7 @@ export interface KernelTestStack {
   telemetry: Telemetry
   kernel: Kernel
   audit: ReturnType<typeof createAuditLogStub>
+  permissions: PermissionEngine
   runner: LangGraphRunner
   cleanup(): void
 }
@@ -25,7 +29,11 @@ export function openKernelStack(): KernelTestStack {
   const appData = openAppData(join(baseDir, 'appdata.db'))
   const telemetry = createTelemetry(appData.db)
   const audit = createAuditLogStub()
-  const kernel = new Kernel({ telemetry, audit })
+  const permissions = new PermissionEngine({ db: appData.db })
+  registerInternalAgents(permissions)
+  // The fixture agents test workflows attribute their jobs to.
+  permissions.registerAgent('agent-demo', { capabilities: EMPTY_CAPABILITIES })
+  const kernel = new Kernel({ telemetry, permissions, audit })
   const runner = new LangGraphRunner({ db: appData.db, telemetry, executor: kernel })
   return {
     baseDir,
@@ -33,6 +41,7 @@ export function openKernelStack(): KernelTestStack {
     telemetry,
     kernel,
     audit,
+    permissions,
     runner,
     cleanup: () => {
       appData.close()

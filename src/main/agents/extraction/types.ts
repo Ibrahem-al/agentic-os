@@ -14,6 +14,7 @@ import type BetterSqlite3 from 'better-sqlite3'
 import { EXTRACTION_PROVENANCE } from '../../config'
 import type { WorkflowRunner } from '../../kernel'
 import type { CloudBrain, SpendMeter } from '../../models'
+import type { AuditLog } from '../../security'
 import type { StorageEngine } from '../../storage'
 
 // ── Structural model interfaces ──────────────────────────────────────────────
@@ -60,6 +61,12 @@ export interface ExtractionAgentDeps {
   readonly llm: ExtractionLlm
   /** Absent = no API key configured; escalation/verification degrade to staging. */
   readonly cloud?: ExtractionCloud | null
+  /**
+   * §13 audit log (phase 09): when present, the write step's ONE lane job
+   * records a reversible delta. Optional so pre-phase-09 rigs stay valid;
+   * boot always wires it.
+   */
+  readonly audit?: AuditLog
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────

@@ -77,6 +77,16 @@ const DENIED_STATEMENT =
 const MUTATING_STATEMENT =
   /\b(create|merge|set|delete|detach|remove|drop|alter|copy|import|export)\b|\bcall\s+(create_|drop_)/i
 
+/**
+ * Shared classification for callers that must know whether a raw statement
+ * mutates (the phase-09 audit log marks actions containing raw mutating
+ * cypher as un-undoable — no generic inverse exists for arbitrary Cypher).
+ * Same conservative regex the engine's auto-routing uses.
+ */
+export function isMutatingCypher(query: string): boolean {
+  return MUTATING_STATEMENT.test(query)
+}
+
 interface RyuModule {
   Database: typeof RyuDatabase
   Connection: typeof RyuConnection

@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { Kernel, LangGraphRunner } from '../../src/main/kernel'
+import { allowAllPermissions, Kernel, LangGraphRunner } from '../../src/main/kernel'
 import { openAppData, type AppData } from '../../src/main/storage'
 import { createTelemetry, type Telemetry } from '../../src/main/telemetry'
 import { DEMO_WORKFLOW_NAME, STEP2_HANDSHAKE, demoSteps } from '../fixtures/demo-workflow'
@@ -104,7 +104,7 @@ describe('kill mid-step-2 → re-instantiate → resume (DoD 1)', () => {
     const runner = new LangGraphRunner({
       db: appData.db,
       telemetry,
-      executor: new Kernel({ telemetry })
+      executor: new Kernel({ telemetry, permissions: allowAllPermissions() })
     })
     const log: string[] = []
     runner.define(DEMO_WORKFLOW_NAME, demoSteps((line) => log.push(line), 'run'))

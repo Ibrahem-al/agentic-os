@@ -11,7 +11,10 @@ const TABLES = [
   'staged_writes',
   'spend',
   'workflow_checkpoints',
-  'workflow_checkpoint_writes'
+  'workflow_checkpoint_writes',
+  'approvals',
+  'audit_log',
+  'injection_flags'
 ] as const
 
 describe('appdata.db (SQLite side of §20 app data)', () => {
@@ -20,13 +23,13 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('creates the db in WAL mode with all tables and user_version 3', () => {
+  it('creates the db in WAL mode with all tables and user_version 4', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const appData = openAppData(join(dir, 'nested', 'appdata.db'))
     try {
       expect(existsSync(appData.path)).toBe(true)
       expect(appData.db.pragma('journal_mode', { simple: true })).toBe('wal')
-      expect(appData.db.pragma('user_version', { simple: true })).toBe(3)
+      expect(appData.db.pragma('user_version', { simple: true })).toBe(4)
       expect(appData.db.pragma('foreign_keys', { simple: true })).toBe(1)
       const names = appData.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -108,14 +111,14 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const second = openAppData(dbPath)
     try {
-      expect(second.db.pragma('user_version', { simple: true })).toBe(3)
+      expect(second.db.pragma('user_version', { simple: true })).toBe(4)
       expect((second.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(1)
     } finally {
       second.close()
     }
   })
 
-  it('upgrades a v1 db in place (additive tables + columns, phase-04 v2 / phase-05 v3)', () => {
+  it('upgrades a v1 db in place (additive tables + columns, phase-04 v2 / phase-05 v3 / phase-09 v4)', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const dbPath = join(dir, 'appdata.db')
     const first = openAppData(dbPath)
@@ -143,7 +146,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(3)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(4)
       const names = upgraded.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .all()

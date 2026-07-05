@@ -1,0 +1,6 @@
+# probe.sh executes inside the alpine container via `sh /sandbox/probe.sh` —
+# CRLF endings (repo checkouts use core.autocrlf=true) would break busybox sh,
+# so pin LF at the git layer. The conformance suite ALSO normalizes CRLF when
+# copying the probe to its temp dir, as a second line of defense.
+probe.sh text eol=lf
+probe.ts text eol=lf

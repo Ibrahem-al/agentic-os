@@ -116,10 +116,64 @@ const APPDATA_SCHEMA: readonly string[] = [
     type TEXT,
     value BLOB,
     PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
-  )`
+  )`,
+  // Pending approvals (§13 tiered gates, phase 09): write/net/spend-tier
+  // actions without a standing grant queue here; the dashboard surfaces the
+  // rows (headless they stay queued). A decision persists, so re-running the
+  // same action signature after approval succeeds.
+  `CREATE TABLE IF NOT EXISTS approvals (
+    id TEXT PRIMARY KEY,
+    signature TEXT NOT NULL UNIQUE,
+    agent_id TEXT NOT NULL,
+    action_kind TEXT NOT NULL,
+    action_name TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    details_json TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending','approved','denied')),
+    requested_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    decided_at TEXT,
+    decided_by TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status)`,
+  // Audit + undo log (§13, phase 09): every committed agent action with a
+  // reversible delta — graph inverse ops in inverse_json, file pre-images in
+  // backups/<id>/ — plus the kernel's mediated-action trail (kind 'action',
+  // not reversible: those rows are observations, not state changes).
+  `CREATE TABLE IF NOT EXISTS audit_log (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    kind TEXT NOT NULL
+      CHECK (kind IN ('action','graph-write','file-write','file-delete','undo')),
+    description TEXT NOT NULL,
+    reversible INTEGER NOT NULL DEFAULT 0,
+    inverse_json TEXT,
+    backup_dir TEXT,
+    outcome TEXT NOT NULL DEFAULT 'ok' CHECK (outcome IN ('ok','error')),
+    error TEXT,
+    details_json TEXT,
+    undone_at TEXT,
+    undo_action_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_log_agent ON audit_log(agent_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_log_kind ON audit_log(kind)`,
+  // Injection-scan findings (§13 detection layer, phase 09): documents whose
+  // ingest scan flagged embedded instructions. The content still ingests as
+  // inert data (§21 rule 5) — these rows exist for the dashboard review
+  // surface, not as a block.
+  `CREATE TABLE IF NOT EXISTS injection_flags (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    detector TEXT NOT NULL CHECK (detector IN ('regex','llm')),
+    pattern TEXT NOT NULL,
+    excerpt TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_injection_flags_source ON injection_flags(source)`
 ]
 
-const APPDATA_USER_VERSION = 3
+const APPDATA_USER_VERSION = 4
 
 /**
  * Column additions to tables that predate them (CREATE IF NOT EXISTS skips an
@@ -207,7 +261,8 @@ export function openAppData(dbPath: string): AppData {
     // Every schema change so far is additive (CREATE IF NOT EXISTS tables +
     // guarded ADD COLUMNs above), so applying the full list upgrades any older
     // version in place (v1 → v2: workflow_checkpoint* tables, phase 04;
-    // v2 → v3: mcp_calls.args_hash, phase 05).
+    // v2 → v3: mcp_calls.args_hash, phase 05; v3 → v4: approvals + audit_log +
+    // injection_flags, phase 09).
     db.pragma(`user_version = ${APPDATA_USER_VERSION}`)
   }
   return {

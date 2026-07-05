@@ -9,7 +9,7 @@
  */
 import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { Kernel, LangGraphRunner } from '../../src/main/kernel'
+import { allowAllPermissions, Kernel, LangGraphRunner } from '../../src/main/kernel'
 // The appdata module directly (not the storage barrel): the child must not
 // load the RyuGraph engine just to run a workflow against SQLite.
 import { openAppData } from '../../src/main/storage/appdata'
@@ -24,7 +24,7 @@ if (baseDir === undefined || jobId === undefined || logFile === undefined) {
 
 const appData = openAppData(join(baseDir, 'appdata.db'))
 const telemetry = createTelemetry(appData.db)
-const kernel = new Kernel({ telemetry })
+const kernel = new Kernel({ telemetry, permissions: allowAllPermissions() })
 const runner = new LangGraphRunner({ db: appData.db, telemetry, executor: kernel })
 runner.define(
   DEMO_WORKFLOW_NAME,

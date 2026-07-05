@@ -22,6 +22,7 @@ import {
   scanWatchedFolder,
   type KnowledgeIngestDeps
 } from '../../src/main/ingest'
+import { untrusted } from '../../src/main/security'
 import { KNOWLEDGE_INGEST_PROVENANCE } from '../../src/main/config'
 import { OllamaClient } from '../../src/main/models'
 import { fakeTextEmbedding } from '../fixtures/graph-seed'
@@ -334,7 +335,7 @@ describe.skipIf(process.env['OLLAMA'] !== '1')('live ingestion (OLLAMA=1): real 
       ].join('\n')
       const result = await ingestKnowledgeContent(
         { engine: liveStore.engine, embedder: client },
-        md,
+        untrusted(md),
         { source: 'live-fixture.md', tags: ['ops'] }
       )
       expect(result.status).toBe('created')

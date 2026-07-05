@@ -5,7 +5,7 @@
  *   esbuild-bundle → node span-evidence.mjs <scratchDir>
  */
 import { join } from 'node:path'
-import { Kernel, LangGraphRunner } from '../../src/main/kernel'
+import { allowAllPermissions, Kernel, LangGraphRunner } from '../../src/main/kernel'
 import { openAppData } from '../../src/main/storage/appdata'
 import { createTelemetry } from '../../src/main/telemetry'
 import { DEMO_WORKFLOW_NAME, demoSteps } from './demo-workflow'
@@ -15,7 +15,7 @@ if (baseDir === undefined) throw new Error('usage: span-evidence <baseDir>')
 
 const appData = openAppData(join(baseDir, 'appdata.db'))
 const telemetry = createTelemetry(appData.db)
-const runner = new LangGraphRunner({ db: appData.db, telemetry, executor: new Kernel({ telemetry }) })
+const runner = new LangGraphRunner({ db: appData.db, telemetry, executor: new Kernel({ telemetry, permissions: allowAllPermissions() }) })
 runner.define(DEMO_WORKFLOW_NAME, demoSteps(() => undefined))
 
 const jobId = await runner.run(DEMO_WORKFLOW_NAME, { seed: 42 }, { jobId: 'evidence-1', agentId: 'agent-demo' })

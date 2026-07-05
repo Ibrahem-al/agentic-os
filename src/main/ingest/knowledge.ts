@@ -13,8 +13,13 @@
  * versioning; `ingested_at` carries freshness). Chunk ids embed the content
  * hash, so a replaced document's chunks never collide with the old ones.
  *
- * §21 rule 5: ingested content is DATA. It is chunked, embedded and stored —
- * never parsed for instructions, never able to trigger a tool call.
+ * §21 rule 5: ingested content is DATA. It enters this pipeline typed as
+ * UntrustedText (phase 09) — the wrapper cannot reach a tool-call
+ * constructor, a KernelAction or a Cypher statement; the ONLY unwrap here is
+ * the `untrustedForStorage` sink where content becomes inert chunks/node
+ * properties. On the way in it passes the §13 injection scanner (when
+ * configured): suspicious documents are FLAGGED for the dashboard, never
+ * blocked and never acted on.
  */
 import { createHash } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
@@ -27,7 +32,15 @@ import {
   INGEST_TEXT_EXTENSIONS,
   KNOWLEDGE_INGEST_PROVENANCE
 } from '../config'
-import type { StorageEngine } from '../storage'
+import type { StorageEngine, WriteTx } from '../storage'
+import {
+  untrusted,
+  untrustedForStorage,
+  type AuditLog,
+  type InjectionScanResult,
+  type InjectionScanner,
+  type UntrustedText
+} from '../security'
 import { chunkDocument, type ChunkFormat } from './chunker'
 
 /** Structural (mirrors retrieval's Embedder): satisfied by OllamaClient. */
@@ -38,6 +51,14 @@ export interface KnowledgeEmbedder {
 export interface KnowledgeIngestDeps {
   readonly engine: StorageEngine
   readonly embedder: KnowledgeEmbedder
+  /** §13 detection layer; absent ⇒ no scan (offline test rigs). */
+  readonly scanner?: InjectionScanner
+  /**
+   * §13 audit: when present, the ingest's lane job logs a reversible delta
+   * attributed to `agentId` (replace-jobs contain raw DETACH DELETE cypher
+   * and are flagged un-undoable; fresh creates are fully reversible).
+   */
+  readonly audit?: { readonly log: AuditLog; readonly agentId: string }
 }
 
 /** Maps 1:1 onto ToolError codes; ingest never imports the MCP layer. */
@@ -72,6 +93,8 @@ export interface IngestDocumentResult {
   /** Chunks of the previous version removed on replace (0 otherwise). */
   readonly deletedChunkCount: number
   readonly tags: readonly IngestedTag[]
+  /** §13 injection-scan verdict (present when a scanner is configured). */
+  readonly injection?: InjectionScanResult
 }
 
 export interface IngestContentOptions {
@@ -97,13 +120,13 @@ export const tagSlug = (name: string): string =>
  */
 export async function ingestKnowledgeContent(
   deps: KnowledgeIngestDeps,
-  content: string,
+  content: UntrustedText,
   options: IngestContentOptions
 ): Promise<IngestDocumentResult> {
   const { engine, embedder } = deps
   const source = options.source.trim()
   if (source === '') throw new IngestError('INVALID_INPUT', 'ingest: source must be a non-empty string')
-  if (content.trim() === '') {
+  if (content.isBlank()) {
     throw new IngestError('INVALID_INPUT', `ingest: document '${source}' has no content — nothing was ingested`)
   }
   if (content.includes('\u0000')) {
@@ -113,7 +136,7 @@ export async function ingestKnowledgeContent(
     )
   }
 
-  const contentHash = `sha256:${sha256Hex(content)}`
+  const contentHash = `sha256:${content.sha256}`
 
   // Dedup check first, via direct reads: an identical re-add must be a no-op
   // BEFORE any model call or lane job (§18 "identical re-adds skip").
@@ -140,7 +163,15 @@ export async function ingestKnowledgeContent(
     }
   }
 
-  const chunks = chunkDocument(content, { format: options.format ?? 'markdown' })
+  // §13 detection layer: scan BEFORE the content becomes chunks. A flag never
+  // blocks — content is stored as inert data regardless (§21 rule 5) and the
+  // finding rides the result + the injection_flags review surface.
+  const injection = deps.scanner !== undefined ? await deps.scanner.scan(content, source) : undefined
+
+  // The one sanctioned unwrap: from here on the text is storage-bound data
+  // (chunks → embeddings → node properties), never instructions.
+  const text = untrustedForStorage(content)
+  const chunks = chunkDocument(text, { format: options.format ?? 'markdown' })
   if (chunks.length === 0) {
     throw new IngestError('INVALID_INPUT', `ingest: document '${source}' produced no chunks — nothing was ingested`)
   }
@@ -175,8 +206,13 @@ export async function ingestKnowledgeContent(
 
   // ONE lane job for the whole mutation (§21 rule 1): replace-on-change stays
   // consistent — no reader ever sees old and new chunk sets interleaved with
-  // other writers' jobs.
-  const deletedChunkCount = await engine.withWrite(async (tx) => {
+  // other writers' jobs. When an audit context is present the job records its
+  // reversible delta (§13) attributed to the acting agent.
+  const laneJob = async (fn: (tx: WriteTx) => Promise<number>): Promise<number> =>
+    deps.audit !== undefined
+      ? (await deps.audit.log.graphWrite(deps.audit.agentId, `ingest document '${source}'`, fn)).result
+      : engine.withWrite(fn)
+  const deletedChunkCount = await laneJob(async (tx) => {
     let deleted = 0
     if (existing) {
       const oldChunks = await tx.cypher(
@@ -225,7 +261,8 @@ export async function ingestKnowledgeContent(
     chunkCount: chunks.length,
     chunkIds,
     deletedChunkCount,
-    tags
+    tags,
+    ...(injection !== undefined ? { injection } : {})
   }
 }
 
@@ -282,7 +319,8 @@ export async function ingestKnowledgeFile(
       `ingest: ${absolute} is ${stats.size} bytes (max ${INGEST_MAX_FILE_BYTES}) — nothing was ingested`
     )
   }
-  const content = readFileSync(absolute, 'utf8')
+  // BOUNDARY: file content is untrusted the moment it is read (§21 rule 5).
+  const content = untrusted(readFileSync(absolute, 'utf8'))
   return ingestKnowledgeContent(deps, content, {
     source: absolute,
     format,
@@ -311,7 +349,9 @@ export async function ingestDocument(
   if (looksLikeFilePath(pathOrContent)) {
     return ingestKnowledgeFile(deps, pathOrContent.trim(), { tags })
   }
-  return ingestKnowledgeContent(deps, pathOrContent, {
+  // BOUNDARY: inline content arrives from an MCP client (tool content —
+  // untrusted by definition, §21 rule 5).
+  return ingestKnowledgeContent(deps, untrusted(pathOrContent), {
     source: `${INGEST_INLINE_SOURCE_PREFIX}${sha256Hex(pathOrContent).slice(0, 16)}`,
     format: 'markdown',
     tags

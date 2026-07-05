@@ -213,7 +213,8 @@ export function createExtractionAgent(deps: ExtractionAgentDeps): ExtractionAgen
           plan: state['plan'] as DeterministicPlan,
           extraction: state['extraction'] as FuzzyExtractionState,
           resolution: state['resolution'] as ResolveState,
-          verification: state['verification'] as VerifyState
+          verification: state['verification'] as VerifyState,
+          ...(deps.audit !== undefined ? { audit: deps.audit } : {})
         })
         return { result } as unknown as JsonObject
       }

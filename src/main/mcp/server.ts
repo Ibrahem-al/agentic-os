@@ -30,8 +30,9 @@ import {
   MCP_SERVER_VERSION
 } from '../config'
 import type { ProjectSummarizer } from '../ingest'
-import type { ActionExecutor } from '../kernel'
+import { KernelPermissionError, type ActionExecutor } from '../kernel'
 import type { RetrievalDeps, Retriever } from '../retrieval'
+import type { AuditLog, InjectionScanner } from '../security'
 import type { StorageEngine } from '../storage'
 import { McpCallLog } from './callLog'
 import { MCP_TOOLS, ToolError, type ToolContext } from './tools'
@@ -48,6 +49,10 @@ export interface AgenticOsMcpServerDeps {
   readonly db: BetterSqlite3.Database
   /** The kernel chokepoint (§9/§13); every tool call runs through it. */
   readonly executor: ActionExecutor
+  /** §13 injection scanner for the ingest tools (phase 09). */
+  readonly scanner?: InjectionScanner
+  /** §13 audit log — ingest lane jobs record reversible deltas (phase 09). */
+  readonly audit?: AuditLog
   readonly host?: string
   /** Default MCP_PORT; tests pass 0 for an ephemeral port. */
   readonly port?: number
@@ -280,7 +285,9 @@ export class AgenticOsMcpServer {
             retrieval: this.deps.retrieval,
             llm: this.deps.llm,
             db: this.deps.db,
-            sessionId
+            sessionId,
+            ...(this.deps.scanner !== undefined ? { scanner: this.deps.scanner } : {}),
+            ...(this.deps.audit !== undefined ? { audit: this.deps.audit } : {})
           }
           return tool.handle(args, ctx)
         }
@@ -288,7 +295,10 @@ export class AgenticOsMcpServer {
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
     } catch (err) {
       resultStatus = 'error'
-      const code = err instanceof ToolError ? err.code : 'INTERNAL'
+      // §13 denials surface as clean structured errors (§15: the orchestrator
+      // decides what to do next — never pause-and-notify).
+      const code =
+        err instanceof ToolError ? err.code : err instanceof KernelPermissionError ? 'PERMISSION_DENIED' : 'INTERNAL'
       const message = err instanceof Error ? err.message : String(err)
       errorText = `${code}: ${message}`
       return {

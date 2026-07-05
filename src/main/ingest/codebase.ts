@@ -34,6 +34,7 @@ import {
   INGEST_MARKDOWN_EXTENSIONS
 } from '../config'
 import type { StorageEngine, WriteTx } from '../storage'
+import { untrusted, type AuditLog, type InjectionScanner } from '../security'
 import {
   IngestError,
   ingestKnowledgeContent,
@@ -57,6 +58,10 @@ export interface CodebaseIngestDeps {
   readonly embedder: KnowledgeEmbedder
   /** README → Project summary (§18). Failures degrade to a deterministic fallback. */
   readonly llm: ProjectSummarizer
+  /** §13 injection scanner, passed through to the knowledge pipeline (phase 09). */
+  readonly scanner?: InjectionScanner
+  /** §13 audit context, passed through to knowledge ingests (phase 09). */
+  readonly audit?: { readonly log: AuditLog; readonly agentId: string }
 }
 
 /** Progress events for the dashboard (phase 10) — n files / n components. */
@@ -650,7 +655,12 @@ export async function ingestCodebase(
   const documents: IngestedKnowledgeDoc[] = []
   const failed: { file: string; error: string }[] = []
   const producedSources = new Set<string>()
-  const knowledgeDeps = { engine, embedder }
+  const knowledgeDeps = {
+    engine,
+    embedder,
+    ...(deps.scanner !== undefined ? { scanner: deps.scanner } : {}),
+    ...(deps.audit !== undefined ? { audit: deps.audit } : {})
+  }
   for (const doc of walk.docFiles) {
     progress({ phase: 'knowledge', filesWalked, codeFilesParsed: parsed.length, componentsFound, currentFile: doc.relPath })
     try {
@@ -667,7 +677,8 @@ export async function ingestCodebase(
     const source = `${CODEBASE_DOCS_SOURCE_PREFIX}${join(root, ...file.relPath.split('/'))}`
     progress({ phase: 'knowledge', filesWalked, codeFilesParsed: parsed.length, componentsFound, currentFile: file.relPath })
     try {
-      const result = await ingestKnowledgeContent(knowledgeDeps, digest, {
+      // BOUNDARY: docstrings are repo content — untrusted like any document.
+      const result = await ingestKnowledgeContent(knowledgeDeps, untrusted(digest), {
         source,
         tags: [project.name],
         format: 'markdown'

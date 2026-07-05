@@ -12,16 +12,25 @@ export {
   type ContextSection,
   type SummarizedSectionInfo
 } from './context'
-export { createAuditLogStub, Kernel, KernelPermissionError, type KernelDeps } from './kernel'
+export {
+  allowAllPermissions,
+  createAuditLogStub,
+  Kernel,
+  KernelApprovalPendingError,
+  KernelPermissionError,
+  type KernelDeps
+} from './kernel'
 export { LangGraphRunner, type LangGraphRunnerDeps } from './runner'
 export {
   WorkflowJobError,
   type ActionExecutor,
   type AuditEvent,
   type AuditHook,
+  type CapabilityDeclaration,
   type JsonObject,
   type KernelAction,
   type KernelActionKind,
+  type PermissionChecker,
   type PermissionDecision,
   type RunWorkflowOptions,
   type SummarizerLlm,

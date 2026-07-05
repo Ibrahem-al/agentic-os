@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import {
   appDataPaths,
+  DENO_VERSION,
   MCP_HOST,
   MCP_PORT,
   MCP_SERVERS_CONFIG_FILENAME,
@@ -23,7 +24,15 @@ import {
   settingsPath
 } from './models'
 import { createTelemetry, type Telemetry } from './telemetry'
-import { ContextManager, Kernel, LangGraphRunner, createAuditLogStub } from './kernel'
+import { ContextManager, Kernel, LangGraphRunner } from './kernel'
+import {
+  AuditLog,
+  createInjectionScanner,
+  detectDocker,
+  PermissionEngine,
+  registerInternalAgents,
+  type InjectionScanner
+} from './security'
 import { createRetriever } from './retrieval'
 import { AgenticOsMcpServer, claudeMcpAddCommand, McpClientManager, writeSampleMcpJson } from './mcp'
 import { createExtractionAgent, type ExtractionAgent } from './agents'
@@ -42,6 +51,8 @@ let appData: AppData | null = null
 let telemetry: Telemetry | null = null
 /** Kernel singletons (phase 04) — the MCP server + later agents run through these. */
 let kernelInstances: { kernel: Kernel; runner: LangGraphRunner; contextManager: ContextManager } | null = null
+/** Security singletons (phase 09): §13 engine + audit/undo + injection scanner. */
+let securityInstances: { permissions: PermissionEngine; audit: AuditLog; scanner: InjectionScanner } | null = null
 /** Model-layer singletons (phase 02) — shared by the MCP server (phase 05). */
 let keychain: Keychain | null = null
 let ollama: OllamaClient | null = null
@@ -145,11 +156,36 @@ function bootKernel(): void {
     return
   }
   telemetry = createTelemetry(appData.db)
-  const kernel = new Kernel({ telemetry, audit: createAuditLogStub() })
+  // Phase 09: the REAL §13 spine replaces the phase-04 stubs — capability
+  // engine (default-deny, tiered gates, pending approvals in appdata) and the
+  // reversible-delta audit log (graph inverses + file pre-images in backups/).
+  const paths = appDataPaths(app.getPath('userData'))
+  const permissions = new PermissionEngine({ db: appData.db })
+  registerInternalAgents(permissions)
+  const audit = new AuditLog({
+    db: appData.db,
+    backupsDir: paths.backupsDir,
+    ...(engine !== null ? { engine } : {})
+  })
+  const scanner = createInjectionScanner({ db: appData.db, ...(ollama !== null ? { llm: ollama } : {}) })
+  securityInstances = { permissions, audit, scanner }
+  const kernel = new Kernel({ telemetry, permissions, audit })
   const runner = new LangGraphRunner({ db: appData.db, telemetry, executor: kernel })
   const contextManager = new ContextManager({ llm: ollama ?? new OllamaClient(), telemetry })
   kernelInstances = { kernel, runner, contextManager }
   console.log('[kernel] workflow runner ready (LangGraph + SQLite checkpointer) — spans → traces table')
+  console.log(
+    '[security] §13 spine armed — permission engine (default-deny, tiered gates), audit/undo log, injection scanner'
+  )
+  // Sandbox lanes (§11): the managed Deno binary downloads on first use; the
+  // Docker lane detects-and-guides. Nothing runs user code until phase 11.
+  void detectDocker().then((docker) => {
+    console.log(
+      `[security] sandbox lanes — deno: managed v${DENO_VERSION} (downloads to userData/bin on first use); docker: ${
+        docker.available ? `ready (server ${docker.version})` : 'not detected (guided install offered when a polyglot rule is added)'
+      }`
+    )
+  })
 }
 
 /**
@@ -176,7 +212,12 @@ async function bootMcp(): Promise<void> {
     retrieval: retrievalDeps,
     llm: ollama,
     db: appData.db,
-    executor: kernelInstances.kernel
+    executor: kernelInstances.kernel,
+    // §13 (phase 09): ingest tools scan for embedded instructions and their
+    // lane jobs record audited reversible deltas.
+    ...(securityInstances !== null
+      ? { scanner: securityInstances.scanner, audit: securityInstances.audit }
+      : {})
   })
   try {
     await server.start()
@@ -237,7 +278,9 @@ function bootAgents(): void {
     runner: kernelInstances.runner,
     embedder: ollama,
     llm: ollama,
-    cloud
+    cloud,
+    // §13 (phase 09): the write step's lane job records a reversible delta.
+    ...(securityInstances !== null ? { audit: securityInstances.audit } : {})
   })
   console.log(
     `[agents] extraction agent ready — runExtraction(sessionId) is manual until phase 11 (cloud tier: ${
@@ -330,6 +373,7 @@ app.on('will-quit', (event) => {
   telemetry = null
   extractionAgent = null
   kernelInstances = null
+  securityInstances = null
   appData?.close()
   appData = null
   if (engine) {
