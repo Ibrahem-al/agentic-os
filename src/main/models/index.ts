@@ -65,8 +65,35 @@ export {
   SETTINGS_FILENAME,
   activeCloudModel,
   defaultModelSettings,
+  defaultReasoningSettings,
+  defaultRunnerSettings,
   loadModelSettings,
   saveModelSettings,
   settingsPath,
-  type ModelSettings
+  type ModelSettings,
+  type ReasoningSettings,
+  type RunnerSettings
 } from './settings'
+export {
+  CloudApiProvider,
+  LocalQwen3Provider,
+  ProviderRouter,
+  ProviderUnavailableError,
+  ROLE_DEFAULTS,
+  ROLE_KEYS,
+  SubscriptionClaudeProvider,
+  type OllamaLike,
+  type ProviderCloudTier,
+  type ProviderRouterDeps,
+  type ReasoningBackend,
+  type ReasoningProvider,
+  type ReasoningRequest,
+  type ReasoningResult,
+  type ResolvedRoute,
+  type RoleDefault,
+  type RoleGenerateOptions,
+  type RoleKey,
+  type RoleReasoner,
+  type SubscriptionBudget,
+  type SubscriptionComplete
+} from './provider'

@@ -169,6 +169,7 @@ export {
   type SkillBenchmark,
   type SkillCandidate,
   type SkillCloud,
+  type SkillCloudCall,
   type SkillEmbedder,
   type SkillImprovementResult,
   type SkillImprovementRunResult,

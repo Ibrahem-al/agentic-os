@@ -14,10 +14,9 @@
  */
 import { createHash } from 'node:crypto'
 import { SKILL_REWRITE_MAX_TOKENS } from '../../config'
-import { meteredComplete } from '../../models'
 import { candidateVersionIdOf } from './lifecycle'
 import { parseSkillMd, SkillMdError } from './skillmd'
-import type { SkillCandidate, SkillCloud, SkillWorkItem } from './types'
+import type { SkillCandidate, SkillCloudCall, SkillWorkItem } from './types'
 
 export const REWRITE_SYSTEM_PROMPT =
   'You improve Claude Code skills. A skill is a SKILL.md file: YAML frontmatter (name, description) ' +
@@ -62,7 +61,12 @@ export interface GenerateCandidateOptions {
   readonly skillMd: string
   /** The frontmatter name the candidate must keep. */
   readonly expectedName: string
-  readonly cloud: SkillCloud & { taskId: string }
+  /**
+   * Role-bound `skills.rewrite` cloud completion (the router path or today's
+   * metered cloud). The agent only calls this step once the role resolves to a
+   * cloud/subscription tier, so it is always present here.
+   */
+  readonly cloud: SkillCloudCall
 }
 
 /**
@@ -80,13 +84,7 @@ export async function generateCandidate(options: GenerateCandidateOptions): Prom
         : `${basePrompt}\n\nYour previous reply was rejected: ${lastError}\nFix that and reply with only the complete SKILL.md file content.`
     let text: string
     try {
-      const completion = await meteredComplete(
-        options.cloud.brain,
-        options.cloud.meter,
-        options.cloud.taskId,
-        [{ role: 'user', content: prompt }],
-        { system: REWRITE_SYSTEM_PROMPT, maxTokens: SKILL_REWRITE_MAX_TOKENS }
-      )
+      const completion = await options.cloud({ prompt, system: REWRITE_SYSTEM_PROMPT, maxTokens: SKILL_REWRITE_MAX_TOKENS })
       text = completion.text
     } catch (err) {
       return {

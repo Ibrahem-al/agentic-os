@@ -20,7 +20,7 @@ import type { RetrievalDeps, Retriever, BudgetGuard } from '../../retrieval'
 import type { ProjectSummarizer, WatchedFolderStore } from '../../ingest'
 import type { AuditLog, InjectionScanner } from '../../security'
 import type { WorkflowRunner } from '../../kernel'
-import type { Keychain, OllamaClient } from '../../models'
+import type { Keychain, OllamaClient, ProviderRouter } from '../../models'
 import type { ApprovalLister, TriggerStatusDeps } from '../../reads'
 import type { AppStatusDto } from '../../../shared/ipc'
 
@@ -77,6 +77,12 @@ export interface ToolContext extends McpReadContext {
   readonly retrieval: RetrievalDeps
   /** The shared LOCAL small LLM (README → Project summary in ingest_codebase). */
   readonly llm: ProjectSummarizer
+  /**
+   * Phase-16b: the ReasoningProvider router. ingest_codebase binds
+   * `forRole('ingest.projectSummary', …)` off it (local-by-default ⇒ identical
+   * to `llm`); absent ⇒ today's `llm`.
+   */
+  readonly router?: ProviderRouter
   /** appdata.db — staged_writes lives here (SQLite, not the graph). */
   readonly db: BetterSqlite3.Database
   /** MCP transport session id (also the §6 correlation key). */

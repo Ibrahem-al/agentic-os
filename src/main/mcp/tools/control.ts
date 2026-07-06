@@ -57,6 +57,7 @@ async function ingestCodebaseTool(args: unknown, ctx: ToolContext): Promise<unkn
         engine: ctx.engine,
         embedder: ctx.retrieval.embedder,
         llm: ctx.llm,
+        ...(ctx.router !== undefined ? { router: ctx.router } : {}),
         ...(ctx.scanner !== undefined ? { scanner: ctx.scanner } : {}),
         ...(ctx.audit !== undefined ? { audit: { log: ctx.audit, agentId: `mcp:${ctx.sessionId}` } } : {})
       },

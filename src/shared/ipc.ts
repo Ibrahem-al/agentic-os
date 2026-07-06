@@ -357,6 +357,28 @@ export interface OllamaStatusDto {
   readonly installUrl: string
 }
 
+/** Renderer-safe mirror of models/provider.ts ReasoningBackend (phase 16). */
+export type IpcReasoningBackend = 'local-qwen3' | 'cloud-api' | 'subscription-claude'
+
+/** Renderer-safe mirror of ReasoningSettings (§2.1/§11.4). Role keys are the
+ * §2.2 dotted strings; the main-side settings validator owns strictness. */
+export interface ReasoningSettingsDto {
+  readonly backend: IpcReasoningBackend
+  readonly overrides?: Readonly<Record<string, IpcReasoningBackend>>
+  readonly models?: Readonly<Record<string, string>>
+}
+
+/** Renderer-safe mirror of RunnerSettings (headless runner / subscription). */
+export interface RunnerSettingsDto {
+  readonly enabled: boolean
+  readonly model: string
+  readonly stageAll: boolean
+  readonly mode: 'completion' | 'agent'
+  readonly injectionPolicy: 'downgrade' | 'proceed'
+  readonly verifierModel?: string
+  readonly binaryPath?: string
+}
+
 export interface SettingsDto {
   readonly cloudProvider: IpcCloudProvider
   readonly cloudModels: Partial<Record<IpcCloudProvider, string>>
@@ -372,12 +394,27 @@ export interface SettingsDto {
     readonly connectCommand: string
     readonly sampleConfigPath: string
   }
+  /**
+   * Phase-16 sections — present only once the user opts in (absent on a default
+   * install). Phase-16b's `settings.get` assembly fills these from
+   * ModelSettings.reasoning/runner; today they are undefined and inert.
+   */
+  readonly reasoning?: ReasoningSettingsDto
+  readonly runner?: RunnerSettingsDto
 }
 
 export interface ModelSettingsPatchDto {
   readonly cloudProvider?: IpcCloudProvider
   readonly cloudModels?: Partial<Record<IpcCloudProvider, string>>
   readonly smallLlmModel?: string | null
+  /**
+   * Phase-16 sections. NOTE for phase-16b: `settings.save` (ipc.ts) rebuilds
+   * `next` from an explicit field list and silently DROPS unknown keys — merge
+   * `reasoning`/`runner` there (and fire router.invalidate()) or a saved patch
+   * vanishes on write.
+   */
+  readonly reasoning?: ReasoningSettingsDto
+  readonly runner?: RunnerSettingsDto
 }
 
 /** Pushed over IPC_EVENT_OLLAMA_PULL while settings.ollamaPull runs. */

@@ -14,8 +14,7 @@
  * the regression gate reads correction cases from BOTH splits.
  */
 import { SKILL_CASE_GEN_MAX_TOKENS, SKILL_HOLDOUT_FRACTION, SKILL_MAX_CORRECTION_CASES, SKILL_SYNTHETIC_CASES } from '../../config'
-import { meteredComplete } from '../../models'
-import type { SkillCloud, SkillTestCase, SkillTestSet, SkillWorkItem } from './types'
+import type { SkillCloudCall, SkillTestCase, SkillTestSet, SkillWorkItem } from './types'
 
 // ── deterministic PRNG (split stability without Math.random) ────────────────
 
@@ -181,7 +180,12 @@ export interface BuildTestSetOptions {
   readonly item: SkillWorkItem
   /** The baseline instructions in SKILL.md form (context for the case designer). */
   readonly skillMd: string
-  readonly cloud: (SkillCloud & { taskId: string }) | null
+  /**
+   * Role-bound `skills.testset` cloud completion (the router path or today's
+   * metered cloud), or `null` when no cloud tier serves the role → correction
+   * cases only. The agent binds this per run; DEFAULT == TODAY.
+   */
+  readonly cloud: SkillCloudCall | null
 }
 
 export async function buildTestSet(options: BuildTestSetOptions): Promise<SkillTestSet> {
@@ -195,13 +199,10 @@ export async function buildTestSet(options: BuildTestSetOptions): Promise<SkillT
 
   if (options.cloud !== null) {
     try {
-      const completion = await meteredComplete(
-        options.cloud.brain,
-        options.cloud.meter,
-        options.cloud.taskId,
-        [{ role: 'user', content: buildCaseGenPrompt(options.item, options.skillMd) }],
-        { maxTokens: SKILL_CASE_GEN_MAX_TOKENS }
-      )
+      const completion = await options.cloud({
+        prompt: buildCaseGenPrompt(options.item, options.skillMd),
+        maxTokens: SKILL_CASE_GEN_MAX_TOKENS
+      })
       const synthetic = extractCaseArray(completion.text)
       if (synthetic.length === 0) {
         warnings.push(`${options.item.skillId}: synthetic case reply was unparseable — benchmarking on correction cases only`)

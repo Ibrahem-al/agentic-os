@@ -18,6 +18,8 @@
  */
 import { randomUUID } from 'node:crypto'
 import type { JsonObject, WorkflowStep } from '../../kernel'
+import { meteredComplete } from '../../models'
+import type { RoleKey } from '../../models'
 import { runBenchmark } from './benchmark'
 import { generateCandidate } from './candidate'
 import { planImprovementRun } from './gate'
@@ -50,8 +52,10 @@ import {
   type SkillAgentDeps,
   type SkillBenchmark,
   type SkillCandidate,
+  type SkillCloudCall,
   type SkillImprovementResult,
   type SkillImprovementRunResult,
+  type SkillLlm,
   type SkillTestSet,
   type SkillWorkItem,
   type TestsetState
@@ -128,15 +132,13 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
       name: 'testset',
       async run(state, ctx): Promise<JsonObject> {
         const plan = state['plan'] as PlanState
+        // Bind the cloud role for THIS run (ctx.jobId is the budget/trace key).
+        const cloud = cloudCallFor(deps, 'skills.testset', ctx.jobId)
         const testsets: SkillTestSet[] = []
         const warnings: string[] = []
         for (const item of plan.work) {
           const baseline = baselineSkillMdOf(item)
-          const testset = await buildTestSet({
-            item,
-            skillMd: baseline.md,
-            cloud: deps.cloud ? { ...deps.cloud, taskId: ctx.jobId } : null
-          })
+          const testset = await buildTestSet({ item, skillMd: baseline.md, cloud })
           testsets.push(testset)
           warnings.push(...testset.warnings)
         }
@@ -147,10 +149,13 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
       name: 'candidate',
       async run(state, ctx): Promise<JsonObject> {
         const plan = state['plan'] as PlanState
+        const cloud = cloudCallFor(deps, 'skills.rewrite', ctx.jobId)
         const candidates: SkillCandidate[] = []
         const warnings: string[] = []
         for (const item of plan.work) {
-          if (!deps.cloud) {
+          if (cloud === null) {
+            // No cloud/subscription tier for the rewrite (keyless default resolves
+            // local) → skip, exactly as today. DEFAULT == TODAY.
             candidates.push({
               skillId: item.skillId,
               candidateVersionId: '',
@@ -164,7 +169,7 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
             item,
             skillMd: baseline.md,
             expectedName: baseline.name,
-            cloud: { ...deps.cloud, taskId: ctx.jobId }
+            cloud
           })
           if (candidate.error !== null) warnings.push(`${item.skillId}: ${candidate.error}`)
           candidates.push(candidate)
@@ -178,6 +183,11 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
         const plan = state['plan'] as PlanState
         const testsetState = state['testsets'] as TestsetState
         const candidateState = state['candidates'] as CandidateState
+        // executor/grader are §11.4 HARD-local (forRole resolves local anyway);
+        // comparator is a different tier (or null = unavailable).
+        const executor = localReasonerFor(deps, 'skills.executor', ctx.jobId)
+        const grader = localReasonerFor(deps, 'skills.grader', ctx.jobId)
+        const comparator = cloudCallFor(deps, 'skills.comparator', ctx.jobId)
         const benchmarks: (SkillBenchmark | null)[] = []
         const warnings: string[] = []
         for (const [index, item] of plan.work.entries()) {
@@ -188,8 +198,9 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
             continue
           }
           const benchmark = await runBenchmark({
-            llm: deps.llm,
-            cloud: deps.cloud ? { ...deps.cloud, taskId: ctx.jobId } : null,
+            executor,
+            grader,
+            comparator,
             kind: item.mode,
             testset,
             candidateInstructions: candidate.instructions,
@@ -512,4 +523,57 @@ async function performWrite(options: WriteOptions): Promise<SkillImprovementResu
 const winRateOf = (c: { candidateWins: number; activeWins: number; ties: number }): number => {
   const total = c.candidateWins + c.activeWins + c.ties
   return total === 0 ? 0 : c.candidateWins / total
+}
+
+// ── per-run §11.4 role binding (phase-16b) ───────────────────────────────────
+
+/**
+ * A role-bound cloud completion for a §17 cloud-tier role (`skills.testset` /
+ * `skills.rewrite` / `skills.comparator`).
+ *
+ *  - Router present → route through it, but ONLY when the role resolves to a
+ *    genuinely non-local tier (cloud-api or subscription). The keyless default
+ *    resolves local, so these roles then return `null` and behave as today's
+ *    "no cloud tier": DEFAULT == TODAY, and §17's blind comparator never runs on
+ *    the same local tier as the executor.
+ *  - Router absent → today's metered cloud via `deps.cloud` (or `null`).
+ *
+ * The router's cloud adapter rides `meteredComplete`, so the §14 $0.50 ceiling
+ * wraps every cloud call on both paths automatically.
+ */
+function cloudCallFor(deps: SkillAgentDeps, role: RoleKey, jobId: string): SkillCloudCall | null {
+  const router = deps.router
+  if (router !== undefined) {
+    if (router.resolve(role).backend === 'local-qwen3') return null
+    return async (req) => {
+      const res = await router.complete(role, {
+        prompt: req.prompt,
+        ...(req.system !== undefined ? { system: req.system } : {}),
+        ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),
+        taskId: jobId
+      })
+      return { text: res.text }
+    }
+  }
+  const cloud = deps.cloud
+  if (cloud) {
+    return async (req) => {
+      const completion = await meteredComplete(cloud.brain, cloud.meter, jobId, [{ role: 'user', content: req.prompt }], {
+        ...(req.system !== undefined ? { system: req.system } : {}),
+        ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {})
+      })
+      return { text: completion.text }
+    }
+  }
+  return null
+}
+
+/**
+ * The local `SkillLlm` for a §17 HARD-local role (`skills.executor` /
+ * `skills.grader`). Router present → `forRole` (resolves local anyway per §11.4,
+ * but honors per-role model overrides + span correlation, and preserves the §7
+ * local-×3 volume rule); router absent → today's `deps.llm`.
+ */
+function localReasonerFor(deps: SkillAgentDeps, role: RoleKey, jobId: string): SkillLlm {
+  return deps.router !== undefined ? deps.router.forRole(role, jobId) : deps.llm
 }

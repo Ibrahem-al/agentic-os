@@ -41,7 +41,7 @@ import {
 } from '../../src/main/agents'
 import { SKILL_IMPROVEMENT_PROVENANCE } from '../../src/main/config'
 import { LangGraphRunner } from '../../src/main/kernel'
-import { OllamaClient, SpendMeter } from '../../src/main/models'
+import { defaultModelSettings, OllamaClient, ProviderRouter, SpendMeter } from '../../src/main/models'
 import {
   approveStagedWrite,
   AuditLog,
@@ -731,6 +731,104 @@ describe('queue handler (the 02:00 slot + "improve now")', () => {
       await queue.stop(0)
     }
   }, 90_000)
+})
+
+// ── phase-16b: ProviderRouter injection (roles route through the router) ─────
+
+describe('phase-16b — ProviderRouter injection (DEFAULT == TODAY; router wins over llm/cloud)', () => {
+  it('router present: executor/grader via forRole, testset/rewrite via complete; deps.llm/cloud bypassed', async () => {
+    const srV0 = 'Deploy the service and move on.'
+    const srCand = skillMdOf('deploy-guard', 'Deploy safely.', 'Run the healthcheck and ROUTEMARK before declaring done.')
+    await seedSkill({
+      id: 'sr',
+      name: 'deploy-guard',
+      instructions: srV0,
+      activeVersion: { id: 'sv-sr-v0', instructions: srV0 },
+      corrections: [{ id: 'corr-r1', content: 'always ROUTEMARK after deploying' }]
+    })
+    setSkillSettings(stack.appData.db, 'sr', { mode: 'verifiable' })
+    await sleep(10)
+
+    // The router's LOCAL tier (a scripted qwen3, structurally an OllamaLike) and
+    // its CLOUD tier (the fake brain + a REAL SpendMeter, so §14 metering runs).
+    const grade = (expectation: string, output: string): boolean =>
+      expectation.includes('ROUTEMARK') ? output.includes('ROUTEMARK') : false
+    const routerLocal = new ScriptedSkillLlm({ grade })
+    const routerBrain = new FakeSkillCloudBrain({
+      rewriteByName: { 'deploy-guard': srCand },
+      casesByName: { 'deploy-guard': '[]' }
+    })
+    const router = new ProviderRouter({
+      loadSnapshot: () => defaultModelSettings(),
+      ollama: routerLocal,
+      makeCloud: () => ({ brain: routerBrain, meter: new SpendMeter({ db: stack.appData.db }) })
+    })
+
+    // deps.llm is DEAD and deps.cloud is null: if the router did not win, the
+    // executor would throw and no cloud call could land → the run would not adopt.
+    const deadLlm = new ScriptedSkillLlm({ failExecute: true })
+    const runner = new LangGraphRunner({ db: stack.appData.db, telemetry: stack.telemetry, executor: stack.kernel })
+    const agent = createSkillImprovementAgent({
+      engine: store.engine,
+      db: stack.appData.db,
+      runner,
+      embedder: new FakeExtractionEmbedder(),
+      llm: deadLlm,
+      cloud: null,
+      router,
+      audit
+    })
+
+    const result = await agent.runImprovement({ skillId: 'sr', jobId: 'job-sr16b-1' })
+
+    expect(result.processed[0]!.outcome).toBe('adopted')
+    // Cloud roles (testset synthesis + rewrite) routed through the ROUTER's cloud.
+    expect(routerBrain.calls.map((c) => c.kind).sort()).toEqual(['cases', 'rewrite'])
+    // Local roles (executor + grader) routed through the ROUTER's local tier.
+    expect(routerLocal.executorCalls).toBeGreaterThan(0)
+    expect(routerLocal.graderCalls).toBeGreaterThan(0)
+    // The today path (deps.llm) was never touched — proof the router won.
+    expect(deadLlm.executorCalls).toBe(0)
+    // §14: the router's cloud adapter still meters every call against the job id.
+    const spend = stack.appData.db.prepare(`SELECT count(*) AS c FROM spend WHERE task_id = 'job-sr16b-1'`).get() as { c: number }
+    expect(spend.c).toBe(2) // cases + rewrite
+    expect(await versionStatus(result.processed[0]!.candidateVersionId!)).toBe('active')
+  }, 60_000)
+
+  it('router present but KEYLESS (makeCloud → null): skills.rewrite resolves local → skipped-no-cloud, zero spend', async () => {
+    const ssV0 = 'Answer questions concisely.'
+    await seedSkill({
+      id: 'ss',
+      name: 'concise-answers',
+      instructions: ssV0,
+      corrections: [{ id: 'corr-s1', content: 'always cite a source' }]
+    })
+    await sleep(10)
+
+    const router = new ProviderRouter({
+      loadSnapshot: () => defaultModelSettings(),
+      ollama: new ScriptedSkillLlm({}),
+      makeCloud: () => null // keyless → the cloud roles resolve local → treated as no cloud tier
+    })
+    const runner = new LangGraphRunner({ db: stack.appData.db, telemetry: stack.telemetry, executor: stack.kernel })
+    const agent = createSkillImprovementAgent({
+      engine: store.engine,
+      db: stack.appData.db,
+      runner,
+      embedder: new FakeExtractionEmbedder(),
+      llm: new ScriptedSkillLlm({}),
+      cloud: null,
+      router,
+      audit
+    })
+
+    const result = await agent.runImprovement({ skillId: 'ss', jobId: 'job-ss16b-1' })
+
+    expect(result.processed[0]!.outcome).toBe('skipped-no-cloud') // DEFAULT == TODAY (keyless)
+    expect((await skillRow('ss')).instructions).toBe(ssV0) // skill untouched
+    const spend = stack.appData.db.prepare(`SELECT count(*) AS c FROM spend WHERE task_id = 'job-ss16b-1'`).get() as { c: number }
+    expect(spend.c).toBe(0) // no non-local tier was ever called
+  }, 60_000)
 })
 
 // ── live gate: the real local tier executes + grades through the real prompts ─

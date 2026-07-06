@@ -11,6 +11,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { ContextManager, type SummarizerLlm } from '../../src/main/kernel'
+import { ProviderRouter, defaultModelSettings, type OllamaLike } from '../../src/main/models'
 
 interface FakeCall {
   prompt: string
@@ -194,5 +195,71 @@ describe('hard limits stay loud (no silent drops)', () => {
     await expect(
       manager.assemble({ objective: 'x', sections: [{ name: ' ', content: '1' }] })
     ).rejects.toThrow(/non-empty/)
+  })
+})
+
+describe('summarizer via ProviderRouter (phase-16b)', () => {
+  /** Extractive fake as a local OllamaLike (keeps FACT lines, respects maxTokens). */
+  function extractiveOllama(): { ollama: OllamaLike; calls: { prompt: string; maxTokens?: number }[] } {
+    const calls: { prompt: string; maxTokens?: number }[] = []
+    const ollama: OllamaLike = {
+      async generate(prompt, options) {
+        calls.push({ prompt, ...(options?.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}) })
+        const body = prompt.slice(prompt.indexOf('\n\n') + 2)
+        const factLines = body.split('\n').filter((line) => line.includes('FACT:'))
+        let text = factLines.length > 0 ? factLines.join('\n') : body.slice(0, 40)
+        const maxChars = (options?.maxTokens ?? 128) * 3
+        if (text.length > maxChars) text = text.slice(0, maxChars)
+        return { text }
+      }
+    }
+    return { ollama, calls }
+  }
+
+  const localRouter = (ollama: OllamaLike): ProviderRouter =>
+    new ProviderRouter({ loadSnapshot: () => defaultModelSettings(), ollama, makeCloud: () => null })
+
+  const poison: SummarizerLlm = {
+    async generate() {
+      throw new Error('injected llm must not be called when a router is wired')
+    }
+  }
+
+  it('resolves context.summarize through forRole to the LOCAL tier; the injected llm is untouched', async () => {
+    const { ollama, calls } = extractiveOllama()
+    const manager = new ContextManager({ llm: poison, router: localRouter(ollama) })
+    const content = [...fillerLines(399), KEY_FACT].join('\n')
+
+    const result = await manager.assemble({
+      objective: 'Prepare the deploy runbook',
+      sections: [{ name: 'history', content }],
+      tokenBudget: 1000,
+      taskId: 'live:sess-1'
+    })
+
+    expect(result.summarizedSections).toHaveLength(1)
+    expect(result.prompt).toContain('[summarized]')
+    expect(result.prompt).toContain('HELIOTROPE')
+    expect(result.estimatedTokens).toBeLessThanOrEqual(1000)
+    // The router carried every summarize call to the local ollama (multi-chunk,
+    // whole section seen — no pre-truncation), each output-capped.
+    expect(calls.length).toBeGreaterThanOrEqual(2)
+    const seen = calls.map((c) => c.prompt).join('\n')
+    expect(seen).toContain('hotel line 0')
+    expect(seen).toContain('hotel line 398')
+    for (const call of calls) expect(call.maxTokens).toBeGreaterThan(0)
+  })
+
+  it('within budget → the router is never consulted (no forRole, no model call)', async () => {
+    const { ollama, calls } = extractiveOllama()
+    const manager = new ContextManager({ llm: poison, router: localRouter(ollama) })
+    const result = await manager.assemble({
+      objective: 'Ship the release notes',
+      sections: [{ name: 'notes', content: 'The zebra palette is approved.' }],
+      tokenBudget: 500
+    })
+    expect(calls).toHaveLength(0)
+    expect(result.prompt).not.toContain('[summarized]')
+    expect(result.prompt).toContain('## notes\n\nThe zebra palette is approved.')
   })
 })

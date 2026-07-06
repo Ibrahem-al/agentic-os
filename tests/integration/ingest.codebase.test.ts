@@ -22,8 +22,10 @@ import {
   ingestCodebase,
   type CodebaseIngestDeps,
   type CodebaseIngestProgress,
-  type IngestCodebaseResult
+  type IngestCodebaseResult,
+  type ProjectSummarizer
 } from '../../src/main/ingest'
+import { ProviderRouter, defaultModelSettings, type OllamaLike } from '../../src/main/models'
 import { createRetriever, type SmallLlm } from '../../src/main/retrieval'
 import { FakeEmbedder, FakeReranker } from '../fixtures/retrieval-fakes'
 import { openTestStore, type TestStore } from './helpers'
@@ -370,6 +372,47 @@ describe('README summary hardening (phase-04 finding: qwen3 narrates)', () => {
         id: result.projectId
       })
       expect(String(rows[0]?.['s'])).toBe('A tiny tool that flips widget bits for the workshop.')
+    } finally {
+      rmSync(join(dir, '..'), { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Project summary via ProviderRouter (phase-16b)', () => {
+  const ROUTER_SUMMARY = 'Widgetworks flips widget bits and serves them over a tiny HTTP endpoint for the workshop.'
+
+  /** A keyless local-only router over a recording fake Ollama. */
+  function localRouter(reply: string): { router: ProviderRouter; calls: string[] } {
+    const calls: string[] = []
+    const ollama: OllamaLike = {
+      generate: async (prompt) => {
+        calls.push(prompt)
+        return { text: reply }
+      }
+    }
+    return { router: new ProviderRouter({ loadSnapshot: () => defaultModelSettings(), ollama, makeCloud: () => null }), calls }
+  }
+
+  /** An injected summarizer that must never fire when a router is wired. */
+  const poison: ProjectSummarizer = {
+    generate: async () => {
+      throw new Error('injected llm must not be called when a router is wired')
+    }
+  }
+
+  it('generates the Project summary through forRole to the LOCAL tier (poison llm untouched)', async () => {
+    const { router, calls } = localRouter(ROUTER_SUMMARY)
+    const dir = join(mkdtempSync(join(tmpdir(), 'agentic-os-router-ingest-')), 'widgetworks')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'README.md'), '# Widgetworks\n\nA tiny tool that flips widget bits for the workshop.\n', 'utf8')
+    writeFileSync(join(dir, 'main.py'), 'def flip():\n    return 1\n', 'utf8')
+    try {
+      const result = await ingestCodebase({ engine: store.engine, embedder, llm: poison, router }, dir)
+      const rows = await store.engine.cypher('MATCH (p:Project {id: $id}) RETURN p.summary AS s', { id: result.projectId })
+      expect(String(rows[0]?.['s'])).toBe(ROUTER_SUMMARY)
+      // The router carried the README-summary call to the local tier.
+      expect(calls).toHaveLength(1)
+      expect(calls[0]).toContain('Widgetworks')
     } finally {
       rmSync(join(dir, '..'), { recursive: true, force: true })
     }

@@ -33,6 +33,7 @@ import {
   CODEBASE_SUMMARY_MAX_TOKENS,
   INGEST_MARKDOWN_EXTENSIONS
 } from '../config'
+import type { ProviderRouter } from '../models'
 import type { StorageEngine, WriteTx } from '../storage'
 import { untrusted, type AuditLog, type InjectionScanner } from '../security'
 import {
@@ -58,6 +59,13 @@ export interface CodebaseIngestDeps {
   readonly embedder: KnowledgeEmbedder
   /** README → Project summary (§18). Failures degrade to a deterministic fallback. */
   readonly llm: ProjectSummarizer
+  /**
+   * Reasoning router (phase-16b). When present the Project summary is generated
+   * via `forRole('ingest.projectSummary', 'ingest:'+projectId)` (default local
+   * qwen3 — DEFAULT == TODAY); when absent the injected `llm` is used unchanged.
+   * The deterministic README/stub fallback is preserved on failure either way.
+   */
+  readonly router?: ProviderRouter
   /** §13 injection scanner, passed through to the knowledge pipeline (phase 09). */
   readonly scanner?: InjectionScanner
   /** §13 audit context, passed through to knowledge ingests (phase 09). */
@@ -411,7 +419,7 @@ async function planProject(
       id: pathDerivedId
     })
     const id = pathIdTaken.length === 0 ? pathDerivedId : `proj-${rootKey}-${sha256Hex(name).slice(0, 8)}`
-    return { id, name, create: await buildCreate(name) }
+    return { id, name, create: await buildCreate(name, id) }
   }
 
   const byPath = await engine.cypher('MATCH (p:Project {id: $id}) RETURN p.name AS name LIMIT 1', {
@@ -433,13 +441,18 @@ async function planProject(
   }
 
   const name = packageJsonName(root) ?? basename(root)
-  return { id: pathDerivedId, name, create: await buildCreate(name) }
+  return { id: pathDerivedId, name, create: await buildCreate(name, pathDerivedId) }
 
-  async function buildCreate(name: string): Promise<{ summary: string; embedding: number[] }> {
+  async function buildCreate(name: string, projectId: string): Promise<{ summary: string; embedding: number[] }> {
     const readme = pickReadme(docFiles)
     const readmeContent = readme ? readFileSync(readme.path, 'utf8') : null
+    // The router (phase-16b: ingest.projectSummary, default local qwen3) bound to
+    // this project's op id when wired, else today's injected llm. Both satisfy
+    // ProjectSummarizer; the deterministic fallback below covers either failing.
+    const summarizer: ProjectSummarizer =
+      deps.router !== undefined ? deps.router.forRole('ingest.projectSummary', `ingest:${projectId}`) : deps.llm
     const summary =
-      (readmeContent !== null ? await summarizeReadme(deps.llm, readmeContent) : null) ??
+      (readmeContent !== null ? await summarizeReadme(summarizer, readmeContent) : null) ??
       fallbackSummary(readmeContent, root, codeFileCount)
     // Embed exactly what retrieval renders for a Project ("name — summary").
     const embedding = (await deps.embedder.embed([`${name} — ${summary}`]))[0]

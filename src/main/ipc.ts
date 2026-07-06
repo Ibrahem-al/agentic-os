@@ -30,6 +30,8 @@ import type {
   JsonObject,
   JsonValue,
   OllamaPullProgressDto,
+  ReasoningSettingsDto,
+  RunnerSettingsDto,
   SettingsDto,
   SkillImprovementDto,
   SkillImprovementEntryDto,
@@ -46,6 +48,8 @@ import {
   OllamaError,
   Reranker,
   apiKeySecretName,
+  defaultReasoningSettings,
+  defaultRunnerSettings,
   loadModelSettings,
   saveModelSettings,
   settingsPath,
@@ -127,6 +131,15 @@ export interface IpcDeps {
   readonly triggers: IpcTriggerDeps | null
   readonly userDataDir: string
   readonly subsystems: AppStatusDto['subsystems']
+  /**
+   * Phase-16b (P1.1): fired by the settings mutators (save / setApiKey /
+   * clearApiKey) AFTER a successful mutation so boot can drop the ProviderRouter's
+   * cached snapshot (router.invalidate()); a provider/key/role change then takes
+   * effect on the NEXT reasoning call with no app restart. Optional — unset in
+   * every test rig and any launch without a router (the mutation still persists,
+   * only the live re-route is skipped).
+   */
+  readonly onSettingsChanged?: () => void
 }
 
 /** The name decisions are recorded under (§13 decided_by / decidedBy). */
@@ -667,7 +680,13 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         url: deps.mcpUrl,
         connectCommand: claudeMcpAddCommand(),
         sampleConfigPath: join(deps.userDataDir, '.mcp.json')
-      }
+      },
+      // Phase-16b: surface the reasoning/runner sections getSettingsSummary
+      // (phase-15) already returns — validated JsonObjects derived from
+      // ModelSettings.reasoning/runner. Present only once the user opts in;
+      // absent and inert on a default install (DEFAULT == TODAY).
+      ...(summary.reasoning !== undefined ? { reasoning: summary.reasoning as unknown as ReasoningSettingsDto } : {}),
+      ...(summary.runner !== undefined ? { runner: summary.runner as unknown as RunnerSettingsDto } : {})
     }
   }
 
@@ -681,7 +700,24 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     }
     const smallLlm = patch.smallLlmModel === undefined ? (current.smallLlmModel ?? null) : patch.smallLlmModel
     if (smallLlm !== null && smallLlm !== '') next.smallLlmModel = smallLlm
+    // Phase-16b: `next` is rebuilt from an explicit field list that would DROP
+    // the additive reasoning/runner sections. Merge a patch onto whatever is on
+    // disk (materializing the phase-doc default the first time a section is
+    // touched); when the patch omits a section, PRESERVE the on-disk one — an
+    // absent section MUST stay absent (DEFAULT == TODAY), never be resurrected.
+    // The loadModelSettings ladder re-validates both on the settingsDto readback.
+    if (patch.reasoning !== undefined) {
+      next.reasoning = { ...defaultReasoningSettings(), ...current.reasoning, ...patch.reasoning }
+    } else if (current.reasoning !== undefined) {
+      next.reasoning = current.reasoning
+    }
+    if (patch.runner !== undefined) {
+      next.runner = { ...defaultRunnerSettings(), ...current.runner, ...patch.runner }
+    } else if (current.runner !== undefined) {
+      next.runner = current.runner
+    }
     saveModelSettings(settingsFile(), next)
+    deps.onSettingsChanged?.()
     return settingsDto()
   })
 
@@ -690,6 +726,9 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       throw new IngestError('INVALID_INPUT', `unknown provider '${provider}'`)
     }
     need.keychain().setApiKey(provider as CloudProvider, key)
+    // Phase-16b: a key change flips makeCloud() between a tier and null; invalidate
+    // so the next reasoning call re-routes without an app restart (P1.1).
+    deps.onSettingsChanged?.()
     return null
   })
 
@@ -698,6 +737,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       throw new IngestError('INVALID_INPUT', `unknown provider '${provider}'`)
     }
     need.keychain().deleteSecret(apiKeySecretName(provider as CloudProvider))
+    deps.onSettingsChanged?.()
     return null
   })
 

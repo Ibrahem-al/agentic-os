@@ -24,6 +24,7 @@ import {
   keychainPath,
   loadModelSettings,
   OllamaClient,
+  ProviderRouter,
   Reranker,
   SpendMeter,
   activeCloudModel,
@@ -95,6 +96,14 @@ let telemetry: Telemetry | null = null
 let kernelInstances: { kernel: Kernel; runner: LangGraphRunner; contextManager: ContextManager } | null = null
 /** Security singletons (phase 09): §13 engine + audit/undo + injection scanner. */
 let securityInstances: { permissions: PermissionEngine; audit: AuditLog; scanner: InjectionScanner } | null = null
+/**
+ * ONE ReasoningProvider router (phase-16b, §11.4) shared across the kernel/MCP/
+ * agents/IPC boots — built in bootKernel (the first consumer), like
+ * kernelInstances/securityInstances. subscriptionComplete + runnerHealthy stay
+ * UNSET until phase-17, so the subscription backend is unavailable and every
+ * role resolves to its today tier: DEFAULT == TODAY.
+ */
+let providerRouter: ProviderRouter | null = null
 /** Model-layer singletons (phase 02) — shared by the MCP server (phase 05). */
 let keychain: Keychain | null = null
 let ollama: OllamaClient | null = null
@@ -246,7 +255,41 @@ function bootKernel(): void {
   // Phase 09: the REAL §13 spine replaces the phase-04 stubs — capability
   // engine (default-deny, tiered gates, pending approvals in appdata) and the
   // reversible-delta audit log (graph inverses + file pre-images in backups/).
-  const paths = appDataPaths(app.getPath('userData'))
+  const userDataDir = app.getPath('userData')
+  const paths = appDataPaths(userDataDir)
+  // Phase-16b: the ONE ProviderRouter (§11.4 role → backend, resolved per call
+  // from a cached settings snapshot), built here — the first consumer boot —
+  // and shared via the module local. `loadSnapshot`/`makeCloud` re-read the
+  // settings file + the keychain LIVE per call, so a provider/model/key change
+  // takes effect on the NEXT call once an IPC mutator fires router.invalidate()
+  // (P1.1 — no app restart). subscriptionComplete + runnerHealthy are left UNSET
+  // (phase-17) ⇒ subscription unavailable ⇒ every role falls through to its
+  // today tier ⇒ DEFAULT == TODAY.
+  const ollamaClient = ollama ?? new OllamaClient()
+  const appDataForRouter = appData
+  const router = new ProviderRouter({
+    loadSnapshot: () => loadModelSettings(settingsPath(userDataDir)),
+    ollama: ollamaClient,
+    makeCloud: () => {
+      const s = loadModelSettings(settingsPath(userDataDir))
+      const apiKey = keychain?.getApiKey(s.cloudProvider)
+      return apiKey
+        ? {
+            brain: createCloudBrain(s.cloudProvider, {
+              apiKey,
+              model: activeCloudModel(s),
+              // Phase-13 test seam: the golden-path e2e fronts the cloud tier
+              // with a scripted server (unset in production).
+              ...(CLOUD_BASE_URL_OVERRIDE !== undefined ? { baseUrl: CLOUD_BASE_URL_OVERRIDE } : {})
+            }),
+            meter: new SpendMeter({ db: appDataForRouter.db })
+          }
+        : null
+    },
+    // subscriptionComplete + runnerHealthy intentionally unset (phase-17).
+    callBudget: new CallBudget({ db: appDataForRouter.db })
+  })
+  providerRouter = router
   const permissions = new PermissionEngine({ db: appData.db })
   registerInternalAgents(permissions)
   const audit = new AuditLog({
@@ -254,7 +297,7 @@ function bootKernel(): void {
     backupsDir: paths.backupsDir,
     ...(engine !== null ? { engine } : {})
   })
-  const scanner = createInjectionScanner({ db: appData.db, ...(ollama !== null ? { llm: ollama } : {}) })
+  const scanner = createInjectionScanner({ db: appData.db, router, ...(ollama !== null ? { llm: ollama } : {}) })
   securityInstances = { permissions, audit, scanner }
   const kernel = new Kernel({ telemetry, permissions, audit })
   // §8 phase-13: cooperative yield at step boundaries — a running multi-step
@@ -269,7 +312,7 @@ function bootKernel(): void {
     executor: kernel,
     yieldPoint: createInflightYield(() => mcpServer?.inflightInteractiveCalls ?? 0)
   })
-  const contextManager = new ContextManager({ llm: ollama ?? new OllamaClient(), telemetry })
+  const contextManager = new ContextManager({ llm: ollamaClient, router, telemetry })
   kernelInstances = { kernel, runner, contextManager }
   console.log('[kernel] workflow runner ready (LangGraph + SQLite checkpointer) — spans → traces table')
   console.log(
@@ -302,7 +345,13 @@ async function bootMcp(): Promise<void> {
   const paths = appDataPaths(userDataDir)
   reranker ??= new Reranker({ modelsDir: paths.modelsDir, ...rerankerFilesOverride() })
   const retrievalDeps = { engine, embedder: ollama, reranker }
-  const retriever = createRetriever({ ...retrievalDeps, llm: ollama })
+  // Phase-16b: the loop's critic/rewrite roles bind off the router when wired
+  // (both §11.4 HARD-local ⇒ always local-qwen3 ⇒ identical to `llm`).
+  const retriever = createRetriever({
+    ...retrievalDeps,
+    llm: ollama,
+    ...(providerRouter !== null ? { router: providerRouter } : {})
+  })
   // §10.1/P0.3 zombie defense: mint a FRESH runner token BEFORE the server binds
   // it (below), so a runner child that outlived a previous app process holds a
   // token that no longer authenticates — its next MCP call 401s at once. The
@@ -320,6 +369,9 @@ async function bootMcp(): Promise<void> {
     retriever,
     retrieval: retrievalDeps,
     llm: ollama,
+    // Phase-16b: the router backs ingest_codebase's README → Project summary
+    // (ingest.projectSummary, local-by-default ⇒ identical to `llm`).
+    ...(providerRouter !== null ? { router: providerRouter } : {}),
     db: appData.db,
     executor: kernelInstances.kernel,
     spendMeter: callBudget,
@@ -414,6 +466,10 @@ function bootAgents(): void {
       embedder: ollama,
       llm: ollama,
       cloud,
+      // Phase-16b: the router wins when present (cloud roles route through it
+      // with the same §14 $0.50 ceiling; a keyless default resolves them local
+      // ⇒ skipped exactly as today). Extraction stays UNWIRED (deferred: 18).
+      ...(providerRouter !== null ? { router: providerRouter } : {}),
       audit: securityInstances.audit
     })
     console.log(
@@ -572,6 +628,11 @@ function bootIpc(): void {
     mcpUrl: mcpServer?.url ?? null,
     triggers,
     userDataDir,
+    // Phase-16b (P1.1): the settings mutators (save / setApiKey / clearApiKey)
+    // fire this after a successful change so boot drops the router's cached
+    // snapshot — provider/model/key changes take effect on the NEXT reasoning
+    // call with no app restart.
+    onSettingsChanged: () => providerRouter?.invalidate(),
     subsystems
   })
   // §4 read tools ride the SAME shared read functions as the IPC handlers above;
@@ -723,6 +784,7 @@ app.on('will-quit', (event) => {
       telemetry = null
       extractionAgent = null
       skillImprovementAgent = null
+      providerRouter = null
       kernelInstances = null
       securityInstances = null
       appData?.close()

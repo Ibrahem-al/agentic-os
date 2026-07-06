@@ -34,6 +34,7 @@ import {
   RUNNER_TASK_HEADER
 } from '../config'
 import type { ProjectSummarizer } from '../ingest'
+import type { ProviderRouter } from '../models'
 import { KernelPermissionError, type ActionExecutor } from '../kernel'
 import type { BudgetGuard, RetrievalDeps, Retriever } from '../retrieval'
 import { READ_TOOLS, STAGING_TOOLS, type AuditLog, type InjectionScanner } from '../security'
@@ -69,6 +70,12 @@ export interface AgenticOsMcpServerDeps {
   readonly retrieval: RetrievalDeps
   /** The shared LOCAL small LLM (ingest_codebase README summaries). */
   readonly llm: ProjectSummarizer
+  /**
+   * Phase-16b: the ReasoningProvider router. When present, ingest_codebase's
+   * README → Project summary binds `forRole('ingest.projectSummary', …)` off it
+   * (local-by-default ⇒ identical to `llm`); absent ⇒ today's `llm`.
+   */
+  readonly router?: ProviderRouter
   /** appdata.db — mcp_calls + staged_writes. */
   readonly db: BetterSqlite3.Database
   /** The kernel chokepoint (§9/§13); every tool call runs through it. */
@@ -508,6 +515,7 @@ export class AgenticOsMcpServer {
             retriever: this.deps.retriever,
             retrieval: this.deps.retrieval,
             llm: this.deps.llm,
+            ...(this.deps.router !== undefined ? { router: this.deps.router } : {}),
             db: this.deps.db,
             sessionId,
             ...(this.deps.scanner !== undefined ? { scanner: this.deps.scanner } : {}),

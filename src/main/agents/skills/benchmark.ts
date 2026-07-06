@@ -34,6 +34,7 @@ import type {
   SkillAdoptionMode,
   SkillBenchmark,
   SkillCloud,
+  SkillCloudCall,
   SkillLlm,
   SkillTestCase,
   SkillTestSet
@@ -256,14 +257,41 @@ export function summarizeBenchmark(
 // ── the step ─────────────────────────────────────────────────────────────────
 
 export interface RunBenchmarkOptions {
-  readonly llm: SkillLlm
-  readonly cloud: (SkillCloud & { taskId: string }) | null
+  /**
+   * The local case executor + assertion grader. Today / direct callers pass one
+   * `llm` (both roles run on it). Phase-16b's agent binds them SEPARATELY via
+   * the router as `executor`/`grader` (both still §11.4 HARD-local, so they
+   * resolve local anyway and the §7 ×3 volume rule is unchanged); when supplied
+   * they win over `llm`.
+   */
+  readonly llm?: SkillLlm
+  readonly executor?: SkillLlm
+  readonly grader?: SkillLlm
+  /**
+   * The stylistic blind comparator (§17: a DIFFERENT tier from the local
+   * executor). Phase-16b's agent passes a router-bound `skills.comparator` call;
+   * direct callers may pass a metered cloud tier via `cloud`. `comparator` wins;
+   * `null` = no different tier available → today's "no cloud tier" behavior.
+   */
+  readonly comparator?: SkillCloudCall | null
+  readonly cloud?: (SkillCloud & { taskId: string }) | null
   readonly kind: SkillAdoptionMode
   readonly testset: SkillTestSet
   readonly candidateInstructions: string
   readonly activeInstructions: string
   /** Test seam; defaults to the §-referenced 3 runs per case per config. */
   readonly runsPerCase?: number
+}
+
+/** Wrap a raw metered cloud tier as a `SkillCloudCall` (direct-caller path). */
+function cloudTierCall(cloud: SkillCloud & { taskId: string }): SkillCloudCall {
+  return async (req) => {
+    const completion = await meteredComplete(cloud.brain, cloud.meter, cloud.taskId, [{ role: 'user', content: req.prompt }], {
+      ...(req.system !== undefined ? { system: req.system } : {}),
+      ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {})
+    })
+    return { text: completion.text }
+  }
 }
 
 export async function runBenchmark(options: RunBenchmarkOptions): Promise<SkillBenchmark> {
@@ -283,12 +311,23 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<SkillB
     }
   }
 
+  // §11.4 role binding (16b): executor/grader are HARD-local; `comparator` is a
+  // different tier (or null = unavailable). Direct callers get today's shape via
+  // `llm` + `cloud`; the router path passes the bound roles from the agent.
+  const executor = options.executor ?? options.llm
+  const grader = options.grader ?? options.llm
+  if (executor === undefined || grader === undefined) {
+    throw new Error('runBenchmark requires `llm` (or both `executor` and `grader`)')
+  }
+  const comparator: SkillCloudCall | null =
+    options.comparator !== undefined ? options.comparator : options.cloud != null ? cloudTierCall(options.cloud) : null
+
   try {
     for (const testCase of cases) {
       for (const config of ['candidate', 'active'] as const) {
         const instructions = config === 'candidate' ? options.candidateInstructions : options.activeInstructions
         for (let runIndex = 0; runIndex < runsPerCase; runIndex++) {
-          const generated = await options.llm.generate(testCase.prompt, {
+          const generated = await executor.generate(testCase.prompt, {
             system: executorSystemPrompt(instructions),
             maxTokens: SKILL_GENERATION_MAX_TOKENS
           })
@@ -298,7 +337,7 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<SkillB
           if (options.kind === 'verifiable') {
             graded = []
             for (const expectation of testCase.expectations) {
-              const verdictReply = await options.llm.generate(buildGraderPrompt(testCase.prompt, output, expectation), {
+              const verdictReply = await grader.generate(buildGraderPrompt(testCase.prompt, output, expectation), {
                 system: GRADER_SYSTEM_PROMPT,
                 maxTokens: SKILL_GRADER_MAX_TOKENS,
                 format: GRADER_FORMAT
@@ -325,7 +364,7 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<SkillB
 
   if (options.kind === 'stylistic') {
     const heldoutCases = cases.filter((c) => c.split === 'heldout')
-    if (options.cloud === null) {
+    if (comparator === null) {
       notes.push('no cloud tier — blind comparison unavailable; review with the raw outputs')
       for (const [caseIndex, testCase] of heldoutCases.entries()) {
         void caseIndex
@@ -349,23 +388,16 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<SkillB
           const candidateOutput = outputOf(testCase.id, 'candidate', runIndex)
           const activeOutput = outputOf(testCase.id, 'active', runIndex)
           try {
-            const completion = await meteredComplete(
-              options.cloud.brain,
-              options.cloud.meter,
-              options.cloud.taskId,
-              [
-                {
-                  role: 'user',
-                  content: buildComparatorPrompt(
-                    testCase.prompt,
-                    candidateIsA ? candidateOutput : activeOutput,
-                    candidateIsA ? activeOutput : candidateOutput,
-                    testCase.expectations
-                  )
-                }
-              ],
-              { system: COMPARATOR_SYSTEM_PROMPT, maxTokens: SKILL_COMPARATOR_MAX_TOKENS }
-            )
+            const completion = await comparator({
+              prompt: buildComparatorPrompt(
+                testCase.prompt,
+                candidateIsA ? candidateOutput : activeOutput,
+                candidateIsA ? activeOutput : candidateOutput,
+                testCase.expectations
+              ),
+              system: COMPARATOR_SYSTEM_PROMPT,
+              maxTokens: SKILL_COMPARATOR_MAX_TOKENS
+            })
             const verdict = parseComparatorReply(completion.text)
             const winner =
               verdict.winner === 'TIE'
