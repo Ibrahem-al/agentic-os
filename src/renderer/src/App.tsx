@@ -134,36 +134,86 @@ function useRunnerStatus(): { status: RunnerStatusDto | null; refresh: () => voi
 }
 
 /**
- * Auth-expired / quota-exhausted banner (phase 17, §9.7). Shown only when the
- * runner is enabled AND unhealthy; reasoning falls back to the cloud/local tier
- * meanwhile, so this nudges rather than blocks. Retry runs the manual canary
- * (the one live re-check the renderer can trigger) then re-reads the snapshot.
+ * Runner-health banner states (phase 17 → broadened phase 21). The banner is a
+ * loud, actionable overlay; it fires only for these classified failures and
+ * NEVER for 'unknown' (the sticky-failure decay / first-load state — banning it
+ * prevents a boot flash) or 'ok'.
  */
-function RunnerBanner({ status, onRetry }: { status: RunnerStatusDto; onRetry: () => void }): React.JSX.Element {
-  const authExpired = status.state === 'auth-expired'
-  const tint = authExpired ? 'border-err/40 bg-err/10' : 'border-warn/40 bg-warn/10'
+const RUNNER_BANNER_STATES = ['auth-expired', 'quota-exhausted', 'not-installed'] as const
+type RunnerBannerState = (typeof RUNNER_BANNER_STATES)[number]
+
+function isRunnerBannerState(state: string): state is RunnerBannerState {
+  return (RUNNER_BANNER_STATES as readonly string[]).includes(state)
+}
+
+/**
+ * Per-state banner copy: title + hint + tint. auth/quota keep the exact phase-17
+ * wording and tints; not-installed is the phase-21 addition (warn tint — a
+ * missing CLI is fixable config, not a hard error). The shared tail sentence and
+ * the lastError mono line are rendered once by RunnerBanner, not per state.
+ */
+const RUNNER_BANNER_COPY: Record<RunnerBannerState, { title: string; hint: React.JSX.Element; tint: string }> = {
+  'auth-expired': {
+    title: 'subscription runner sign-in expired',
+    hint: (
+      <>
+        run <code className="rounded bg-raised px-1 font-mono text-[11px] text-ink">claude /login</code> in any
+        terminal, then retry.
+      </>
+    ),
+    tint: 'border-err/40 bg-err/10'
+  },
+  'quota-exhausted': {
+    title: 'subscription runner usage limit reached',
+    hint: <>the subscription hit its usage limit. it resets automatically; retry once it does.</>,
+    tint: 'border-warn/40 bg-warn/10'
+  },
+  'not-installed': {
+    title: 'subscription runner cli unavailable',
+    hint: (
+      <>
+        install claude code (
+        <code className="rounded bg-raised px-1 font-mono text-[11px] text-ink">
+          npm install -g @anthropic-ai/claude-code
+        </code>
+        ) or point <code className="rounded bg-raised px-1 font-mono text-[11px] text-ink">runner.binaryPath</code> in
+        settings.json at the cli, then retry.
+      </>
+    ),
+    tint: 'border-warn/40 bg-warn/10'
+  }
+}
+
+/**
+ * Runner-health banner (phase 17, §9.7; broadened phase 21). Shown only when the
+ * runner is enabled AND in a classified failure state; reasoning falls back to
+ * the cloud/local tier meanwhile, so this nudges rather than blocks. Retry runs
+ * the manual canary (the one live re-check the renderer can trigger) then
+ * re-reads the snapshot.
+ */
+function RunnerBanner({
+  state,
+  lastError,
+  onRetry
+}: {
+  state: RunnerBannerState
+  lastError: string | null
+  onRetry: () => void
+}): React.JSX.Element {
+  const { title, hint, tint } = RUNNER_BANNER_COPY[state]
   return (
     <div role="alert" data-testid="runner-banner" className={`flex items-start gap-3 border-b px-5 py-2.5 ${tint}`}>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <Badge status={status.state} />
-          <span className="text-[13px] font-medium">
-            {authExpired ? 'subscription runner sign-in expired' : 'subscription runner usage limit reached'}
-          </span>
+          <Badge status={state} />
+          <span className="text-[13px] font-medium">{title}</span>
         </div>
         <div className="mt-1 text-[12px] text-ink-mute">
-          {authExpired ? (
-            <>
-              run <code className="rounded bg-raised px-1 font-mono text-[11px] text-ink">claude /login</code> in any
-              terminal, then retry.
-            </>
-          ) : (
-            'the subscription hit its usage limit. it resets automatically; retry once it does.'
-          )}{' '}
+          {hint}{' '}
           reasoning falls back to your cloud or local tier until this clears, so nothing is blocked.
         </div>
-        {status.lastError !== null && status.lastError !== '' && (
-          <div className="mt-1 font-mono text-[11px] break-words text-err">{status.lastError}</div>
+        {lastError !== null && lastError !== '' && (
+          <div className="mt-1 font-mono text-[11px] break-words text-err">{lastError}</div>
         )}
       </div>
       <div className="shrink-0">
@@ -171,6 +221,36 @@ function RunnerBanner({ status, onRetry }: { status: RunnerStatusDto; onRetry: (
           retry
         </Button>
       </div>
+    </div>
+  )
+}
+
+/**
+ * Ambient fallback chip (phase 21). When the runner is enabled but the
+ * subscription tier is unavailable, a subscription-eligible role is actually
+ * landing on cloud/local. This states that fact in the rail with a neutral warn
+ * token — degraded but working — without the banner's urgency. The banner (loud,
+ * actionable) and this chip (ambient) COEXIST; neither hides the other.
+ */
+function RunnerFallbackChip({ status }: { status: RunnerStatusDto }): React.JSX.Element {
+  const { label, title } =
+    status.effectiveBackend === 'cloud-api'
+      ? {
+          label: 'fallback: cloud',
+          title: 'subscription unavailable — reasoning is running on your cloud api tier until it recovers'
+        }
+      : status.effectiveBackend === 'local-qwen3'
+        ? {
+            label: 'fallback: local',
+            title: 'subscription unavailable — reasoning is running on the local model until it recovers'
+          }
+        : {
+            label: 'fallback active',
+            title: 'subscription unavailable — reasoning is running on the fallback tier'
+          }
+  return (
+    <div role="status" data-testid="runner-fallback-chip" title={title} className="border-t border-line px-4 py-2.5">
+      <Badge status="fallback" label={label} />
     </div>
   )
 }
@@ -229,10 +309,19 @@ export default function App(): React.JSX.Element {
   }, [refreshRunner])
 
   const runnerBanner =
+    runnerStatus !== null && runnerStatus.enabled && isRunnerBannerState(runnerStatus.state) ? (
+      <RunnerBanner state={runnerStatus.state} lastError={runnerStatus.lastError} onRetry={() => void retryRunner()} />
+    ) : null
+
+  // Ambient effective-tier fact in the rail — coexists with the banner (no hide-
+  // coupling). The `!== 'unknown'` is renderer-only anti-flicker; the DTO stays
+  // factual. Runner OFF ⇒ enabled:false ⇒ not rendered (DEFAULT == TODAY).
+  const runnerFallbackChip =
     runnerStatus !== null &&
     runnerStatus.enabled &&
-    (runnerStatus.state === 'auth-expired' || runnerStatus.state === 'quota-exhausted') ? (
-      <RunnerBanner status={runnerStatus} onRetry={() => void retryRunner()} />
+    runnerStatus.fallbackActive &&
+    runnerStatus.state !== 'unknown' ? (
+      <RunnerFallbackChip status={runnerStatus} />
     ) : null
 
   return (
@@ -281,6 +370,7 @@ export default function App(): React.JSX.Element {
               · <span className="text-ink-mute">decided {week.decided}</span>
             </div>
           </div>
+          {runnerFallbackChip}
           <SubsystemStatus />
         </nav>
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">

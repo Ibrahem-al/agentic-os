@@ -65,6 +65,8 @@ export const statusColor: Readonly<Record<string, keyof typeof color>> = {
   'not-installed': 'warn',
   'auth-expired': 'err',
   'quota-exhausted': 'warn',
+  // runner fallback (phase 21) — subscription down, reasoning degraded-but-working (NOT err)
+  fallback: 'warn',
   // skill versions
   active: 'ok',
   candidate: 'warn',

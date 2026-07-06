@@ -35,6 +35,8 @@ Orchestrator (Opus) read `MCP-COVERAGE.md` (1729 lines, twice), `spec.md` §20/�
 
 _(appended per work unit; each phase also gets a `docs/progress/phase-NN-report.md` per the CLAUDE.md protocol.)_
 
+| 2026-07-06 | 21 | Fallback visibility (post-feature UX): RunnerStatusDto += fallbackActive + effectiveBackend (from isHealthy() + router.resolve, not the sticky state) → dashboard chip + get_runner_status; renderer rail chip + banner broadened to not-installed; OFF-by-default preserved | **Fable-5 PLAN** (`a66841624efa3a0a5`) + Opus ultracode Workflow (`wf_35447569-c77`) | shared/ipc.ts, reads/runner.ts, ipc.ts, index.ts, mcp/tools/read.ts, renderer (design-tokens/App.tsx), reads.runner-status.test.ts | **done** — lint+typecheck clean, 850 passed/12 skip offline (flakes isolated), reads 10/10, no new deps; orchestrator confirmed the isHealthy()-based computation + DEFAULT==TODAY | `phase-21` |
+
 ## Feature complete (2026-07-06)
 Phases 14–20 delivered the MCP-integration + subscription-reasoner feature on branch `feat/mcp-expansion-subscription-reasoner`: 38 MCP tools (27 read / 4 staged-write / 7 control); the ReasoningProvider seam + per-call ProviderRouter (`subscription → cloud-api → local-qwen3` fallback); the runner (completion + agent mode) with the CallBudget circuit breaker, quota self-throttle, zombie defense; the §5 human-gated spine provably off the MCP surface; everything OFF by default with a consent dialog + the recorded §6.1 ToS gate. Nothing removed — a default install behaves exactly as v0.1.0. 8 commits (`acffda5` → `phase-20`); no new npm dependency across the whole feature.
 

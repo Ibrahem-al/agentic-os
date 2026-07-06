@@ -53,7 +53,8 @@ import {
   loadModelSettings,
   saveModelSettings,
   settingsPath,
-  type ModelSettings
+  type ModelSettings,
+  type ProviderRouter
 } from './models'
 import { searchMemory } from './retrieval'
 import {
@@ -150,7 +151,16 @@ export interface IpcDeps {
    * down) or in test rigs; `runner.status` then reports the disabled/unknown
    * shape and `runner.testConnection` surfaces UNAVAILABLE.
    */
-  readonly runner?: Pick<Runner, 'healthSnapshot' | 'testConnection'> | null
+  readonly runner?: Pick<Runner, 'healthSnapshot' | 'testConnection' | 'isHealthy'> | null
+  /**
+   * Phase-21: the phase-16 ProviderRouter (live role resolution). Read by
+   * `runner.status` to fill the DTO's `effectiveBackend` — where a
+   * subscription-eligible role actually lands while the runner is falling back.
+   * Optional/null (like `onSettingsChanged`): unset in test rigs and any launch
+   * without a router, in which case `effectiveBackend` reports null (DEFAULT ==
+   * TODAY).
+   */
+  readonly router?: ProviderRouter | null
 }
 
 /** The name decisions are recorded under (§13 decided_by / decidedBy). */
@@ -808,7 +818,9 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   // read-only health + latest-run view for the settings panel + banner. Always
   // answerable — an absent runner reports the disabled/unknown shape (off is the
   // default, not a fault).
-  register('runner.status', () => getRunnerStatus({ runner: deps.runner ?? null, db: need.db() }))
+  register('runner.status', () =>
+    getRunnerStatus({ runner: deps.runner ?? null, db: need.db(), router: deps.router ?? null })
+  )
 
   // The manual 1-turn canary — the closest thing to an auth probe (§3.7). Only
   // ever user-triggered from the settings panel, NEVER scheduled.

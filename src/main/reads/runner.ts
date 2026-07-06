@@ -7,13 +7,19 @@
  * binary + version + last state, learned from real-run classification — there is
  * no offline "am I logged in" probe, §9.7) and the durable `runner_runs` ledger
  * (the latest row + the agent-mode tombstone count). It is READ-ONLY: it never
- * spawns `claude` (that is the manual test-connection canary, §3.7) and never
- * writes. A default install reports `enabled:false` / `state:'unknown'`.
+ * writes and never spawns a `claude` COMPLETION (that is the manual
+ * test-connection canary, §3.7). Reading fallback status calls the runner's
+ * `isHealthy()` — the router's own gate — which on an ENABLED runner may kick one
+ * deduped, non-blocking `claude --version` health probe per TTL (already firing on
+ * every route, so this adds no new spawn behavior); a DISABLED runner spawns
+ * nothing (the enabled check precedes the probe). A default install reports
+ * `enabled:false` / `state:'unknown'` / `fallbackActive:false`.
  */
 import type BetterSqlite3 from 'better-sqlite3'
 import type { RunnerRunSummaryDto, RunnerStatusDto } from '../../shared/ipc'
-// Type-only (no runtime coupling to the runner module from the reads layer).
+// Type-only (no runtime coupling to the runner/models modules from the reads layer).
 import type { RunnerHealthSnapshot } from '../runner'
+import type { ProviderRouter } from '../models'
 
 /**
  * The runner facade viewed as a health source (`healthSnapshot()` only). The
@@ -22,12 +28,27 @@ import type { RunnerHealthSnapshot } from '../runner'
  */
 export interface RunnerStatusSource {
   healthSnapshot(): RunnerHealthSnapshot
+  /**
+   * The router's own `isHealthy()` gate (enabled ∧ resolved ∧ versionOk ∧
+   * effective-state usable) — the SAME primitive `ProviderRouter.subscriptionAvailable`
+   * consults, so "fallback active" tracks live routing rather than the sticky
+   * snapshot `state`. On an ENABLED runner it may kick one deduped, non-blocking
+   * `claude --version` probe per TTL; a disabled runner returns false with no spawn.
+   */
+  isHealthy(): boolean
 }
 
 export interface RunnerStatusDeps {
   /** The subscription runner facade; null when it did not boot this launch. */
   readonly runner: RunnerStatusSource | null
   readonly db: BetterSqlite3.Database
+  /**
+   * The phase-16 ProviderRouter (resolve only) — resolves the effective backend a
+   * subscription-eligible role lands on while the runner is falling back. Optional
+   * and nullable so existing rigs and any launch without a router compile unchanged
+   * and report `effectiveBackend:null` (DEFAULT == TODAY).
+   */
+  readonly router?: Pick<ProviderRouter, 'resolve'> | null
 }
 
 const iso = (ms: number | null): string | null => (ms === null ? null : new Date(ms).toISOString())
@@ -40,14 +61,29 @@ const iso = (ms: number | null): string | null => (ms === null ? null : new Date
  */
 export function getRunnerStatus(deps: RunnerStatusDeps): RunnerStatusDto {
   const snap = deps.runner?.healthSnapshot() ?? null
+  const enabled = snap?.enabled ?? false
+  // Fallback = the runner is ON but the subscription tier is NOT healthy right now
+  // (the exact isHealthy() the router consults, NOT the sticky snapshot `state`).
+  // Always false when disabled — local/cloud is then the CONFIGURED tier, not a
+  // fallback.
+  const fallbackActive = enabled && !(deps.runner?.isHealthy() ?? false)
+  // Where a subscription-eligible role (skills.rewrite is subscribable) actually
+  // lands while falling back — live router resolution. Only resolved while falling
+  // back; a raced 'subscription-claude' (health flipped mid-read) and the no-router
+  // case both clamp to null.
+  const resolved = fallbackActive ? deps.router?.resolve('skills.rewrite') : undefined
+  const effectiveBackend =
+    resolved === undefined || resolved.backend === 'subscription-claude' ? null : resolved.backend
   return {
-    enabled: snap?.enabled ?? false,
+    enabled,
     binaryPath: snap?.binaryPath ?? null,
     version: snap?.version ?? null,
     versionOk: snap?.versionOk ?? false,
     state: snap?.state ?? 'unknown',
     lastAuthOkAt: iso(snap?.lastAuthOkAtMs ?? null),
     lastError: snap?.lastError ?? null,
+    fallbackActive,
+    effectiveBackend,
     lastRun: latestRunnerRun(deps.db),
     tombstonedSessions: countTombstonedSessions(deps.db)
   }

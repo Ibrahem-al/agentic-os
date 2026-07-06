@@ -472,6 +472,10 @@ export interface RunnerStatusDto {
   readonly lastAuthOkAt: string | null
   /** Last classified failure detail (auth/quota/not-installed) — the banner line. */
   readonly lastError: string | null
+  /** True when the runner is enabled but the subscription tier is unavailable (same isHealthy() the router consults) — reasoning that would ride the subscription is falling back. Always false when disabled (local/cloud is then the CONFIGURED tier). */
+  readonly fallbackActive: boolean
+  /** Where a subscription-eligible role actually lands while falling back (live router resolution). null when not falling back, or no router wired. */
+  readonly effectiveBackend: 'cloud-api' | 'local-qwen3' | null
   readonly lastRun: RunnerRunSummaryDto | null
   /** Agent-mode tombstoned sessions (§3.6/§10.2); 0 in completion mode. */
   readonly tombstonedSessions: number

@@ -444,8 +444,9 @@ async function getRunnerStatusTool(args: unknown, ctx: ToolContext): Promise<unk
   parse(NO_INPUT, args, 'get_runner_status')
   // Read-only + always answerable: an absent runner (didn't boot / off) yields
   // the disabled/unknown shape rather than an error — the runner being off is
-  // the normal default, not a fault.
-  return getRunnerStatus({ runner: ctx.runnerStatus ?? null, db: ctx.db })
+  // the normal default, not a fault. The router (when wired) resolves the
+  // effective backend a subscription-eligible role lands on while falling back.
+  return getRunnerStatus({ runner: ctx.runnerStatus ?? null, db: ctx.db, router: ctx.router ?? null })
 }
 
 export const READ_TOOL_DEFS: readonly McpToolDef[] = [
@@ -619,7 +620,7 @@ export const READ_TOOL_DEFS: readonly McpToolDef[] = [
   {
     name: 'get_runner_status',
     description:
-      'Headless subscription-runner status: enabled flag, resolved claude binary path + version, health state (ok / not-installed / auth-expired / quota-exhausted / unknown), last auth-ok time, the latest runner run, and the agent-mode tombstone count. OFF by default — a default install reports enabled:false and never spawns claude.',
+      'Headless subscription-runner status: enabled flag, resolved claude binary path + version, health state (ok / not-installed / auth-expired / quota-exhausted / unknown), last auth-ok time, whether the subscription tier is currently unavailable and falling back (fallbackActive) plus the effective backend reasoning lands on while it does (effectiveBackend: cloud-api / local-qwen3 / null), the latest runner run, and the agent-mode tombstone count. OFF by default — a default install reports enabled:false, fallbackActive:false and never spawns claude.',
     inputSchema: jsonSchema(NO_INPUT),
     handle: getRunnerStatusTool
   }

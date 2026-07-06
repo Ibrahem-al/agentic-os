@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { getRunnerStatus, type RunnerStatusSource } from '../../src/main/reads'
+import { getRunnerStatus, type RunnerStatusDeps, type RunnerStatusSource } from '../../src/main/reads'
 import type { RunnerHealthSnapshot } from '../../src/main/runner'
 import { openAppData, type AppData } from '../../src/main/storage'
 
@@ -40,7 +40,20 @@ const HEALTHY: RunnerHealthSnapshot = {
   lastError: null
 }
 
-const sourceOf = (snap: RunnerHealthSnapshot): RunnerStatusSource => ({ healthSnapshot: () => snap })
+const sourceOf = (snap: RunnerHealthSnapshot, isHealthy = false): RunnerStatusSource => ({
+  healthSnapshot: () => snap,
+  isHealthy: () => isHealthy
+})
+
+/** An enabled runner whose LIVE gate (isHealthy) is DOWN — the fallback case. */
+const ENABLED_UNHEALTHY: RunnerHealthSnapshot = { ...HEALTHY, state: 'auth-expired', lastError: 'login expired' }
+
+/** A router stub whose skills.rewrite resolves to a fixed backend (introspection only). */
+const routerResolving = (
+  backend: 'cloud-api' | 'local-qwen3' | 'subscription-claude'
+): NonNullable<RunnerStatusDeps['router']> => ({
+  resolve: (role) => ({ role, backend, model: `model-${backend}` })
+})
 
 interface SeedRun {
   id: string
@@ -93,6 +106,8 @@ describe('getRunnerStatus (§4.F read shape)', () => {
       state: 'unknown',
       lastAuthOkAt: null,
       lastError: null,
+      fallbackActive: false,
+      effectiveBackend: null,
       lastRun: null,
       tombstonedSessions: 0
     })
@@ -166,5 +181,66 @@ describe('getRunnerStatus (§4.F read shape)', () => {
     expect(status.state).toBe('unknown')
     expect(status.lastRun?.id).toBe('rr-only')
     expect(status.tombstonedSessions).toBe(1)
+  })
+})
+
+describe('getRunnerStatus fallback enrichment (§21 — fallbackActive + effectiveBackend)', () => {
+  it('disabled runner → fallbackActive:false / effectiveBackend:null even when a router is wired', () => {
+    // enabled:false short-circuits the fallback trigger; the router is never consulted.
+    const status = getRunnerStatus({
+      runner: sourceOf({ ...HEALTHY, enabled: false }, false),
+      db: appData.db,
+      router: routerResolving('cloud-api')
+    })
+    expect(status.enabled).toBe(false)
+    expect(status.fallbackActive).toBe(false)
+    expect(status.effectiveBackend).toBeNull()
+  })
+
+  it('enabled + healthy → not falling back (false / null); router not consulted', () => {
+    const status = getRunnerStatus({
+      runner: sourceOf(HEALTHY, true),
+      db: appData.db,
+      router: routerResolving('cloud-api')
+    })
+    expect(status.enabled).toBe(true)
+    expect(status.fallbackActive).toBe(false)
+    expect(status.effectiveBackend).toBeNull()
+  })
+
+  it('enabled + unhealthy + router→cloud-api → true / cloud-api', () => {
+    const status = getRunnerStatus({
+      runner: sourceOf(ENABLED_UNHEALTHY, false),
+      db: appData.db,
+      router: routerResolving('cloud-api')
+    })
+    expect(status.fallbackActive).toBe(true)
+    expect(status.effectiveBackend).toBe('cloud-api')
+  })
+
+  it('enabled + unhealthy + router→local-qwen3 → true / local-qwen3', () => {
+    const status = getRunnerStatus({
+      runner: sourceOf(ENABLED_UNHEALTHY, false),
+      db: appData.db,
+      router: routerResolving('local-qwen3')
+    })
+    expect(status.fallbackActive).toBe(true)
+    expect(status.effectiveBackend).toBe('local-qwen3')
+  })
+
+  it('enabled + unhealthy + NO router → true / null (fallback known, effective tier unresolved)', () => {
+    const status = getRunnerStatus({ runner: sourceOf(ENABLED_UNHEALTHY, false), db: appData.db })
+    expect(status.fallbackActive).toBe(true)
+    expect(status.effectiveBackend).toBeNull()
+  })
+
+  it('enabled + unhealthy + router races back to subscription-claude → true / null (clamped)', () => {
+    const status = getRunnerStatus({
+      runner: sourceOf(ENABLED_UNHEALTHY, false),
+      db: appData.db,
+      router: routerResolving('subscription-claude')
+    })
+    expect(status.fallbackActive).toBe(true)
+    expect(status.effectiveBackend).toBeNull()
   })
 })

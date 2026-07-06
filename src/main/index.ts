@@ -759,6 +759,9 @@ function bootIpc(): void {
     triggers,
     // Phase-17: the subscription runner backs runner.status / runner.testConnection.
     runner: subscriptionRunner,
+    // Phase-21: the live router fills runner.status's effectiveBackend — where a
+    // subscription-eligible role lands while the runner is falling back.
+    router: providerRouter,
     userDataDir,
     // Phase-16b (P1.1): the settings mutators (save / setApiKey / clearApiKey)
     // fire this after a successful change so boot drops the router's cached
