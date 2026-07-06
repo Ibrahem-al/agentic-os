@@ -19,6 +19,7 @@ import {
 } from './config'
 import { openAppData, openRyuGraphEngine, type AppData } from './storage'
 import {
+  CallBudget,
   Keychain,
   keychainPath,
   loadModelSettings,
@@ -257,14 +258,16 @@ function bootKernel(): void {
   securityInstances = { permissions, audit, scanner }
   const kernel = new Kernel({ telemetry, permissions, audit })
   // §8 phase-13: cooperative yield at step boundaries — a running multi-step
-  // workflow defers to live MCP calls between steps (the queue's pre-dispatch
-  // yield covers only task starts). The closure reads mcpServer at call time;
-  // it is null until bootMcp() and that is fine (0 inflight = no wait).
+  // workflow defers to live INTERACTIVE MCP calls between steps (the queue's
+  // pre-dispatch yield covers only task starts). §14b gauge split: a runner's
+  // own MCP calls are excluded, so a background workflow never yields to itself.
+  // The closure reads mcpServer at call time; it is null until bootMcp() and
+  // that is fine (0 inflight = no wait).
   const runner = new LangGraphRunner({
     db: appData.db,
     telemetry,
     executor: kernel,
-    yieldPoint: createInflightYield(() => mcpServer?.inflightCalls ?? 0)
+    yieldPoint: createInflightYield(() => mcpServer?.inflightInteractiveCalls ?? 0)
   })
   const contextManager = new ContextManager({ llm: ollama ?? new OllamaClient(), telemetry })
   kernelInstances = { kernel, runner, contextManager }
@@ -300,14 +303,26 @@ async function bootMcp(): Promise<void> {
   reranker ??= new Reranker({ modelsDir: paths.modelsDir, ...rerankerFilesOverride() })
   const retrievalDeps = { engine, embedder: ollama, reranker }
   const retriever = createRetriever({ ...retrievalDeps, llm: ollama })
+  // §10.1/P0.3 zombie defense: mint a FRESH runner token BEFORE the server binds
+  // it (below), so a runner child that outlived a previous app process holds a
+  // token that no longer authenticates — its next MCP call 401s at once. The
+  // boot-sweep of stale runner/*.mcp.json + the kill-on-boot land at FP-3.
+  const runnerToken = keychain.rotateRunnerToken()
+  // P0.2: ONE durable call/spend guard (reads runner_runs, so it survives
+  // resume) threaded into every tool's ToolContext as spendMeter. The live
+  // read-path consumer (taskId 'live:<sessionId>', RUNNER_LIVE_SESSION_MAX_CALLS)
+  // is wired when getContext is refactored at FP-1; here we only supply the dep.
+  const callBudget = new CallBudget({ db: appData.db })
   const server = new AgenticOsMcpServer({
     bearerToken: keychain.ensureMcpBearerToken(),
+    runnerToken,
     engine,
     retriever,
     retrieval: retrievalDeps,
     llm: ollama,
     db: appData.db,
     executor: kernelInstances.kernel,
+    spendMeter: callBudget,
     // §13 (phase 09): ingest tools scan for embedded instructions and their
     // lane jobs record audited reversible deltas.
     ...(securityInstances !== null
@@ -428,8 +443,10 @@ async function bootTriggers(): Promise<void> {
   const paths = appDataPaths(userDataDir)
   const queue = new DurableTaskQueue({
     db: appData.db,
-    // §8: live MCP work is prioritized; background dispatch yields (capped).
-    shouldYield: () => (mcpServer?.inflightCalls ?? 0) > 0
+    // §8: live INTERACTIVE MCP work is prioritized; background dispatch yields
+    // (capped). §14b gauge split: a runner's own MCP calls don't count, so its
+    // background task never blocks itself.
+    shouldYield: () => (mcpServer?.inflightInteractiveCalls ?? 0) > 0
   })
 
   if (extractionAgent !== null) {

@@ -59,9 +59,69 @@ export interface ApprovalRow {
   readonly decidedBy: string | null
 }
 
-const READ_TOOLS = new Set(['get_context', 'search_memory', 'list_skills', 'get_skill'])
+/**
+ * The full planned MCP tool surface (§4.G / phase-14b), split by permission
+ * tier. Most names have no handler yet — the dispatcher answers NOT_FOUND for
+ * those (a client error, not a permission breach) — but tiering them here means
+ * each is gated correctly the moment its handler lands (FP-1 / FP-4), and the
+ * §13 mcp-call scope check (P0.6) fails closed on anything outside these sets.
+ * Exported so the server dispatch (B3) derives the runner-session READ+STAGING
+ * allowlist from the same source of truth.
+ */
+export const READ_TOOLS = new Set([
+  // phase-05 originals
+  'get_context',
+  'search_memory',
+  'list_skills',
+  'get_skill',
+  // phase-14b full read surface (§4.G)
+  'list_sessions',
+  'read_session',
+  'get_pending_work',
+  'get_skill_full',
+  'get_skill_signal',
+  'memory_counts',
+  'list_nodes',
+  'get_node',
+  'list_staged_writes',
+  'get_staged_write',
+  'list_approvals',
+  'list_injection_flags',
+  'list_audit_log',
+  'list_traces',
+  'get_trace',
+  'get_usage',
+  'list_tasks',
+  'get_task',
+  'get_triggers_status',
+  'list_watched_folders',
+  'get_app_status',
+  'get_settings_summary',
+  'get_runner_status'
+])
 /** Staging IS the §21-rule-6 approval flow — gating the act of staging would be approval-on-approval. */
-const STAGING_TOOLS = new Set(['propose_correction'])
+export const STAGING_TOOLS = new Set([
+  'propose_correction',
+  // phase-14b staging surface — proposals land in a review queue, not the graph
+  'propose_extraction',
+  'propose_skill_revision',
+  'submit_extraction_items'
+])
+/**
+ * Control tools trigger real side effects (runs, writes, task control) — they
+ * are write-tier gated: standing-allowed on the interactive `mcp:` profile
+ * (whose §13 write machinery lives downstream), never on runner profiles.
+ */
+export const CONTROL_TOOLS = new Set([
+  'run_extraction',
+  'improve_skill_now',
+  'run_maintenance',
+  'retry_task',
+  'scan_watched_folder',
+  // phase-05 ingest tools — moved here from the inline mcp-call name check
+  'ingest_document',
+  'ingest_codebase'
+])
 
 export class PermissionEngine implements PermissionChecker {
   private readonly db: BetterSqlite3.Database
@@ -164,16 +224,24 @@ export class PermissionEngine implements PermissionChecker {
       }
 
       case 'mcp-call': {
-        // The §12 surface is fixed server-side; per-tool tiering here. Unknown
-        // names pass through to the dispatcher, which answers NOT_FOUND — a
-        // client error, not a permission breach (recorded decision).
+        // P0.6: scope-check FIRST — a session may only call tools its profile
+        // declares (mirrors case 'tool-call'). This closes the gap where the
+        // pre-14b branch skipped cap.tools entirely: READ/STAGING auto-allowed
+        // regardless of the agent's declared surface, and unknown names fell
+        // through to a silent allow. Now both fail closed.
+        if (!cap.tools.includes(action.name) && !cap.tools.includes('*')) {
+          return this.block(action, `tool '${action.name}' is not in the agent's declared tools`)
+        }
+        // Reads + staging (§21 rule 6 — staging IS the approval flow) auto-allow.
         if (READ_TOOLS.has(action.name) || STAGING_TOOLS.has(action.name)) {
           return { allowed: true, reason: 'read/staging MCP tool — auto-allowed (§13/§21 rule 6)' }
         }
-        if (action.name === 'ingest_document' || action.name === 'ingest_codebase') {
+        // Control tools carry real side effects — write-tier gated.
+        if (CONTROL_TOOLS.has(action.name)) {
           return this.gate(agentId, action, profile, 'write', { tool: action.name })
         }
-        return { allowed: true, reason: 'MCP dispatch — unknown names are answered NOT_FOUND by the fixed §12 surface' }
+        // Declared but in no recognized tier ⇒ fail closed (no allow-by-default).
+        return this.block(action, `tool '${action.name}' is not a recognized MCP tool`)
       }
 
       case 'sandbox-run': {
@@ -339,17 +407,28 @@ export function registerInternalAgents(engine: PermissionEngine): void {
   engine.registerAgentPrefix('mcp:', {
     capabilities: {
       ...EMPTY_CAPABILITIES,
-      tools: [
-        'get_context',
-        'search_memory',
-        'list_skills',
-        'get_skill',
-        'propose_correction',
-        'ingest_document',
-        'ingest_codebase'
-      ]
+      // The full planned surface: with the P0.6 cap.tools check now enforced,
+      // the interactive session must declare every tool it may call. Reads +
+      // staging auto-allow; the control tools ride the write standing-grant —
+      // so the 7 phase-05 tools (and every later one) behave exactly as today.
+      tools: [...READ_TOOLS, ...STAGING_TOOLS, ...CONTROL_TOOLS]
     },
     gates: { write: 'allow' }
+  })
+  // Runner-attributed MCP sessions (§12 'mcp-runner:<transport session id>',
+  // phase-14b): the subscription reasoner drives these headlessly. Scoped to
+  // READ + STAGING only (NOT the control tools) with NO standing grant — reads
+  // and staging auto-allow; any gated tier stays queued headless rather than
+  // committing. maxSpendUSD 0: the runner's ceiling is the durable call budget
+  // (models/callBudget), never a dollar figure. Prefix hygiene —
+  // 'mcp-runner:'.startsWith('mcp:') is false, so this never inherits the
+  // interactive write grant (verified).
+  engine.registerAgentPrefix('mcp-runner:', {
+    capabilities: {
+      ...EMPTY_CAPABILITIES,
+      tools: [...READ_TOOLS, ...STAGING_TOOLS],
+      maxSpendUSD: 0
+    }
   })
 }
 

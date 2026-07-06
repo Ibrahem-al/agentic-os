@@ -17,7 +17,10 @@ export {
   type DockerCapabilityArgs
 } from './capabilities'
 export {
+  CONTROL_TOOLS,
   PermissionEngine,
+  READ_TOOLS,
+  STAGING_TOOLS,
   registerInternalAgents,
   type AgentProfile,
   type ApprovalRow,

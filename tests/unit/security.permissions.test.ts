@@ -115,6 +115,21 @@ describe('tiered gates', () => {
     expect(declared.pendingApprovalId).toBeDefined()
   })
 
+  it('P0.6: mcp-call enforces declared-tool scope, and a declared-but-unrecognized name fails closed', () => {
+    // 'worker' declares only the 'summarize' tool (see beforeEach).
+    // (a) A READ tool the profile does NOT declare: pre-14b this auto-allowed
+    //     for ANY registered agent because the mcp-call branch skipped cap.tools.
+    const undeclared = engine.check('worker', { kind: 'mcp-call', name: 'get_context' })
+    expect(undeclared.allowed).toBe(false)
+    expect(undeclared.reason).toContain("not in the agent's declared tools")
+    // (b) A name the profile DOES declare but that maps to no read/staging/control
+    //     tier: the old allow-by-default fallthrough is replaced with a hard block.
+    const unrecognized = engine.check('worker', { kind: 'mcp-call', name: 'summarize' })
+    expect(unrecognized.allowed).toBe(false)
+    expect(unrecognized.reason).toContain('not a recognized MCP tool')
+    expect(engine.listApprovals()).toHaveLength(0)
+  })
+
   it('sandbox-run: read-only requests auto-allow; side-effecting ones gate; exceeding ones block', () => {
     const readOnly = engine.check('worker', {
       kind: 'sandbox-run',
@@ -179,17 +194,50 @@ describe('internal registrations (boot profile)', () => {
     expect(engine.check('extraction-agent', { kind: 'net', name: 'fetch', host: 'example.com' }).allowed).toBe(false)
   })
 
-  it('mcp:<session> prefix: read tools + staging auto-allow, ingest tools standing-allowed', () => {
+  it('mcp:<session> prefix: full read + staging surface auto-allows; control (incl. ingest) standing-allowed; interactive behavior unchanged', () => {
     const sid = 'mcp:3f2a-transport-session'
+    // The 7 phase-05 tools still behave exactly as today...
     for (const tool of ['get_context', 'search_memory', 'list_skills', 'get_skill', 'propose_correction']) {
       expect(engine.check(sid, { kind: 'mcp-call', name: tool }).allowed).toBe(true)
     }
     expect(engine.check(sid, { kind: 'mcp-call', name: 'ingest_document' }).allowed).toBe(true)
     expect(engine.check(sid, { kind: 'mcp-call', name: 'ingest_codebase' }).allowed).toBe(true)
-    // Unknown tool names pass through to the fixed §12 dispatcher (NOT_FOUND);
+    // ...and a sample of the phase-14b read/staging surface auto-allows too.
+    for (const tool of ['list_sessions', 'get_runner_status', 'list_audit_log', 'submit_extraction_items']) {
+      expect(engine.check(sid, { kind: 'mcp-call', name: tool }).allowed).toBe(true)
+    }
+    // The new control tools ride the write standing-grant on the interactive profile.
+    for (const tool of ['run_extraction', 'improve_skill_now', 'run_maintenance', 'retry_task', 'scan_watched_folder']) {
+      expect(engine.check(sid, { kind: 'mcp-call', name: tool }).allowed).toBe(true)
+    }
+    // P0.6: an unknown / undeclared tool name is now BLOCKED (pre-14b it was allow-defaulted).
+    const unknown = engine.check(sid, { kind: 'mcp-call', name: 'no-such-tool' })
+    expect(unknown.allowed).toBe(false)
+    expect(unknown.reason).toContain('hard block')
+    expect(engine.listApprovals()).toHaveLength(0)
     // a non-mcp action from the session family still hits scope checks.
-    expect(engine.check(sid, { kind: 'mcp-call', name: 'no-such-tool' }).allowed).toBe(true)
     expect(engine.check(sid, { kind: 'fs-write', name: 'w', paths: [abs('x')] }).allowed).toBe(false)
+  })
+
+  it('mcp-runner:<session> prefix: READ + STAGING auto-allow; CONTROL and unknown names blocked; no standing grant', () => {
+    const rid = 'mcp-runner:abcd-transport-session'
+    // Reads + staging auto-allow (sample the declared surface).
+    for (const tool of ['get_context', 'list_sessions', 'get_runner_status', 'propose_correction', 'submit_extraction_items']) {
+      expect(engine.check(rid, { kind: 'mcp-call', name: tool }).allowed).toBe(true)
+    }
+    // Control tools are NOT in the runner's declared surface → hard-blocked
+    // (no standing write grant exists either).
+    for (const tool of ['ingest_document', 'ingest_codebase', 'run_extraction', 'run_maintenance', 'retry_task']) {
+      const denied = engine.check(rid, { kind: 'mcp-call', name: tool })
+      expect(denied.allowed).toBe(false)
+      expect(denied.reason).toContain('hard block')
+    }
+    // Unknown names blocked; none of the above queued an approval row.
+    expect(engine.check(rid, { kind: 'mcp-call', name: 'no-such-tool' }).allowed).toBe(false)
+    expect(engine.listApprovals()).toHaveLength(0)
+    // Prefix hygiene: a runner id does not match the mcp: family, so it never
+    // inherits the interactive write standing-grant.
+    expect('mcp-runner:x'.startsWith('mcp:')).toBe(false)
   })
 
   it('prefix families do not leak: an id NOT matching any prefix stays denied', () => {
