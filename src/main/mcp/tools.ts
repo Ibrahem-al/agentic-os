@@ -22,6 +22,7 @@ export {
   jsonSchema,
   type ToolErrorCode,
   type ToolContext,
+  type McpReadContext,
   type McpToolDef
 } from './tools/shared'
 export { READ_TOOL_DEFS } from './tools/read'

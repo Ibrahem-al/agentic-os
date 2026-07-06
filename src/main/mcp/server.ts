@@ -39,7 +39,7 @@ import type { BudgetGuard, RetrievalDeps, Retriever } from '../retrieval'
 import { READ_TOOLS, STAGING_TOOLS, type AuditLog, type InjectionScanner } from '../security'
 import type { StorageEngine } from '../storage'
 import { McpCallLog } from './callLog'
-import { MCP_TOOLS, ToolError, type ToolContext } from './tools'
+import { MCP_TOOLS, ToolError, type McpReadContext, type ToolContext } from './tools'
 
 /**
  * Runner MCP sessions are scoped SERVER-SIDE to READ + STAGING tools (§14b B3),
@@ -169,6 +169,11 @@ export class AgenticOsMcpServer {
   private readonly sessions = new Map<string, McpSession>()
   private http: HttpServer | null = null
   private sessionEndHook: SessionEndHook | null = null
+  // The §4 read tools' late-bound deps (permissions/runner/triggers/watched
+  // folders/ollama/keychain/app-status). Empty until bootIpc calls
+  // setReadContext; spread into every ToolContext so an un-wired server keeps
+  // today's exact behavior and the read tools that need a dep degrade cleanly.
+  private readContext: McpReadContext = {}
   // Gauge split (§3.6a/P0.9): interactive calls drive the §8 yield; runner calls
   // are observed but never stall live work.
   private inflightInteractive = 0
@@ -189,6 +194,17 @@ export class AgenticOsMcpServer {
   /** Arm the session-end hook endpoint (phase-11 boot, after the queue exists). */
   setSessionEndHook(hook: SessionEndHook): void {
     this.sessionEndHook = hook
+  }
+
+  /**
+   * Supply the §4 read tools' late-bound dependencies. Called once from bootIpc
+   * — the last boot step, where every subsystem singleton exists and the
+   * subsystem snapshot is accurate. Mirrors setSessionEndHook: purely additive.
+   * Until it runs, read tools needing a missing dep return a clean structured
+   * error, so an un-wired server behaves exactly as before.
+   */
+  setReadContext(readContext: McpReadContext): void {
+    this.readContext = readContext
   }
 
   /**
@@ -496,7 +512,9 @@ export class AgenticOsMcpServer {
             sessionId,
             ...(this.deps.scanner !== undefined ? { scanner: this.deps.scanner } : {}),
             ...(this.deps.audit !== undefined ? { audit: this.deps.audit } : {}),
-            ...(this.deps.spendMeter !== undefined ? { spendMeter: this.deps.spendMeter } : {})
+            ...(this.deps.spendMeter !== undefined ? { spendMeter: this.deps.spendMeter } : {}),
+            // §4 read tools' late-bound deps (empty on an un-wired server).
+            ...this.readContext
           }
           return tool.handle(args, ctx)
         }

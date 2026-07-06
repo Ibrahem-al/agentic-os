@@ -60,7 +60,12 @@ async function listSkills(engine: StorageEngine, skillId?: string): Promise<Skil
   }))
 }
 
-async function collectSignal(
+/**
+ * The event-gate signal for one skill (§17/§20): its corrections and failure
+ * examples, each stamped `isNew` relative to the per-skill cursor. Exported for
+ * the phase-15 read tools (`get_skill_signal`, `get_pending_work`) — the same
+ * read-only computation the nightly plan uses. */
+export async function collectSignal(
   engine: StorageEngine,
   skillId: string,
   cursor: string | null
@@ -118,7 +123,10 @@ async function activeInstructionsOf(
   }
 }
 
-function hasPendingReview(db: BetterSqlite3.Database, skillId: string): boolean {
+/**
+ * A stylistic candidate for this skill is already awaiting review (§13). Blocks
+ * re-candidacy in the gate; exported for `get_skill_signal`/`get_pending_work`. */
+export function hasPendingReview(db: BetterSqlite3.Database, skillId: string): boolean {
   const row = db
     .prepare(
       `SELECT 1 AS x FROM staged_writes
@@ -203,7 +211,7 @@ export async function planImprovementRun(options: PlanOptions): Promise<PlanStat
 
 // ── §20 drift watch: corrections rate over the next 20 uses vs predecessor ──
 
-async function scanDrift(engine: StorageEngine, db: BetterSqlite3.Database, now: Date): Promise<DriftFinding[]> {
+export async function scanDrift(engine: StorageEngine, db: BetterSqlite3.Database, now: Date): Promise<DriftFinding[]> {
   const findings: DriftFinding[] = []
   for (const adoption of listOpenDriftWatches(db)) {
     const finding = await evaluateDrift(engine, db, adoption, now)

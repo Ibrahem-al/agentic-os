@@ -544,6 +544,22 @@ function bootIpc(): void {
     // the ONE shared reranker instance.
     reranker = new Reranker({ modelsDir: appDataPaths(userDataDir).modelsDir, ...rerankerFilesOverride() })
   }
+  const triggers =
+    triggerInstances !== null
+      ? {
+          queue: triggerInstances.queue,
+          schedules: triggerInstances.schedules,
+          watchers: triggerInstances.watchers,
+          ruleErrors: triggerInstances.rules.errors
+        }
+      : null
+  const subsystems = {
+    storage: engine !== null && appData !== null,
+    models: ollama !== null,
+    kernel: kernelInstances !== null,
+    mcp: mcpServer !== null,
+    agents: extractionAgent !== null
+  }
   registerIpcHandlers({
     engine,
     db: appData?.db ?? null,
@@ -554,24 +570,31 @@ function bootIpc(): void {
     reranker,
     keychain,
     mcpUrl: mcpServer?.url ?? null,
-    triggers:
-      triggerInstances !== null
-        ? {
-            queue: triggerInstances.queue,
-            schedules: triggerInstances.schedules,
-            watchers: triggerInstances.watchers,
-            ruleErrors: triggerInstances.rules.errors
-          }
-        : null,
+    triggers,
     userDataDir,
-    subsystems: {
-      storage: engine !== null && appData !== null,
-      models: ollama !== null,
-      kernel: kernelInstances !== null,
-      mcp: mcpServer !== null,
-      agents: extractionAgent !== null
-    }
+    subsystems
   })
+  // §4 read tools ride the SAME shared read functions as the IPC handlers above;
+  // supply their late-bound deps now — the last boot step, where every singleton
+  // exists and `subsystems` is accurate. Additive: a default install is
+  // unchanged, the read tools are simply newly available over MCP.
+  if (mcpServer !== null) {
+    mcpServer.setReadContext({
+      ...(securityInstances !== null ? { permissions: securityInstances.permissions } : {}),
+      ...(kernelInstances !== null ? { runner: kernelInstances.runner } : {}),
+      triggers,
+      watchedFolders: new WatchedFolderStore({ configPath: join(userDataDir, WATCHED_FOLDERS_CONFIG_FILENAME) }),
+      ollama,
+      keychain,
+      appStatus: {
+        version: app.getVersion(),
+        platform: process.platform,
+        userDataDir,
+        subsystems,
+        mcpUrl: mcpServer.url
+      }
+    })
+  }
   console.log('[ipc] dashboard IPC ready (typed contract, structured errors)')
 }
 

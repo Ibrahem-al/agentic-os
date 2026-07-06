@@ -17,8 +17,12 @@ import * as z from 'zod'
 import type BetterSqlite3 from 'better-sqlite3'
 import type { StorageEngine } from '../../storage'
 import type { RetrievalDeps, Retriever, BudgetGuard } from '../../retrieval'
-import type { ProjectSummarizer } from '../../ingest'
+import type { ProjectSummarizer, WatchedFolderStore } from '../../ingest'
 import type { AuditLog, InjectionScanner } from '../../security'
+import type { WorkflowRunner } from '../../kernel'
+import type { Keychain, OllamaClient } from '../../models'
+import type { ApprovalLister, TriggerStatusDeps } from '../../reads'
+import type { AppStatusDto } from '../../../shared/ipc'
 
 export type ToolErrorCode =
   | 'INVALID_INPUT'
@@ -39,8 +43,35 @@ export class ToolError extends Error {
   }
 }
 
+/**
+ * The §4 read tools' late-bound dependencies — supplied via
+ * `AgenticOsMcpServer.setReadContext` at the LAST boot step (bootIpc), once
+ * every subsystem singleton exists and the subsystem snapshot is accurate.
+ * Every field is optional: an un-wired server (or a pre-14b rig that never
+ * calls the setter) keeps today's exact behavior, and a read tool whose dep is
+ * missing returns a clean structured error instead of crashing. Additive by
+ * construction — a default install is unchanged; the tools are merely newly
+ * available.
+ */
+export interface McpReadContext {
+  /** §13 approval lister (PermissionEngine) — list_approvals / get_pending_work. */
+  readonly permissions?: ApprovalLister
+  /** Workflow-job lookup for get_task's include_workflow (`<taskId>-wf`). */
+  readonly runner?: Pick<WorkflowRunner, 'getJob'>
+  /** Phase-11 trigger runtime for get_triggers_status (null = not armed this launch). */
+  readonly triggers?: TriggerStatusDeps | null
+  /** Watched-folder store for list_watched_folders. */
+  readonly watchedFolders?: Pick<WatchedFolderStore, 'list'>
+  /** Live Ollama health for get_app_status (null = model layer absent this launch). */
+  readonly ollama?: Pick<OllamaClient, 'status'> | null
+  /** Keychain — PRESENCE reads only — for get_settings_summary (null = absent). */
+  readonly keychain?: Pick<Keychain, 'getApiKey'> | null
+  /** Static app-status facts (version/platform/userDataDir/subsystems/mcpUrl). */
+  readonly appStatus?: AppStatusDto
+}
+
 /** Everything a tool handler may touch, resolved per transport session. */
-export interface ToolContext {
+export interface ToolContext extends McpReadContext {
   readonly engine: StorageEngine
   readonly retriever: Retriever
   readonly retrieval: RetrievalDeps

@@ -91,7 +91,7 @@ export {
   REWRITE_SYSTEM_PROMPT,
   type GenerateCandidateOptions
 } from './skills/candidate'
-export { planImprovementRun, type PlanOptions } from './skills/gate'
+export { collectSignal, hasPendingReview, planImprovementRun, scanDrift, type PlanOptions } from './skills/gate'
 export {
   enqueueManualImprovement,
   registerSkillImprovementHandler,

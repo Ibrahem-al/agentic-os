@@ -17,7 +17,7 @@ import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { AgenticOsMcpServer, McpClientManager } from '../../src/main/mcp'
+import { AgenticOsMcpServer, McpClientManager, MCP_TOOLS } from '../../src/main/mcp'
 import { createRetriever, searchMemory, type RetrievalDeps, type Retriever, type SmallLlm } from '../../src/main/retrieval'
 import { RUNNER_SESSION_MAX_TOOL_CALLS, RUNNER_TASK_HEADER } from '../../src/main/config'
 import type { ActionExecutor, KernelAction } from '../../src/main/kernel'
@@ -146,17 +146,22 @@ describe('auth (§12 bearer token)', () => {
 })
 
 describe('the §12 tool surface', () => {
-  it('lists exactly the seven v1 tools, no others', async () => {
+  it('advertises exactly the composed tool registry — the §4 read surface included, get_runner_status still deferred', async () => {
     const tools = await client.listTools()
-    expect(tools.tools.map((t) => t.name).sort()).toEqual([
-      'get_context',
-      'get_skill',
-      'ingest_codebase',
-      'ingest_document',
-      'list_skills',
-      'propose_correction',
-      'search_memory'
-    ])
+    const names = tools.tools.map((t) => t.name)
+    // The SDK round-trip advertises exactly the composed registry (read+write+control).
+    expect(names.slice().sort()).toEqual(MCP_TOOLS.map((t) => t.name).sort())
+    expect(new Set(names).size).toBe(names.length) // no duplicate names
+    // The phase-05 v1 seven are still there…
+    for (const name of ['get_context', 'search_memory', 'list_skills', 'get_skill', 'propose_correction', 'ingest_document', 'ingest_codebase']) {
+      expect(names).toContain(name)
+    }
+    // …the phase-15 §4 read tools are now live…
+    for (const name of ['list_sessions', 'read_session', 'get_pending_work', 'get_usage', 'list_tasks', 'get_app_status', 'get_settings_summary']) {
+      expect(names).toContain(name)
+    }
+    // …but get_runner_status is tiered in READ_TOOLS yet handler-deferred to phase-17.
+    expect(names).not.toContain('get_runner_status')
   })
 
   it('get_context returns a bundle from the fixture graph (DoD)', async () => {
@@ -251,10 +256,11 @@ describe('the §12 tool surface', () => {
     expect(undeclared.isError).toBe(true)
     expect(undeclared.body.error.code).toBe('PERMISSION_DENIED')
     expect(undeclared.body.error.message).toContain('delete_everything')
-    // A DECLARED name whose handler has not landed yet (the planned READ surface)
-    // passes the scope check and reaches the dispatcher's own NOT_FOUND — the
-    // clean-structured-error path stays exercised.
-    const unimplemented = await call(client, 'list_sessions', {})
+    // A DECLARED name whose handler has not landed yet (get_runner_status —
+    // tiered in READ_TOOLS, deferred to phase-17) passes the scope check and
+    // reaches the dispatcher's own NOT_FOUND — the clean-structured-error path
+    // stays exercised.
+    const unimplemented = await call(client, 'get_runner_status', {})
     expect(unimplemented.isError).toBe(true)
     expect(unimplemented.body.error.code).toBe('NOT_FOUND')
     expect(unimplemented.body.error.message).toContain('get_context')
@@ -469,15 +475,9 @@ describe('the MCP client manager consumes this server (§12 client side)', () =>
         bearerTokenSecret: 'mcp.bearerToken'
       })
       const tools = await manager.listTools('agentic-os-self')
-      expect(tools.map((t) => t.name).sort()).toEqual([
-        'get_context',
-        'get_skill',
-        'ingest_codebase',
-        'ingest_document',
-        'list_skills',
-        'propose_correction',
-        'search_memory'
-      ])
+      expect(tools.map((t) => t.name).sort()).toEqual(MCP_TOOLS.map((t) => t.name).sort())
+      expect(tools.some((t) => t.name === 'get_context')).toBe(true)
+      expect(tools.some((t) => t.name === 'list_sessions')).toBe(true)
       expect(tools.every((t) => typeof t.inputSchema === 'object')).toBe(true)
     } finally {
       rmSync(dir, { recursive: true, force: true })
