@@ -45,7 +45,15 @@ vi.mock('electron', () => ({
 }))
 
 import { registerIpcHandlers, type IpcDeps } from '../../src/main/ipc'
-import { loadModelSettings, settingsPath, type Keychain } from '../../src/main/models'
+import {
+  ProviderRouter,
+  loadModelSettings,
+  settingsPath,
+  type Keychain,
+  type OllamaLike,
+  type ProviderCloudTier,
+  type SubscriptionComplete
+} from '../../src/main/models'
 import { IPC_INVOKE_PREFIX } from '../../src/shared/ipc'
 import type {
   IpcChannel,
@@ -53,6 +61,7 @@ import type {
   IpcRequest,
   IpcResponse,
   IpcResult,
+  ModelSettingsPatchDto,
   SettingsDto
 } from '../../src/shared/ipc'
 
@@ -202,5 +211,98 @@ describe('ipc settings mutators (phase-16b)', () => {
     const dto: SettingsDto = dataOf(await invoke('settings.get'))
     expect(dto.reasoning).toBeUndefined()
     expect(dto.runner).toBeUndefined()
+  })
+})
+
+// ── phase-22: enabling the runner engages reasoning.backend ───────────────────
+//
+// SettingsPanel.tsx's saveRunner sends an enable/disable as ONE atomic
+// settings.save that pairs runner.enabled with the GLOBAL reasoning backend
+// (subscription-claude on enable, local-qwen3 on disable). Rationale: the
+// subscription tier is only ROUTED to when reasoning.backend ===
+// 'subscription-claude', so flipping runner.enabled alone leaves it "available
+// but unused"; and a stale 'subscription-claude' with the runner OFF would fall
+// through to the paid cloud-api tier for the subscribable roles (§11.4), so the
+// disable reverts unconditionally. These pin the main-side contract the renderer
+// coupling depends on: the merge persists BOTH fields, and the persisted backend
+// actually reroutes the subscribable roles.
+
+/** RUNNER_DEFAULTS mirrored from SettingsPanel.tsx (the keyless opt-in shape). */
+const RUNNER_DEFAULTS = {
+  enabled: false,
+  model: 'sonnet',
+  stageAll: true,
+  mode: 'completion',
+  injectionPolicy: 'downgrade'
+} as const
+
+/** Exactly the ModelSettingsPatchDto saveRunner builds for an enable/disable. */
+function runnerTogglePatch(enabled: boolean): ModelSettingsPatchDto {
+  return {
+    runner: { ...RUNNER_DEFAULTS, enabled },
+    reasoning: { backend: enabled ? 'subscription-claude' : 'local-qwen3' }
+  }
+}
+
+describe('ipc settings — runner enable couples reasoning.backend (phase-22)', () => {
+  it('the enable patch round-trips runner.enabled + reasoning.backend to disk and the DTO, firing onSettingsChanged once', async () => {
+    const dto = dataOf(await invoke('settings.save', runnerTogglePatch(true)))
+    const onDisk = loadModelSettings(settingsPath(dir))
+    expect(onDisk.runner?.enabled).toBe(true)
+    expect(onDisk.reasoning?.backend).toBe('subscription-claude')
+    expect(dto.runner?.enabled).toBe(true)
+    expect(dto.reasoning?.backend).toBe('subscription-claude')
+    expect(onSettingsChanged).toHaveBeenCalledTimes(1)
+  })
+
+  it('a backend-only toggle preserves hand-edited reasoning.overrides/models and flips the backend both ways', async () => {
+    // The renderer only ever sends reasoning:{backend}; these escape hatches are
+    // hand-edited into settings.json and must survive the backend-only merge.
+    const overrides = { 'extraction.verify': 'cloud-api' } as const
+    const models = { 'skills.rewrite': 'claude-sonnet-4-5' } as const
+    await invoke('settings.save', { reasoning: { backend: 'local-qwen3', overrides, models } })
+
+    await invoke('settings.save', runnerTogglePatch(true))
+    const enabled = loadModelSettings(settingsPath(dir))
+    expect(enabled.reasoning).toEqual({ backend: 'subscription-claude', overrides, models })
+    expect(enabled.runner?.enabled).toBe(true)
+
+    await invoke('settings.save', runnerTogglePatch(false))
+    const disabled = loadModelSettings(settingsPath(dir))
+    expect(disabled.reasoning).toEqual({ backend: 'local-qwen3', overrides, models })
+    expect(disabled.runner?.enabled).toBe(false)
+  })
+
+  it('the persisted backend actually routes: enable → subscribable roles hit subscription; disable → today (cloud-api with a key, local keyless); grader stays local', async () => {
+    const ollama: OllamaLike = { generate: async () => ({ text: '' }) }
+    const subscriptionComplete: SubscriptionComplete = async () => ({ text: '' })
+    // resolve() only reads backend+model — it never dereferences the tier, so a
+    // structural stand-in is enough to observe the cloud-api resolution.
+    let cloudKey: ProviderCloudTier | null = { brain: {}, meter: {} } as unknown as ProviderCloudTier
+    const router = new ProviderRouter({
+      loadSnapshot: () => loadModelSettings(settingsPath(dir)),
+      ollama,
+      makeCloud: () => cloudKey,
+      subscriptionComplete,
+      runnerHealthy: () => true
+    })
+
+    // Enabled: the two subscribable extraction roles ride the subscription; the
+    // HARD-local grader never follows the global toggle. (Lazy snapshot loads the
+    // just-saved enabled state on the first resolve.)
+    await invoke('settings.save', runnerTogglePatch(true))
+    expect(router.resolve('extraction.fuzzy').backend).toBe('subscription-claude')
+    expect(router.resolve('extraction.verify').backend).toBe('subscription-claude')
+    expect(router.resolve('skills.grader').backend).toBe('local-qwen3')
+
+    // Disabled: revert to today. extraction.fuzzy is local-today; extraction.verify
+    // is cloud-today → cloud-api when a key exists, else falls through to local.
+    await invoke('settings.save', runnerTogglePatch(false))
+    router.invalidate()
+    expect(router.resolve('extraction.fuzzy').backend).toBe('local-qwen3')
+    expect(router.resolve('extraction.verify').backend).toBe('cloud-api')
+    cloudKey = null // makeCloud is live (only the settings snapshot is cached).
+    expect(router.resolve('extraction.verify').backend).toBe('local-qwen3')
+    expect(router.resolve('skills.grader').backend).toBe('local-qwen3')
   })
 })

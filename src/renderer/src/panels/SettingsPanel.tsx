@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from 'react'
 import type {
   InstallHookResultDto,
   IpcCloudProvider,
+  ModelSettingsPatchDto,
   OllamaPullProgressDto,
   RunnerSettingsDto,
   RunnerTestConnectionDto,
@@ -193,11 +194,34 @@ export default function SettingsPanel(): React.JSX.Element {
   const saveRunner = async (patch: Partial<RunnerSettingsDto>): Promise<void> => {
     if (dto === null) return
     const next: RunnerSettingsDto = { ...(dto.runner ?? RUNNER_DEFAULTS), ...patch }
+    // An enable/disable must move the GLOBAL reasoning backend in the SAME atomic
+    // save (phase-22): the subscription tier is only routed to when
+    // reasoning.backend === 'subscription-claude', so flipping runner.enabled
+    // alone leaves it "available but unused". Disable reverts to 'local-qwen3'
+    // UNCONDITIONALLY — a stale 'subscription-claude' with the runner off would
+    // fall through to the paid cloud-api tier for the subscribable roles (§11.4).
+    // The main-side merge preserves any hand-edited reasoning.overrides/models.
+    // A model-only save leaves reasoning untouched (patch.enabled === undefined).
+    const save: ModelSettingsPatchDto =
+      patch.enabled === undefined
+        ? { runner: next }
+        : { runner: next, reasoning: { backend: patch.enabled ? 'subscription-claude' : 'local-qwen3' } }
     setRunnerBusy(true)
     try {
-      const fresh = await call('settings.save', { runner: next })
+      const fresh = await call('settings.save', save)
       applyDto(fresh)
-      toast.notify('ok', 'saved')
+      if (patch.enabled === undefined) {
+        toast.notify('ok', 'saved')
+      } else {
+        // Refresh the health cache so the routing status line reflects the new tier.
+        runnerStatus.reload()
+        toast.notify(
+          'ok',
+          patch.enabled
+            ? 'runner enabled — background reasoning uses your subscription'
+            : 'runner disabled — background reasoning back to local + cloud defaults'
+        )
+      }
     } catch (err) {
       toast.notify('err', errMessage(err))
     } finally {
@@ -327,6 +351,22 @@ export default function SettingsPanel(): React.JSX.Element {
       ? RUNNER_MODEL_OPTIONS
       : [runnerCfg.model, ...RUNNER_MODEL_OPTIONS]
   ).map((m) => ({ value: m, label: m }))
+
+  // Routing status line (phase-22): the tier background reasoning actually uses
+  // right now. "Configured for subscription" is read back from the PERSISTED
+  // reasoning.backend + runner.enabled (never optimistic local state); the
+  // fallback wording mirrors the App.tsx runner chip's effectiveBackend handling.
+  const runnerLive = runnerStatus.data
+  const subscriptionConfigured = runnerCfg.enabled && dto.reasoning?.backend === 'subscription-claude'
+  const runnerRoutingLine = !subscriptionConfigured
+    ? 'background reasoning: local + cloud api defaults'
+    : runnerLive !== null && runnerLive.fallbackActive
+      ? runnerLive.effectiveBackend === 'cloud-api'
+        ? 'background reasoning: subscription — currently falling back to your cloud api tier'
+        : runnerLive.effectiveBackend === 'local-qwen3'
+          ? 'background reasoning: subscription — currently falling back to the local model'
+          : 'background reasoning: subscription — currently falling back to the fallback tier'
+      : 'background reasoning: subscription'
 
   return (
     <>
@@ -487,6 +527,11 @@ export default function SettingsPanel(): React.JSX.Element {
               local, so ollama remains required.
             </div>
 
+            {/* Routing status: which tier background reasoning lands on right now (phase-22). */}
+            <div className="text-[12px] text-ink-mute" role="status" data-testid="settings-runner-routing">
+              {runnerRoutingLine}
+            </div>
+
             {runnerStatus.data !== null && (
               <div className="flex flex-col gap-1.5 border-t border-line pt-3" data-testid="runner-status">
                 <div className="flex flex-wrap items-center gap-2.5">
@@ -642,6 +687,10 @@ export default function SettingsPanel(): React.JSX.Element {
               With the subscription runner enabled, the text being reasoned about — session transcripts, skill
               feedback, and (if you opt those roles in) retrieved memory snippets — is sent to Anthropic under your
               Claude account, the same vendor your Claude Code sessions already go to.
+            </p>
+            <p>
+              While the runner is unavailable, background reasoning falls back to your cloud api key (if set) or the
+              local model; turning the runner off restores those defaults.
             </p>
             <p className="text-ink-mute">
               Your memory graph, embeddings, and search index never leave your machine.
