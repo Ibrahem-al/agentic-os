@@ -61,6 +61,10 @@ export const statusColor: Readonly<Record<string, keyof typeof color>> = {
   ready: 'ok',
   'models-missing': 'warn',
   'daemon-not-running': 'err',
+  // runner health (phase 17) — 'unknown' stays unmapped (neutral)
+  'not-installed': 'warn',
+  'auth-expired': 'err',
+  'quota-exhausted': 'warn',
   // skill versions
   active: 'ok',
   candidate: 'warn',

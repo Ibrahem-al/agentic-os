@@ -21,7 +21,7 @@ import type { ProjectSummarizer, WatchedFolderStore } from '../../ingest'
 import type { AuditLog, InjectionScanner } from '../../security'
 import type { WorkflowRunner } from '../../kernel'
 import type { Keychain, OllamaClient, ProviderRouter } from '../../models'
-import type { ApprovalLister, TriggerStatusDeps } from '../../reads'
+import type { ApprovalLister, RunnerStatusSource, TriggerStatusDeps } from '../../reads'
 import type { AppStatusDto } from '../../../shared/ipc'
 
 export type ToolErrorCode =
@@ -58,6 +58,12 @@ export interface McpReadContext {
   readonly permissions?: ApprovalLister
   /** Workflow-job lookup for get_task's include_workflow (`<taskId>-wf`). */
   readonly runner?: Pick<WorkflowRunner, 'getJob'>
+  /**
+   * The phase-17 subscription-runner health source for get_runner_status
+   * (distinct from `runner` above — that is the workflow runner). Absent = the
+   * runner did not boot ⇒ get_runner_status reports the disabled/unknown shape.
+   */
+  readonly runnerStatus?: RunnerStatusSource
   /** Phase-11 trigger runtime for get_triggers_status (null = not armed this launch). */
   readonly triggers?: TriggerStatusDeps | null
   /** Watched-folder store for list_watched_folders. */

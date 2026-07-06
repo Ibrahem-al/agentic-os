@@ -97,6 +97,7 @@ import {
 } from './triggers'
 import {
   getNode,
+  getRunnerStatus,
   getSettingsSummary,
   getSkillDetail,
   getSpendSummary,
@@ -108,6 +109,7 @@ import {
   listTraces,
   memoryCounts
 } from './reads'
+import type { Runner, TestConnectionResult } from './runner'
 
 /** The phase-11 trigger runtime the status/installer channels read. */
 export interface IpcTriggerDeps {
@@ -140,6 +142,14 @@ export interface IpcDeps {
    * only the live re-route is skipped).
    */
   readonly onSettingsChanged?: () => void
+  /**
+   * Phase-17 subscription runner — backs `runner.status` (health snapshot +
+   * latest runner_runs row) and `runner.testConnection` (the manual 1-turn
+   * canary, §3.7). Optional: null/absent when the runner did not boot (storage
+   * down) or in test rigs; `runner.status` then reports the disabled/unknown
+   * shape and `runner.testConnection` surfaces UNAVAILABLE.
+   */
+  readonly runner?: Pick<Runner, 'healthSnapshot' | 'testConnection'> | null
 }
 
 /** The name decisions are recorded under (§13 decided_by / decidedBy). */
@@ -183,6 +193,18 @@ const jsonify = (value: unknown): JsonValue => {
 const jsonObject = (value: unknown): JsonObject => {
   const result = jsonify(value)
   return typeof result === 'object' && result !== null && !Array.isArray(result) ? result : {}
+}
+
+/** Compose the runner test-connection canary result into one operator line (§3.7). */
+const testConnectionMessage = (r: TestConnectionResult): string => {
+  if (r.ok) {
+    const version = r.version !== null ? ` (claude ${r.version})` : ''
+    const sample = r.sample !== undefined && r.sample !== '' ? ` — replied: ${r.sample}` : ''
+    return `Connected${version}${sample}`
+  }
+  const detail = r.error ?? `runner ${r.state}`
+  // The one actionable line for the common expired-login case (§3.7 banner copy).
+  return r.state === 'auth-expired' ? `${detail} — run \`claude /login\` in any terminal, then Retry` : detail
 }
 
 // ── registration ──────────────────────────────────────────────────────────────
@@ -776,5 +798,21 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       send({ model, status: 'error', done: true, error: message })
       throw err
     }
+  })
+
+  // ── runner (phase 17) ────────────────────────────────────────────────────────
+
+  // Enable/model live in settings.json (saved via settings.save); this is the
+  // read-only health + latest-run view for the settings panel + banner. Always
+  // answerable — an absent runner reports the disabled/unknown shape (off is the
+  // default, not a fault).
+  register('runner.status', () => getRunnerStatus({ runner: deps.runner ?? null, db: need.db() }))
+
+  // The manual 1-turn canary — the closest thing to an auth probe (§3.7). Only
+  // ever user-triggered from the settings panel, NEVER scheduled.
+  register('runner.testConnection', async () => {
+    const runner = deps.runner ?? raiseUnavailable('the subscription runner')
+    const result = await runner.testConnection()
+    return { ok: result.ok, message: testConnectionMessage(result) }
   })
 }

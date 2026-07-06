@@ -427,6 +427,55 @@ export interface OllamaPullProgressDto {
   readonly error?: string
 }
 
+// ── runner (headless subscription reasoner, phase 17) ─────────────────────────
+
+/** Renderer-safe mirror of the runner health-cache state (§9.7). */
+export type RunnerHealthStateDto = 'ok' | 'not-installed' | 'auth-expired' | 'quota-exhausted' | 'unknown'
+
+/** One runner_runs row projected for get_runner_status / the dashboard (§3.7). */
+export interface RunnerRunSummaryDto {
+  readonly id: string
+  readonly taskId: string
+  readonly mode: string
+  readonly model: string | null
+  readonly startedAt: string
+  readonly durationMs: number | null
+  readonly numTurns: number | null
+  readonly inputTokens: number | null
+  readonly outputTokens: number | null
+  /** Observability-only price estimate — subscription runs create NO spend rows. */
+  readonly shadowCostUsdEstimate: number | null
+  readonly isError: boolean | null
+  readonly exitCode: number | null
+}
+
+/**
+ * get_runner_status / runner.status: the runner health cache + latest run (§4.F).
+ * OFF by default — a keyless install reports `enabled:false`, `state:'unknown'`,
+ * and never spawns claude.
+ */
+export interface RunnerStatusDto {
+  readonly enabled: boolean
+  /** Resolved absolute claude path (P1.9/§10.12); null when unresolved/off. */
+  readonly binaryPath: string | null
+  readonly version: string | null
+  readonly versionOk: boolean
+  readonly state: RunnerHealthStateDto
+  /** ISO-8601; last time a real run/canary authenticated OK (null = never). */
+  readonly lastAuthOkAt: string | null
+  /** Last classified failure detail (auth/quota/not-installed) — the banner line. */
+  readonly lastError: string | null
+  readonly lastRun: RunnerRunSummaryDto | null
+  /** Agent-mode tombstoned sessions (§3.6/§10.2); 0 in completion mode. */
+  readonly tombstonedSessions: number
+}
+
+/** runner.testConnection: the manual 1-turn canary outcome (§3.7 — never scheduled). */
+export interface RunnerTestConnectionDto {
+  readonly ok: boolean
+  readonly message: string
+}
+
 // ── triggers & automation (phase 11) ─────────────────────────────────────────
 
 export interface ScheduleStatusDto {
@@ -546,6 +595,11 @@ export interface IpcChannels {
   'settings.revealMcpToken': { req: void; res: { token: string } }
   'settings.ollamaStatus': { req: void; res: OllamaStatusDto }
   'settings.ollamaPull': { req: { model: string; runId: string }; res: null }
+
+  /** Phase-17 headless subscription runner. Enable/model are saved via settings.save. */
+  'runner.status': { req: void; res: RunnerStatusDto }
+  /** Manual 1-turn canary — user-triggered only, NEVER scheduled (§3.7). */
+  'runner.testConnection': { req: void; res: RunnerTestConnectionDto }
 }
 
 export type IpcChannel = keyof IpcChannels

@@ -3,9 +3,10 @@
  * panel host on the right. Panel switching is local state — this is a
  * single-window cockpit, not a routed site.
  */
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import type { RunnerStatusDto } from '../../shared/ipc'
 import { call, useIpc } from './lib/ipc'
-import { ToastProvider } from './ui/kit'
+import { Badge, Button, ToastProvider } from './ui/kit'
 import MemoryPanel from './panels/MemoryPanel'
 import ReviewPanel from './panels/ReviewPanel'
 import AuditPanel from './panels/AuditPanel'
@@ -68,6 +69,77 @@ const fetchDriftCount = async (): Promise<number> => {
   return summary.flagged
 }
 
+/**
+ * Poll the runner health snapshot (phase 17) every 20s; failures keep the last
+ * value (the settings panel reports detail). OFF by default → enabled:false →
+ * the banner never shows and a keyless install is unchanged.
+ */
+function useRunnerStatus(): { status: RunnerStatusDto | null; refresh: () => void } {
+  const [status, setStatus] = useState<RunnerStatusDto | null>(null)
+  const [generation, setGeneration] = useState(0)
+  useEffect(() => {
+    let cancelled = false
+    const load = async (): Promise<void> => {
+      try {
+        const next = await call('runner.status', undefined)
+        if (!cancelled) setStatus(next)
+      } catch {
+        // Runner subsystem unavailable this poll — keep the last value.
+      }
+    }
+    void load()
+    const timer = setInterval(() => void load(), 20_000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [generation])
+  const refresh = useCallback(() => setGeneration((g) => g + 1), [])
+  return { status, refresh }
+}
+
+/**
+ * Auth-expired / quota-exhausted banner (phase 17, §9.7). Shown only when the
+ * runner is enabled AND unhealthy; reasoning falls back to the cloud/local tier
+ * meanwhile, so this nudges rather than blocks. Retry runs the manual canary
+ * (the one live re-check the renderer can trigger) then re-reads the snapshot.
+ */
+function RunnerBanner({ status, onRetry }: { status: RunnerStatusDto; onRetry: () => void }): React.JSX.Element {
+  const authExpired = status.state === 'auth-expired'
+  const tint = authExpired ? 'border-err/40 bg-err/10' : 'border-warn/40 bg-warn/10'
+  return (
+    <div role="alert" data-testid="runner-banner" className={`flex items-start gap-3 border-b px-5 py-2.5 ${tint}`}>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <Badge status={status.state} />
+          <span className="text-[13px] font-medium">
+            {authExpired ? 'subscription runner sign-in expired' : 'subscription runner usage limit reached'}
+          </span>
+        </div>
+        <div className="mt-1 text-[12px] text-ink-mute">
+          {authExpired ? (
+            <>
+              run <code className="rounded bg-raised px-1 font-mono text-[11px] text-ink">claude /login</code> in any
+              terminal, then retry.
+            </>
+          ) : (
+            'the subscription hit its usage limit. it resets automatically; retry once it does.'
+          )}{' '}
+          reasoning falls back to your cloud or local tier until this clears, so nothing is blocked.
+        </div>
+        {status.lastError !== null && status.lastError !== '' && (
+          <div className="mt-1 font-mono text-[11px] break-words text-err">{status.lastError}</div>
+        )}
+      </div>
+      <div className="shrink-0">
+        <Button testId="runner-banner-retry" onClick={onRetry}>
+          retry
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 function SubsystemStatus(): React.JSX.Element {
   const status = useIpc('app.status', undefined)
   if (status.data === null) return <div className="px-4 py-3 text-[11px] text-ink-faint">…</div>
@@ -106,7 +178,26 @@ export default function App(): React.JSX.Element {
   const [active, setActive] = useState<PanelKey>('memory')
   const pending = usePolledCount(fetchPendingCount)
   const drift = usePolledCount(fetchDriftCount)
+  const { status: runnerStatus, refresh: refreshRunner } = useRunnerStatus()
   const ActivePanel = PANELS.find((p) => p.key === active)?.component ?? MemoryPanel
+
+  // Retry = one live re-check (the canary) then re-read the snapshot.
+  const retryRunner = useCallback(async (): Promise<void> => {
+    try {
+      await call('runner.testConnection', undefined)
+    } catch {
+      // The refreshed snapshot still drives the banner; nothing extra to surface.
+    } finally {
+      refreshRunner()
+    }
+  }, [refreshRunner])
+
+  const runnerBanner =
+    runnerStatus !== null &&
+    runnerStatus.enabled &&
+    (runnerStatus.state === 'auth-expired' || runnerStatus.state === 'quota-exhausted') ? (
+      <RunnerBanner status={runnerStatus} onRetry={() => void retryRunner()} />
+    ) : null
 
   return (
     <ToastProvider>
@@ -150,6 +241,7 @@ export default function App(): React.JSX.Element {
           <SubsystemStatus />
         </nav>
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+          {runnerBanner}
           <ActivePanel />
         </main>
       </div>

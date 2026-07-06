@@ -146,7 +146,7 @@ describe('auth (§12 bearer token)', () => {
 })
 
 describe('the §12 tool surface', () => {
-  it('advertises exactly the composed tool registry — the §4 read surface included, get_runner_status still deferred', async () => {
+  it('advertises exactly the composed tool registry — the §4 read surface + phase-17 get_runner_status included', async () => {
     const tools = await client.listTools()
     const names = tools.tools.map((t) => t.name)
     // The SDK round-trip advertises exactly the composed registry (read+write+control).
@@ -156,12 +156,10 @@ describe('the §12 tool surface', () => {
     for (const name of ['get_context', 'search_memory', 'list_skills', 'get_skill', 'propose_correction', 'ingest_document', 'ingest_codebase']) {
       expect(names).toContain(name)
     }
-    // …the phase-15 §4 read tools are now live…
-    for (const name of ['list_sessions', 'read_session', 'get_pending_work', 'get_usage', 'list_tasks', 'get_app_status', 'get_settings_summary']) {
+    // …the phase-15 §4 read tools + the phase-17 get_runner_status are now live.
+    for (const name of ['list_sessions', 'read_session', 'get_pending_work', 'get_usage', 'list_tasks', 'get_app_status', 'get_settings_summary', 'get_runner_status']) {
       expect(names).toContain(name)
     }
-    // …but get_runner_status is tiered in READ_TOOLS yet handler-deferred to phase-17.
-    expect(names).not.toContain('get_runner_status')
   })
 
   it('get_context returns a bundle from the fixture graph (DoD)', async () => {
@@ -256,11 +254,11 @@ describe('the §12 tool surface', () => {
     expect(undeclared.isError).toBe(true)
     expect(undeclared.body.error.code).toBe('PERMISSION_DENIED')
     expect(undeclared.body.error.message).toContain('delete_everything')
-    // A DECLARED name whose handler has not landed yet (get_runner_status —
-    // tiered in READ_TOOLS, deferred to phase-17) passes the scope check and
-    // reaches the dispatcher's own NOT_FOUND — the clean-structured-error path
-    // stays exercised.
-    const unimplemented = await call(client, 'get_runner_status', {})
+    // A DECLARED name whose handler has not landed yet (submit_extraction_items —
+    // tiered in STAGING_TOOLS, deferred to phase-19 agent mode) passes the scope
+    // check and reaches the dispatcher's own NOT_FOUND — the clean-structured-error
+    // path stays exercised. (get_runner_status moved here to a real handler at phase-17.)
+    const unimplemented = await call(client, 'submit_extraction_items', {})
     expect(unimplemented.isError).toBe(true)
     expect(unimplemented.body.error.code).toBe('NOT_FOUND')
     expect(unimplemented.body.error.message).toContain('get_context')

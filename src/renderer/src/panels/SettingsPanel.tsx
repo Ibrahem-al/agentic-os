@@ -4,7 +4,14 @@
  * Ollama model status/pulls, and the MCP connection details (§4, §14).
  */
 import { useEffect, useRef, useState } from 'react'
-import type { InstallHookResultDto, IpcCloudProvider, OllamaPullProgressDto, SettingsDto } from '../../../shared/ipc'
+import type {
+  InstallHookResultDto,
+  IpcCloudProvider,
+  OllamaPullProgressDto,
+  RunnerSettingsDto,
+  RunnerTestConnectionDto,
+  SettingsDto
+} from '../../../shared/ipc'
 import { call, IpcError, useIpc } from '../lib/ipc'
 import {
   Badge,
@@ -16,8 +23,27 @@ import {
   SectionHeader,
   Select,
   TextInput,
+  Timestamp,
+  Toggle,
   useToast
 } from '../ui/kit'
+
+/**
+ * Default runner section for a keyless install (mirrors main-side
+ * defaultRunnerSettings / config.RUNNER_MODEL_DEFAULT). The `runner` section is
+ * absent until the user opts in, so the first toggle/model change materializes
+ * it from these defaults. OFF by default → nothing ever spawns claude.
+ */
+const RUNNER_DEFAULTS: RunnerSettingsDto = {
+  enabled: false,
+  model: 'sonnet',
+  stageAll: true,
+  mode: 'completion',
+  injectionPolicy: 'downgrade'
+}
+
+/** Claude CLI model aliases offered in the runner model select. */
+const RUNNER_MODEL_OPTIONS = ['sonnet', 'opus', 'haiku'] as const
 
 function errMessage(err: unknown): string {
   return err instanceof IpcError ? err.message : String(err)
@@ -46,6 +72,12 @@ export default function SettingsPanel(): React.JSX.Element {
   const hookStatus = useIpc('triggers.status', undefined)
   const [installingHook, setInstallingHook] = useState(false)
   const [hookResult, setHookResult] = useState<InstallHookResultDto | null>(null)
+
+  // ── subscription runner (phase 17) ───────────────────────────────────────────
+  const runnerStatus = useIpc('runner.status', undefined)
+  const [runnerBusy, setRunnerBusy] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<RunnerTestConnectionDto | null>(null)
 
   const installHook = async (): Promise<void> => {
     setInstallingHook(true)
@@ -118,6 +150,43 @@ export default function SettingsPanel(): React.JSX.Element {
       toast.notify('err', errMessage(err))
     } finally {
       setSavingSmallLlm(false)
+    }
+  }
+
+  /**
+   * Persist a runner-section change. The main-side settings.save merges onto the
+   * current runner, but the patch type requires the full DTO, so send the
+   * current section (or the keyless defaults) with the one changed field.
+   */
+  const saveRunner = async (patch: Partial<RunnerSettingsDto>): Promise<void> => {
+    if (dto === null) return
+    const next: RunnerSettingsDto = { ...(dto.runner ?? RUNNER_DEFAULTS), ...patch }
+    setRunnerBusy(true)
+    try {
+      const fresh = await call('settings.save', { runner: next })
+      applyDto(fresh)
+      toast.notify('ok', 'saved')
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setRunnerBusy(false)
+    }
+  }
+
+  /** Manual 1-turn canary (§3.7 — never scheduled); refresh the status after. */
+  const testRunnerConnection = async (): Promise<void> => {
+    setTesting(true)
+    setTestResult(null)
+    try {
+      const result = await call('runner.testConnection', undefined)
+      setTestResult(result)
+      toast.notify(result.ok ? 'ok' : 'err', result.message)
+    } catch (err) {
+      setTestResult({ ok: false, message: errMessage(err) })
+      toast.notify('err', errMessage(err))
+    } finally {
+      setTesting(false)
+      runnerStatus.reload()
     }
   }
 
@@ -198,6 +267,14 @@ export default function SettingsPanel(): React.JSX.Element {
       </>
     )
   }
+
+  const runnerCfg = dto.runner ?? RUNNER_DEFAULTS
+  // Keep the current model selectable even if it is a custom id not in the presets.
+  const runnerModelOptions = (
+    (RUNNER_MODEL_OPTIONS as readonly string[]).includes(runnerCfg.model)
+      ? RUNNER_MODEL_OPTIONS
+      : [runnerCfg.model, ...RUNNER_MODEL_OPTIONS]
+  ).map((m) => ({ value: m, label: m }))
 
   return (
     <>
@@ -322,6 +399,88 @@ export default function SettingsPanel(): React.JSX.Element {
               <Button variant="primary" size="default" disabled={savingSmallLlm} onClick={() => void saveSmallLlm()}>
                 save
               </Button>
+            </div>
+          </div>
+        </section>
+
+        {/* ── subscription runner (phase 17) ───────────────────────────────── */}
+        <section className="max-w-3xl border-t border-line pt-5">
+          <SectionHeader meta="reason with a claude subscription via the local claude cli, off by default">
+            subscription runner
+          </SectionHeader>
+          <div className="flex flex-col gap-3">
+            <div className="flex items-center gap-3">
+              <Toggle
+                label="enable subscription runner"
+                testId="settings-runner-enable"
+                checked={runnerCfg.enabled}
+                disabled={runnerBusy}
+                onChange={(next) => void saveRunner({ enabled: next })}
+              />
+              <span className="text-[13px]">{runnerCfg.enabled ? 'enabled' : 'disabled'}</span>
+              <div className="ml-auto">
+                <Select
+                  ariaLabel="runner model"
+                  testId="settings-runner-model"
+                  value={runnerCfg.model}
+                  onChange={(value) => void saveRunner({ model: value })}
+                  options={runnerModelOptions}
+                />
+              </div>
+            </div>
+
+            {/* Honest scope line (phase-doc required copy). */}
+            <div className="text-[12px] text-ink-mute">
+              the subscription replaces the reasoning llm, not the model stack. embeddings and reranking stay
+              local, so ollama remains required.
+            </div>
+
+            {runnerStatus.data !== null && (
+              <div className="flex flex-col gap-1.5 border-t border-line pt-3" data-testid="runner-status">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <Badge status={runnerStatus.data.state} />
+                  {runnerStatus.data.version !== null && (
+                    <span className="font-mono text-[11px] text-ink-mute">
+                      cli {runnerStatus.data.version}
+                      {runnerStatus.data.versionOk ? '' : ' (unsupported)'}
+                    </span>
+                  )}
+                  {runnerStatus.data.lastRun !== null && (
+                    <span className="flex items-center gap-1.5 font-mono text-[11px] text-ink-faint">
+                      last run
+                      <Timestamp iso={runnerStatus.data.lastRun.startedAt} />
+                      {runnerStatus.data.lastRun.durationMs !== null
+                        ? `· ${runnerStatus.data.lastRun.durationMs}ms`
+                        : ''}
+                    </span>
+                  )}
+                </div>
+                <div className="font-mono text-[11px] break-all text-ink-faint">
+                  {runnerStatus.data.binaryPath ?? 'claude cli not found on PATH'}
+                </div>
+                {runnerStatus.data.lastError !== null && runnerStatus.data.lastError !== '' && (
+                  <div className="font-mono text-[11px] break-words text-err">{runnerStatus.data.lastError}</div>
+                )}
+              </div>
+            )}
+
+            <div className="flex items-center gap-2.5">
+              <Button testId="settings-runner-test" disabled={testing} onClick={() => void testRunnerConnection()}>
+                {testing ? 'testing…' : 'test connection'}
+              </Button>
+              {testResult !== null && (
+                <span
+                  role="status"
+                  data-testid="runner-test-result"
+                  className={`text-[12px] ${testResult.ok ? 'text-ok' : 'text-err'}`}
+                >
+                  {testResult.message}
+                </span>
+              )}
+            </div>
+            <div className="text-[11px] text-ink-faint">
+              test connection runs one manual 1-turn canary against the claude cli. it is never scheduled. the full
+              consent dialog, quota history, and run log arrive next.
             </div>
           </div>
         </section>

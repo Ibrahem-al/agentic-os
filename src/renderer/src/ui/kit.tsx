@@ -193,6 +193,49 @@ export function Select({
   )
 }
 
+/**
+ * Boolean switch (role="switch"). Renders no text of its own — pass an
+ * accessible `label`. Accent track + light knob when on, hairline track when
+ * off; MOTION 2 feedback transition only. Focus ring comes from the global
+ * :focus-visible rule, matching Button/Select.
+ */
+export function Toggle({
+  checked,
+  onChange,
+  label,
+  disabled,
+  testId
+}: {
+  checked: boolean
+  onChange: (checked: boolean) => void
+  label: string
+  disabled?: boolean
+  testId?: string
+}): React.JSX.Element {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      {...(testId !== undefined ? { 'data-testid': testId } : {})}
+      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors duration-120
+        cursor-pointer select-none disabled:cursor-not-allowed disabled:opacity-45 ${
+          checked ? 'border-accent bg-accent' : 'border-line-strong bg-raised'
+        }`}
+    >
+      <span
+        aria-hidden="true"
+        className={`inline-block size-3.5 rounded-full transition-transform duration-120 ${
+          checked ? 'translate-x-[18px] bg-accent-ink' : 'translate-x-[3px] bg-ink-mute'
+        }`}
+      />
+    </button>
+  )
+}
+
 // ── layout ────────────────────────────────────────────────────────────────────
 
 /** Panel header row: title left, actions right (VARIANCE 4: left-aligned). */

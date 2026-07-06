@@ -80,3 +80,5 @@ export {
   type AppStatusDeps,
   type SettingsSummaryDeps
 } from './status'
+
+export { getRunnerStatus, type RunnerStatusDeps, type RunnerStatusSource } from './runner'

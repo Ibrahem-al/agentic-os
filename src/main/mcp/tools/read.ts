@@ -9,8 +9,8 @@
  * owning read function through `ctx`, and returns the plain DTO. The reads
  * module raises domain errors (IngestError/StagedWriteError); `raiseMapped`
  * re-throws them as the matching clean ToolError so §15 error semantics hold.
- * `get_runner_status` is deliberately absent — it lands in phase-17 with the
- * runner health cache (its name is already tiered in READ_TOOLS).
+ * `get_runner_status` (phase-17) reads the runner health cache + latest run; it
+ * never spawns claude and reports the disabled/unknown shape on a default install.
  */
 import * as z from 'zod'
 import { RETRIEVAL_RECENT_EXAMPLES, RUNNER_LIVE_SESSION_MAX_CALLS, SEARCH_MEMORY_MAX_K } from '../../config'
@@ -41,7 +41,8 @@ import {
   listTraces,
   listWatchedFolders,
   memoryCounts,
-  readSession
+  readSession,
+  getRunnerStatus
 } from '../../reads'
 import { ToolError, parse, jsonSchema, type McpToolDef, type ToolContext, type ToolErrorCode } from './shared'
 
@@ -439,6 +440,14 @@ async function getSettingsSummaryTool(args: unknown, ctx: ToolContext): Promise<
   return getSettingsSummary({ userDataDir: appStatus.userDataDir, keychain: ctx.keychain ?? null })
 }
 
+async function getRunnerStatusTool(args: unknown, ctx: ToolContext): Promise<unknown> {
+  parse(NO_INPUT, args, 'get_runner_status')
+  // Read-only + always answerable: an absent runner (didn't boot / off) yields
+  // the disabled/unknown shape rather than an error — the runner being off is
+  // the normal default, not a fault.
+  return getRunnerStatus({ runner: ctx.runnerStatus ?? null, db: ctx.db })
+}
+
 export const READ_TOOL_DEFS: readonly McpToolDef[] = [
   {
     name: 'get_context',
@@ -606,5 +615,12 @@ export const READ_TOOL_DEFS: readonly McpToolDef[] = [
       'Sanitized model settings: cloud provider, model names, and API-key PRESENCE booleans only — key material never crosses this boundary.',
     inputSchema: jsonSchema(NO_INPUT),
     handle: getSettingsSummaryTool
+  },
+  {
+    name: 'get_runner_status',
+    description:
+      'Headless subscription-runner status: enabled flag, resolved claude binary path + version, health state (ok / not-installed / auth-expired / quota-exhausted / unknown), last auth-ok time, the latest runner run, and the agent-mode tombstone count. OFF by default — a default install reports enabled:false and never spawns claude.',
+    inputSchema: jsonSchema(NO_INPUT),
+    handle: getRunnerStatusTool
   }
 ]

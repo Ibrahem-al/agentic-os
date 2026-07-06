@@ -44,6 +44,7 @@ import {
   type InjectionScanner
 } from './security'
 import { createRetriever } from './retrieval'
+import { Runner } from './runner'
 import { AgenticOsMcpServer, claudeMcpAddCommand, McpClientManager, writeSampleMcpJson } from './mcp'
 import {
   createExtractionAgent,
@@ -104,6 +105,15 @@ let securityInstances: { permissions: PermissionEngine; audit: AuditLog; scanner
  * role resolves to its today tier: DEFAULT == TODAY.
  */
 let providerRouter: ProviderRouter | null = null
+/**
+ * The headless subscription runner (phase 17). Built in bootKernel over the ONE
+ * CallBudget; its `complete`/`isHealthy` are injected into the ProviderRouter so
+ * subscribable roles can route to a Claude subscription when the user opts in.
+ * SHIPS OFF: with `runner.enabled=false` (the default) `isHealthy()` is false, so
+ * the subscription backend stays unavailable and nothing here ever spawns claude.
+ * killChildren() runs FIRST in will-quit; sweepZombies() runs at boot.
+ */
+let subscriptionRunner: Runner | null = null
 /** Model-layer singletons (phase 02) — shared by the MCP server (phase 05). */
 let keychain: Keychain | null = null
 let ollama: OllamaClient | null = null
@@ -148,6 +158,35 @@ function rerankerFilesOverride(): { files: NonNullable<ConstructorParameters<typ
     console.warn(`[models] AGENTIC_OS_RERANKER_FILES unreadable (${String(err)}) — using pinned defaults`)
     return {}
   }
+}
+
+/**
+ * §10.5/P0.3 boot hygiene: delete any per-task `<userData>/runner/*.mcp.json`
+ * left by a previous run. Agent mode (phase-19) writes these fresh per spawn and
+ * removes them after; a crash can strand one referencing a now-rotated runner
+ * token. Completion mode writes none, so this is a no-op on a default install
+ * (the directory usually does not exist).
+ */
+function sweepStaleRunnerMcpConfigs(userDataDir: string): void {
+  const { readdirSync, rmSync } = require('node:fs') as typeof import('node:fs')
+  const dir = join(userDataDir, 'runner')
+  let entries: string[]
+  try {
+    entries = readdirSync(dir)
+  } catch {
+    return // no runner dir yet — nothing to sweep
+  }
+  let swept = 0
+  for (const name of entries) {
+    if (!name.endsWith('.mcp.json')) continue
+    try {
+      rmSync(join(dir, name), { force: true })
+      swept += 1
+    } catch {
+      /* best effort — never fail boot over a leftover config */
+    }
+  }
+  if (swept > 0) console.log(`[runner] swept ${swept} stale runner/*.mcp.json from a previous run`)
 }
 
 /** Native-module pipeline sanity: versions logged from Electron main. */
@@ -262,11 +301,28 @@ function bootKernel(): void {
   // and shared via the module local. `loadSnapshot`/`makeCloud` re-read the
   // settings file + the keychain LIVE per call, so a provider/model/key change
   // takes effect on the NEXT call once an IPC mutator fires router.invalidate()
-  // (P1.1 — no app restart). subscriptionComplete + runnerHealthy are left UNSET
-  // (phase-17) ⇒ subscription unavailable ⇒ every role falls through to its
-  // today tier ⇒ DEFAULT == TODAY.
+  // (P1.1 — no app restart). Phase-17 now injects subscriptionComplete +
+  // runnerHealthy from the runner below; DEFAULT == TODAY still holds because
+  // runner.enabled=false (the default) ⇒ isHealthy() false ⇒ subscription
+  // unavailable ⇒ every role falls through to its today tier.
   const ollamaClient = ollama ?? new OllamaClient()
   const appDataForRouter = appData
+  // Phase-17: ONE CallBudget over runner_runs (P0.2 — durable across resume),
+  // shared by the runner's completion path AND the router's subscription guard.
+  const callBudget = new CallBudget({ db: appDataForRouter.db })
+  // Build the ONE headless runner (completion mode) over that budget, then inject
+  // its completion fn + live health into the router — the two seams phase-16 left
+  // UNSET. With runner.enabled=false (the default) isHealthy() is false, so the
+  // subscription backend stays unavailable and every role resolves to its today
+  // tier: DEFAULT == TODAY (a keyless install is byte-for-byte local and NEVER
+  // spawns claude).
+  const runnerInstance = new Runner({
+    db: appDataForRouter.db,
+    loadSettings: () => loadModelSettings(settingsPath(userDataDir)),
+    telemetry,
+    callBudget
+  })
+  subscriptionRunner = runnerInstance
   const router = new ProviderRouter({
     loadSnapshot: () => loadModelSettings(settingsPath(userDataDir)),
     ollama: ollamaClient,
@@ -286,10 +342,29 @@ function bootKernel(): void {
           }
         : null
     },
-    // subscriptionComplete + runnerHealthy intentionally unset (phase-17).
-    callBudget: new CallBudget({ db: appDataForRouter.db })
+    // Phase-17 (were unset): the runner's completion fn + live health probe.
+    subscriptionComplete: runnerInstance.complete,
+    runnerHealthy: () => runnerInstance.isHealthy(),
+    callBudget
   })
   providerRouter = router
+  // §10.1/P0.4 zombie defense: kill any runner child tree orphaned by a previous
+  // process generation (an unfinished runner_runs row whose pid still resolves to
+  // a claude image — NEVER by pid alone) and sweep stale per-task
+  // runner/*.mcp.json. Both are no-ops on a fresh/default install.
+  void runnerInstance
+    .sweepZombies()
+    .then((killed) => {
+      if (killed > 0) console.log(`[runner] boot zombie sweep killed ${killed} orphaned runner child tree(s)`)
+    })
+    .catch((err) => console.warn('[runner] boot zombie sweep failed', err))
+  sweepStaleRunnerMcpConfigs(userDataDir)
+  const runnerEnabled = loadModelSettings(settingsPath(userDataDir)).runner?.enabled === true
+  console.log(
+    `[runner] subscription runner built (completion mode) — ${
+      runnerEnabled ? 'ENABLED' : 'disabled (default)'
+    }; complete/health injected into the router`
+  )
   const permissions = new PermissionEngine({ db: appData.db })
   registerInternalAgents(permissions)
   const audit = new AuditLog({
@@ -627,6 +702,8 @@ function bootIpc(): void {
     keychain,
     mcpUrl: mcpServer?.url ?? null,
     triggers,
+    // Phase-17: the subscription runner backs runner.status / runner.testConnection.
+    runner: subscriptionRunner,
     userDataDir,
     // Phase-16b (P1.1): the settings mutators (save / setApiKey / clearApiKey)
     // fire this after a successful change so boot drops the router's cached
@@ -643,6 +720,9 @@ function bootIpc(): void {
     mcpServer.setReadContext({
       ...(securityInstances !== null ? { permissions: securityInstances.permissions } : {}),
       ...(kernelInstances !== null ? { runner: kernelInstances.runner } : {}),
+      // Phase-17: get_runner_status reads this health source (distinct from the
+      // workflow `runner` above).
+      ...(subscriptionRunner !== null ? { runnerStatus: subscriptionRunner } : {}),
       triggers,
       watchedFolders: new WatchedFolderStore({ configPath: join(userDataDir, WATCHED_FOLDERS_CONFIG_FILENAME) }),
       ollama,
@@ -758,7 +838,13 @@ app.on('will-quit', (event) => {
   if (quitting) return
   quitting = true
   event.preventDefault()
-  // MCP first: closeAllConnections() severs sockets synchronously, so no new
+  // Phase-17/P0.4: kill any in-flight runner child tree FIRST — before the MCP
+  // server and the queue tear down — so a live `claude` child is never stranded,
+  // and the queue's "task stays running, re-runs next boot" invariant stays
+  // clean. Guarded + synchronous; a default install has no children to kill.
+  subscriptionRunner?.killChildren()
+  subscriptionRunner = null
+  // MCP next: closeAllConnections() severs sockets synchronously, so no new
   // tool call can reach appdata.db after this line; the rest of stop() (SDK
   // session teardown) finishes in the background.
   void mcpServer?.stop().catch(() => undefined)
