@@ -26,6 +26,7 @@ export { TIEBREAK_SYSTEM_PROMPT, resolveEntities, type ResolveOptions } from './
 export { parseTranscriptContent, parseTranscriptFile } from './extraction/transcript'
 export {
   ExtractionError,
+  ExtractionUnavailableError,
   extractionProvenance,
   itemKeyOf,
   normalizeItemText,

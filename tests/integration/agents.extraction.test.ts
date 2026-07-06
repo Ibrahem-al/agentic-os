@@ -18,6 +18,7 @@ import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
   createExtractionAgent,
+  ExtractionUnavailableError,
   sessionNodeIdOf,
   type ExtractionAgent,
   type ExtractionCloud,
@@ -29,6 +30,7 @@ import { rootKeyOf } from '../../src/main/ingest'
 import { LangGraphRunner, WorkflowJobError } from '../../src/main/kernel'
 import { OllamaClient, SpendMeter } from '../../src/main/models'
 import type { StorageEngine } from '../../src/main/storage'
+import { DurableTaskQueue, enqueueExtraction, extractionTaskId, registerExtractionHandler } from '../../src/main/triggers'
 import {
   FailingOnceEmbedder,
   FakeCloudBrain,
@@ -796,6 +798,104 @@ describe('crash between passes — resume completes from checkpoints without re-
     expect(
       await edgeStamp(storeA.engine, 'Preference', String(prefRows[0]!['id']), 'EXTRACTED_FROM', 'Session', sessionNodeId)
     ).not.toBeNull()
+  }, 30_000)
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P0.1 (phase 14, MCP-COVERAGE §9.5) — all-model-failure extraction is LOUD:
+// the workflow rejects with a retryable error and the queue task RETRIES
+// instead of flipping the exactly-once `extract-<sessionId>` token to a
+// silent, empty 'done' that would tombstone the session forever.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('P0.1 — every model call fails: extraction throws instead of committing empty', () => {
+  it('runExtraction rejects with ExtractionUnavailableError in the cause chain; the graph stays untouched', async () => {
+    const sessionId = 'p01-direct'
+    insertMcpCalls(stackA.appData.db, [
+      { sessionId, tool: 'get_context', params: { task: 'anything at all' }, startedUnixMs: TMS(360) }
+    ])
+    const transcriptPath = writeTranscript('p01-a.jsonl', [
+      userRecord('Please remember: always run the linter before committing.', { timestamp: T(360), sessionId })
+    ])
+    const llm = new ScriptedExtractionLlm({}, { failExtraction: true })
+    const agent = makeAgent(storeA, stackA, { llm })
+    const err: unknown = await agent
+      .runExtraction(sessionId, { transcriptPath, jobId: 'job-p01-direct' })
+      .catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(WorkflowJobError)
+    // The retryable class survives the workflow wrap via the cause chain —
+    // exactly what the session-end handler's isNothingToExtract walks.
+    let found = false
+    for (let cause: unknown = err, depth = 0; depth < 6 && cause instanceof Error; depth++, cause = cause.cause) {
+      if (cause instanceof ExtractionUnavailableError) {
+        found = true
+        break
+      }
+    }
+    expect(found).toBe(true)
+    // Nothing committed, nothing staged: the session is NOT recorded as extracted.
+    expect(await nodeCount(storeA.engine, 'Session', 'WHERE n.id = $id', { id: sessionNodeIdOf(sessionId) })).toBe(0)
+    expect(stagedRows(`extraction-agent:${sessionNodeIdOf(sessionId)}`)).toHaveLength(0)
+  }, 30_000)
+
+  it('through the REAL queue handler: the task retries (pending + §20 backoff), never a silent done', async () => {
+    const sessionId = 'p01-queued'
+    const taskId = extractionTaskId(sessionId)
+    insertMcpCalls(stackA.appData.db, [
+      { sessionId, tool: 'search_memory', params: { query: 'merge policy' }, startedUnixMs: TMS(370) }
+    ])
+    const transcriptPath = writeTranscript('p01-b.jsonl', [
+      userRecord('Always squash-merge feature branches, please.', { timestamp: T(370), sessionId })
+    ])
+    // The real phase-11 wiring: queue → registerExtractionHandler → the real
+    // phase-08 workflow, with every model call failing (no cloud tier).
+    const queue = new DurableTaskQueue({ db: stackA.appData.db })
+    const runner = new LangGraphRunner({ db: stackA.appData.db, telemetry: stackA.telemetry, executor: stackA.kernel })
+    const agent = createExtractionAgent({
+      engine: storeA.engine,
+      db: stackA.appData.db,
+      runner,
+      embedder: new FakeExtractionEmbedder(),
+      llm: new ScriptedExtractionLlm({}, { failExtraction: true }),
+      cloud: null
+    })
+    registerExtractionHandler(queue, { agent, runner })
+    queue.start()
+    try {
+      expect(enqueueExtraction(queue, { sessionId, transcriptPath }, 'hook').deduped).toBe(false)
+      // Wait for attempt 1 to settle (real timers; the §20 backoff is 60s so
+      // the settled state is stable once observed).
+      const deadline = Date.now() + 20_000
+      let settled:
+        | { status: string; attempts: number; not_before_unix_ms: number | null; last_error: string | null }
+        | undefined
+      for (;;) {
+        settled = stackA.appData.db
+          .prepare('SELECT status, attempts, not_before_unix_ms, last_error FROM tasks WHERE id = ?')
+          .get(taskId) as typeof settled
+        if (
+          settled !== undefined &&
+          (settled.status === 'done' ||
+            settled.status === 'failed' ||
+            settled.status === 'deferred' ||
+            (settled.status === 'pending' && settled.attempts >= 1))
+        ) {
+          break
+        }
+        if (Date.now() > deadline) throw new Error(`task ${taskId} did not settle: ${JSON.stringify(settled ?? null)}`)
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      // The P0.1 regression pin: NOT 'done' (silent loss), NOT 'failed'
+      // (unretryable), NOT swallowed by the nothing-to-extract path — a live
+      // retry with the 1m backoff recorded.
+      expect(settled).toMatchObject({ status: 'pending', attempts: 1 })
+      expect(settled?.not_before_unix_ms ?? 0).toBeGreaterThan(Date.now())
+      expect(settled?.last_error ?? '').toMatch(/fuzzy-pass calls failed/)
+      // And still nothing in the graph for this session.
+      expect(await nodeCount(storeA.engine, 'Session', 'WHERE n.id = $id', { id: sessionNodeIdOf(sessionId) })).toBe(0)
+    } finally {
+      await queue.stop(0)
+    }
   }, 30_000)
 })
 

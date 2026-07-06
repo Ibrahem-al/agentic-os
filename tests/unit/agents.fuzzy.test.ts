@@ -11,6 +11,8 @@ import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
   chunkTranscript,
+  ExtractionError,
+  ExtractionUnavailableError,
   extractItemsReply,
   extractJsonArray,
   extractJsonObject,
@@ -282,5 +284,93 @@ describe('runFuzzyExtraction — §20 escalation gates', () => {
     expect(result.escalated).toBe(false)
     expect(result.components[0]?.name).toBe('kept local unit')
     expect(result.warnings.some((w) => w.includes('cloud escalation failed on every call'))).toBe(true)
+  })
+})
+
+describe('runFuzzyExtraction — P0.1: all-calls-failed is LOUD (MCP-COVERAGE §9.5, phase 14)', () => {
+  /** Every model call rejects — the "Ollama daemon died / auth expired" shape. */
+  const deadLlm: ExtractionLlm = {
+    generate: () => Promise.reject(new Error('ollama daemon unreachable'))
+  }
+
+  it('throws ExtractionUnavailableError when every local call fails and no cloud tier exists', async () => {
+    await expect(runFuzzyExtraction({ llm: deadLlm, transcript: digestOf('User: hello') })).rejects.toThrow(
+      ExtractionUnavailableError
+    )
+    await expect(runFuzzyExtraction({ llm: deadLlm, transcript: digestOf('User: hello') })).rejects.toThrow(
+      /all 3 local fuzzy-pass calls failed and no cloud tier is configured/
+    )
+  })
+
+  it('throws when the cloud escalation ALSO fails on every call (both tiers down)', async () => {
+    const cloud = new FakeCloudBrain({}, { failAll: true })
+    const promise = runFuzzyExtraction({
+      llm: deadLlm,
+      cloud: { brain: cloud, meter, taskId: 'task-p01-both-down' },
+      transcript: digestOf('User: everything is down')
+    })
+    await expect(promise).rejects.toThrow(ExtractionUnavailableError)
+    await expect(
+      runFuzzyExtraction({
+        llm: deadLlm,
+        cloud: { brain: new FakeCloudBrain({}, { failAll: true }), meter, taskId: 'task-p01-both-down' },
+        transcript: digestOf('User: everything is down')
+      })
+    ).rejects.toThrow(/cloud escalation failed on every call/)
+  })
+
+  it('does NOT throw when the cloud rescue works — the throw sits AFTER gate B (placement guard)', async () => {
+    const cloud = new FakeCloudBrain({
+      components: '[{"name": "rescued unit", "type": "module", "confidence": 0.9}]',
+      preferences: '[]',
+      corrections: '[]'
+    })
+    const result = await runFuzzyExtraction({
+      llm: deadLlm,
+      cloud: { brain: cloud, meter, taskId: 'task-p01-rescued' },
+      transcript: digestOf('User: local model is down, cloud is fine')
+    })
+    expect(result.tier).toBe('cloud')
+    expect(result.escalated).toBe(true)
+    expect(result.escalationReason).toBe('low-local-confidence')
+    expect(result.components[0]?.name).toBe('rescued unit')
+  })
+
+  it('an empty transcript still skips quietly — totalCalls === 0 means nothing was asked of a model', async () => {
+    const blank = await runFuzzyExtraction({ llm: deadLlm, transcript: digestOf('   ') })
+    expect(blank.tier).toBe('none')
+    const missing = await runFuzzyExtraction({ llm: deadLlm, transcript: null })
+    expect(missing.tier).toBe('none')
+  })
+
+  it('partial local success never throws: some calls surviving means the run learned something', async () => {
+    let call = 0
+    const flaky: ExtractionLlm = {
+      generate: (_prompt, options) => {
+        call += 1
+        // The components pass succeeds; preferences/corrections passes die.
+        if ((options?.system ?? '').includes('extract software components')) {
+          return Promise.resolve({ text: '[{"name": "survivor", "type": "module", "confidence": 0.9}]' })
+        }
+        return Promise.reject(new Error(`daemon flaked on call ${call}`))
+      }
+    }
+    const result = await runFuzzyExtraction({ llm: flaky, transcript: digestOf('User: partial outage') })
+    expect(result.tier).toBe('local')
+    expect(result.components[0]?.name).toBe('survivor')
+    expect(result.warnings.length).toBeGreaterThan(0)
+  })
+
+  it('is an ExtractionError subclass whose name/code can NEVER match the NOT_FOUND quiet path', async () => {
+    // isNothingToExtract (triggers/sessionEnd.ts) swallows only
+    // name === 'ExtractionError' && code === 'NOT_FOUND' — both differ here,
+    // so the session-end handler rethrows and the queue retries.
+    const err: unknown = await runFuzzyExtraction({ llm: deadLlm, transcript: digestOf('User: hi') }).catch(
+      (e: unknown) => e
+    )
+    expect(err).toBeInstanceOf(ExtractionUnavailableError)
+    expect(err).toBeInstanceOf(ExtractionError)
+    expect((err as ExtractionUnavailableError).name).toBe('ExtractionUnavailableError')
+    expect((err as ExtractionUnavailableError).code).toBe('UNAVAILABLE')
   })
 })

@@ -57,6 +57,38 @@ export class TaskFatalError extends Error {
   }
 }
 
+/**
+ * Thrown by a handler when an upstream resource said "come back later" at a
+ * KNOWN time (runner auth expiry, a provider quota window — phase 14,
+ * MCP-COVERAGE P0.7): the task re-pends at exactly `retryAtUnixMs` and the
+ * execution is NOT counted against the §20 retry round — waiting out a quota
+ * window must never burn the three real attempts.
+ */
+export class TaskRetryAtError extends Error {
+  constructor(
+    readonly retryAtUnixMs: number,
+    message?: string
+  ) {
+    super(message ?? `retry not before ${new Date(retryAtUnixMs).toISOString()}`)
+    this.name = 'TaskRetryAtError'
+  }
+}
+
+/**
+ * Thrown by retryDeferred() when the request cannot be honored. `code` maps
+ * onto the MCP tool-error vocabulary (§4.E `retry_task`: NOT_FOUND /
+ * INVALID_STATE) without this module importing mcp.
+ */
+export class TaskRetryError extends Error {
+  constructor(
+    readonly code: 'NOT_FOUND' | 'INVALID_STATE',
+    message: string
+  ) {
+    super(message)
+    this.name = 'TaskRetryError'
+  }
+}
+
 export interface EnqueueRequest {
   /** Deterministic id for dedup (e.g. `extract-<sessionId>`); default random. */
   readonly id?: string
@@ -332,6 +364,68 @@ export class DurableTaskQueue {
     this.poke()
   }
 
+  /**
+   * Re-run a 'deferred' task NOW with a fresh §20 retry round (phase 14;
+   * MCP-COVERAGE §4.E `retry_task`) — semantically what the next start()
+   * reload would do to the row, without the restart. Guard rails: only rows
+   * that are really deferred, of a kind registered this launch, not already
+   * queued/running, and not parked behind a §13 approval (approval decisions
+   * are the human's — onApprovalDecided is that row's only way back).
+   * Failures throw TaskRetryError with an MCP-mappable code.
+   */
+  retryDeferred(taskId: string): { taskId: string; status: 'pending' } {
+    const row = this.db
+      .prepare(
+        `SELECT id, kind, payload_json, status, attempts, not_before_unix_ms, priority, waiting_approval_id
+         FROM tasks WHERE id = ?`
+      )
+      .get(taskId) as TaskRow | undefined
+    if (row === undefined) throw new TaskRetryError('NOT_FOUND', `no task with id '${taskId}'`)
+    if (row.status !== 'deferred') {
+      throw new TaskRetryError(
+        'INVALID_STATE',
+        `task '${taskId}' is '${row.status}', not 'deferred' — only deferred tasks can be retried`
+      )
+    }
+    if (row.waiting_approval_id !== null) {
+      throw new TaskRetryError(
+        'INVALID_STATE',
+        `task '${taskId}' is parked behind approval '${row.waiting_approval_id}' — decide the approval instead`
+      )
+    }
+    if (!this.handlers.has(row.kind)) {
+      throw new TaskRetryError(
+        'INVALID_STATE',
+        `task '${taskId}' has kind '${row.kind}', which has no handler registered this launch`
+      )
+    }
+    if (this.pending.has(taskId) || this.current?.task.id === taskId) {
+      throw new TaskRetryError('INVALID_STATE', `task '${taskId}' is already queued or running`)
+    }
+    let payload: JsonObject = {}
+    try {
+      const parsed: unknown = JSON.parse(row.payload_json ?? '{}')
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) payload = parsed as JsonObject
+    } catch {
+      // Same posture as start(): a corrupt payload cannot run — flag it.
+      this.updateStatus.run('failed', null, null, 'unparseable payload_json on retry', nowIso(), row.id)
+      throw new TaskRetryError('INVALID_STATE', `task '${taskId}' has unparseable payload_json — marked failed`)
+    }
+    this.updateStatus.run('pending', null, null, null, nowIso(), taskId)
+    this.pending.set(taskId, {
+      id: row.id,
+      kind: row.kind,
+      payload,
+      priority: row.priority,
+      notBeforeUnixMs: null,
+      enqueuedAtMs: Date.now(),
+      seq: this.seqCounter++,
+      roundExecs: 0
+    })
+    this.poke()
+    return { taskId, status: 'pending' }
+  }
+
   /** Status counts over the queue's rows (workflow jobs excluded). */
   counts(): Record<string, number> {
     const rows = this.db
@@ -456,6 +550,20 @@ export class DurableTaskQueue {
       if (err instanceof TaskFatalError) {
         this.updateStatus.run('failed', null, null, message, nowIso(), task.id)
         console.error(`[triggers] task ${task.id} (${task.kind}) failed permanently: ${message}`)
+        return
+      }
+      if (err instanceof TaskRetryAtError) {
+        // P0.7 (phase 14): not a real failure — the handler asked to be
+        // re-run at a known time (auth/quota reset). Un-consume runTask's
+        // pre-increment so the §20 retry round stays intact, and schedule
+        // exactly there (no backoff arithmetic).
+        task.roundExecs -= 1
+        task.notBeforeUnixMs = err.retryAtUnixMs
+        this.pending.set(task.id, task)
+        this.updateStatus.run('pending', err.retryAtUnixMs, null, message, nowIso(), task.id)
+        console.warn(
+          `[triggers] task ${task.id} (${task.kind}) waiting until ${new Date(err.retryAtUnixMs).toISOString()} (no attempt consumed): ${message}`
+        )
         return
       }
       const retryIndex = task.roundExecs - 1

@@ -60,6 +60,7 @@ const APPDATA_SCHEMA: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS mcp_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT,
+    session_kind TEXT,
     tool TEXT NOT NULL,
     params_json TEXT,
     args_hash TEXT,
@@ -211,10 +212,49 @@ const APPDATA_SCHEMA: readonly string[] = [
     drift_json TEXT,
     drift_resolved_at TEXT
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_skill_improvements_skill ON skill_improvements(skill_id)`
+  `CREATE INDEX IF NOT EXISTS idx_skill_improvements_skill ON skill_improvements(skill_id)`,
+  // Headless-runner bookkeeping (phase 14, MCP-COVERAGE spec):
+  //  - runner_runs: one row per spawned `claude -p` process — the CallBudget's
+  //    DURABLE per-task call ledger (§9.3/P0.2: count survives crash/resume the
+  //    way `spend` rows do), the §3.7 usage/window accounting source
+  //    (input/output tokens over started_at), and the §10.1 zombie defense's
+  //    pid record. shadow_cost_usd is the observability-only price estimate —
+  //    subscription runs create NO spend rows.
+  //  - runner_submissions: agent-mode result payloads (submit_extraction_items
+  //    et al.) captured verbatim before staging, keyed to the spawning task.
+  `CREATE TABLE IF NOT EXISTS runner_runs (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    model TEXT,
+    claude_session_id TEXT,
+    transport_session_id TEXT,
+    pid INTEGER,
+    started_at TEXT NOT NULL,
+    duration_ms INTEGER,
+    num_turns INTEGER,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    shadow_cost_usd REAL,
+    stderr_tail TEXT,
+    is_error INTEGER,
+    error TEXT,
+    exit_code INTEGER
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_runner_runs_task ON runner_runs(task_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_runner_runs_started ON runner_runs(started_at)`,
+  `CREATE TABLE IF NOT EXISTS runner_submissions (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_runner_submissions_task ON runner_submissions(task_id)`
 ]
 
-const APPDATA_USER_VERSION = 6
+const APPDATA_USER_VERSION = 7
 
 /**
  * Column additions to tables that predate them (CREATE IF NOT EXISTS skips an
@@ -225,11 +265,15 @@ const APPDATA_USER_VERSION = 6
  * v5 (phase 11): tasks.priority (the §8 queue mirror lists priority as a
  * column) and tasks.waiting_approval_id (a task deferred behind a §13
  * pending-approval row retries when the approval is decided).
+ * v7 (phase 14): mcp_calls.session_kind — 'runner' rows let the §6 inactivity
+ * sweep skip a headless runner's own MCP session (MCP-COVERAGE §10.2, P0.5).
+ * Nullable: interactive callers pass nothing.
  */
 const APPDATA_COLUMN_ADDITIONS: readonly { table: string; column: string; ddl: string }[] = [
   { table: 'mcp_calls', column: 'args_hash', ddl: 'ALTER TABLE mcp_calls ADD COLUMN args_hash TEXT' },
   { table: 'tasks', column: 'priority', ddl: 'ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0' },
-  { table: 'tasks', column: 'waiting_approval_id', ddl: 'ALTER TABLE tasks ADD COLUMN waiting_approval_id TEXT' }
+  { table: 'tasks', column: 'waiting_approval_id', ddl: 'ALTER TABLE tasks ADD COLUMN waiting_approval_id TEXT' },
+  { table: 'mcp_calls', column: 'session_kind', ddl: 'ALTER TABLE mcp_calls ADD COLUMN session_kind TEXT' }
 ]
 
 /** The binding that loaded successfully in this runtime (cached). */
@@ -343,7 +387,8 @@ export function openAppData(dbPath: string, backupsDir?: string): AppData {
     // v2 → v3: mcp_calls.args_hash, phase 05; v3 → v4: approvals + audit_log +
     // injection_flags, phase 09; v4 → v5: tasks.priority +
     // tasks.waiting_approval_id, phase 11; v5 → v6: skill_settings +
-    // skill_improvements, phase 12).
+    // skill_improvements, phase 12; v6 → v7: mcp_calls.session_kind +
+    // runner_runs + runner_submissions, phase 14).
     db.pragma(`user_version = ${APPDATA_USER_VERSION}`)
   }
   return {

@@ -48,6 +48,7 @@ describe('McpCallLog', () => {
 
   interface CallRow {
     session_id: string
+    session_kind: string | null
     tool: string
     params_json: string | null
     args_hash: string
@@ -57,7 +58,7 @@ describe('McpCallLog', () => {
     duration_ms: number
   }
 
-  it('writes the full row: session, tool, args JSON + hash, timing, status', () => {
+  it('writes the full row: session, tool, args JSON + hash, timing, status — NULL session_kind by default', () => {
     const log = open()
     const args = { task: 'deploy the storefront', tags: ['frontend'] }
     log.record({
@@ -70,6 +71,9 @@ describe('McpCallLog', () => {
     })
     const row = appData.db.prepare('SELECT * FROM mcp_calls').get() as CallRow
     expect(row.session_id).toBe('sess-1')
+    // Interactive callers pass no sessionKind — the 9th column stays NULL
+    // (phase 14: existing call sites keep working unchanged).
+    expect(row.session_kind).toBeNull()
     expect(row.tool).toBe('get_context')
     expect(row.params_json).toBe(stableStringify(args))
     expect(row.args_hash).toBe(hashArgs(args))
@@ -77,6 +81,35 @@ describe('McpCallLog', () => {
     expect(row.error).toBeNull()
     expect(row.started_unix_ms).toBe(1234)
     expect(row.duration_ms).toBe(57)
+  })
+
+  it('round-trips session_kind when given (phase 14: runner sessions tag their rows)', () => {
+    const log = open()
+    log.record({
+      sessionId: 'sess-runner',
+      sessionKind: 'runner',
+      tool: 'get_skill',
+      args: { name: 'deploy-web' },
+      resultStatus: 'ok',
+      startedUnixMs: 10,
+      durationMs: 5
+    })
+    log.record({
+      sessionId: 'sess-explicit-null',
+      sessionKind: null,
+      tool: 'get_context',
+      args: {},
+      resultStatus: 'ok',
+      startedUnixMs: 20,
+      durationMs: 5
+    })
+    const rows = appData.db
+      .prepare('SELECT session_id, session_kind FROM mcp_calls ORDER BY started_unix_ms')
+      .all() as { session_id: string; session_kind: string | null }[]
+    expect(rows).toEqual([
+      { session_id: 'sess-runner', session_kind: 'runner' },
+      { session_id: 'sess-explicit-null', session_kind: null }
+    ])
   })
 
   it('records errors with the message', () => {

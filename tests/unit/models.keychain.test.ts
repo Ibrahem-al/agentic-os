@@ -9,7 +9,14 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { Keychain, KeychainError, MCP_BEARER_TOKEN_SECRET, apiKeySecretName, type SafeStorageLike } from '../../src/main/models'
+import {
+  Keychain,
+  KeychainError,
+  MCP_BEARER_TOKEN_SECRET,
+  RUNNER_TOKEN_SECRET,
+  apiKeySecretName,
+  type SafeStorageLike
+} from '../../src/main/models'
 
 const MAGIC = Buffer.from('FAKEENCv1:')
 
@@ -86,6 +93,41 @@ describe('keychain', () => {
     expect(keychain.ensureMcpBearerToken()).toBe(token)
     expect(openKeychain().ensureMcpBearerToken()).toBe(token)
     expect(openKeychain().getSecret(MCP_BEARER_TOKEN_SECRET)).toBe(token)
+  })
+
+  it('ensureRunnerToken is get-or-create and persists across instances (phase 14)', () => {
+    const keychain = openKeychain()
+    const token = keychain.ensureRunnerToken()
+    expect(token).toMatch(/^[A-Za-z0-9_-]{40,}$/) // 32 random bytes, base64url
+    expect(keychain.ensureRunnerToken()).toBe(token)
+    expect(openKeychain().ensureRunnerToken()).toBe(token)
+    expect(openKeychain().getSecret(RUNNER_TOKEN_SECRET)).toBe(token)
+    // Distinct token family: never the MCP bearer token, never the hook token.
+    expect(token).not.toBe(keychain.ensureMcpBearerToken())
+    expect(token).not.toBe(keychain.ensureSessionEndHookToken())
+  })
+
+  it('rotateRunnerToken UNCONDITIONALLY replaces the token — the old value is dead (P0.3/§10.1)', () => {
+    const keychain = openKeychain()
+    const original = keychain.ensureRunnerToken()
+    const rotated = keychain.rotateRunnerToken()
+    expect(rotated).toMatch(/^[A-Za-z0-9_-]{40,}$/)
+    expect(rotated).not.toBe(original) // never read-existing
+    // The rotation persisted: every reader now sees ONLY the new value.
+    expect(keychain.ensureRunnerToken()).toBe(rotated)
+    expect(openKeychain().ensureRunnerToken()).toBe(rotated)
+    expect(openKeychain().getSecret(RUNNER_TOKEN_SECRET)).toBe(rotated)
+    // Rotating again keeps rotating (each boot mints a fresh generation).
+    const again = keychain.rotateRunnerToken()
+    expect(again).not.toBe(rotated)
+    expect(openKeychain().getSecret(RUNNER_TOKEN_SECRET)).toBe(again)
+  })
+
+  it('rotateRunnerToken works on a keychain that never had a runner token (first boot)', () => {
+    const keychain = openKeychain()
+    const token = keychain.rotateRunnerToken()
+    expect(token).toMatch(/^[A-Za-z0-9_-]{40,}$/)
+    expect(openKeychain().ensureRunnerToken()).toBe(token)
   })
 
   it('refuses to operate when OS encryption is unavailable (no plaintext fallback)', () => {

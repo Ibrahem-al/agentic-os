@@ -7,6 +7,8 @@
 export {
   DurableTaskQueue,
   TaskFatalError,
+  TaskRetryAtError,
+  TaskRetryError,
   type DurableTaskQueueDeps,
   type EnqueueRequest,
   type EnqueueResult,

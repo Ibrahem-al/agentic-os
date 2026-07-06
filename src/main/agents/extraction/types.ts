@@ -71,7 +71,7 @@ export interface ExtractionAgentDeps {
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
-export type ExtractionErrorCode = 'INVALID_INPUT' | 'NOT_FOUND'
+export type ExtractionErrorCode = 'INVALID_INPUT' | 'NOT_FOUND' | 'UNAVAILABLE'
 
 export class ExtractionError extends Error {
   readonly code: ExtractionErrorCode
@@ -80,6 +80,25 @@ export class ExtractionError extends Error {
     super(message)
     this.name = 'ExtractionError'
     this.code = code
+  }
+}
+
+/**
+ * Every model tier failed on every fuzzy-pass call (phase 14; MCP-COVERAGE
+ * §9.5 / P0.1): the run learned NOTHING, and returning an empty state would
+ * let the workflow commit an empty plan and flip the exactly-once
+ * `extract-<sessionId>` task to 'done' — silently tombstoning the session as
+ * "extracted" forever. This is an ORDINARY retryable error (deliberately NOT
+ * a TaskFatalError): the queue runs its §20 1m/5m/25m round and then defers,
+ * and the next launch — or a manual retry — resumes the checkpointed
+ * workflow at the failed step without re-buying earlier passes. Its name AND
+ * code both differ from ExtractionError/'NOT_FOUND' so the session-end
+ * handler's "nothing to extract" quiet path can never swallow it.
+ */
+export class ExtractionUnavailableError extends ExtractionError {
+  constructor(message: string) {
+    super('UNAVAILABLE', message)
+    this.name = 'ExtractionUnavailableError'
   }
 }
 

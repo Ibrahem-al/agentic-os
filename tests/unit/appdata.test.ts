@@ -16,7 +16,9 @@ const TABLES = [
   'audit_log',
   'injection_flags',
   'skill_settings',
-  'skill_improvements'
+  'skill_improvements',
+  'runner_runs',
+  'runner_submissions'
 ] as const
 
 describe('appdata.db (SQLite side of §20 app data)', () => {
@@ -25,13 +27,13 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('creates the db in WAL mode with all tables and user_version 6', () => {
+  it('creates the db in WAL mode with all tables and user_version 7', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const appData = openAppData(join(dir, 'nested', 'appdata.db'))
     try {
       expect(existsSync(appData.path)).toBe(true)
       expect(appData.db.pragma('journal_mode', { simple: true })).toBe('wal')
-      expect(appData.db.pragma('user_version', { simple: true })).toBe(6)
+      expect(appData.db.pragma('user_version', { simple: true })).toBe(7)
       expect(appData.db.pragma('foreign_keys', { simple: true })).toBe(1)
       const names = appData.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -67,6 +69,13 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
         'claude-sonnet-5',
         0.01
       )
+      db.prepare(
+        `INSERT INTO runner_runs (id, task_id, mode, model, pid, started_at, input_tokens, output_tokens)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run('run-1', 'task-1', 'completion', 'sonnet', 4242, '2026-07-05T00:00:00.000Z', 1200, 300)
+      db.prepare(
+        'INSERT INTO runner_submissions (id, task_id, session_id, kind, payload_json) VALUES (?, ?, ?, ?, ?)'
+      ).run('sub-1', 'task-1', 'sess-r1', 'extraction-items', '{"items":[]}')
 
       expect((db.prepare('SELECT name FROM traces WHERE trace_id = ?').get('t1') as { name: string }).name).toBe('boot')
       const task = db.prepare('SELECT status, attempts, created_at FROM tasks WHERE id = ?').get('task-1') as {
@@ -86,6 +95,16 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
         (db.prepare('SELECT status FROM staged_writes WHERE id = ?').get('sw-1') as { status: string }).status
       ).toBe('staged')
       expect((db.prepare('SELECT usd FROM spend WHERE task_id = ?').get('task-1') as { usd: number }).usd).toBe(0.01)
+      const run = db
+        .prepare('SELECT mode, model, pid, input_tokens FROM runner_runs WHERE task_id = ?')
+        .get('task-1') as { mode: string; model: string; pid: number; input_tokens: number }
+      expect(run).toEqual({ mode: 'completion', model: 'sonnet', pid: 4242, input_tokens: 1200 })
+      const sub = db
+        .prepare('SELECT kind, payload_json, created_at FROM runner_submissions WHERE id = ?')
+        .get('sub-1') as { kind: string; payload_json: string; created_at: string }
+      expect(sub.kind).toBe('extraction-items')
+      expect(sub.payload_json).toBe('{"items":[]}')
+      expect(Number.isNaN(Date.parse(sub.created_at))).toBe(false) // datetime('now') default populated
 
       expect(() => db.prepare('INSERT INTO tasks (id, kind, status) VALUES (?, ?, ?)').run('bad', 'x', 'nope')).toThrow(
         /CHECK/
@@ -113,14 +132,14 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const second = openAppData(dbPath)
     try {
-      expect(second.db.pragma('user_version', { simple: true })).toBe(6)
+      expect(second.db.pragma('user_version', { simple: true })).toBe(7)
       expect((second.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(1)
     } finally {
       second.close()
     }
   })
 
-  it('upgrades a v1 db in place (additive tables + columns, v2 kernel / v3 mcp / v4 security / v5 triggers / v6 skills)', () => {
+  it('upgrades a v1 db in place (additive tables + columns, v2 kernel / v3 mcp / v4 security / v5 triggers / v6 skills / v7 runner)', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const dbPath = join(dir, 'appdata.db')
     const first = openAppData(dbPath)
@@ -143,6 +162,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     first.db.prepare('INSERT INTO tasks (id, kind) VALUES (?, ?)').run('keep-me', 'probe')
     first.db.exec('DROP TABLE workflow_checkpoints; DROP TABLE workflow_checkpoint_writes')
     first.db.exec('DROP TABLE skill_settings; DROP TABLE skill_improvements')
+    first.db.exec('DROP TABLE runner_runs; DROP TABLE runner_submissions')
     first.db.exec(`DROP TABLE mcp_calls;
       CREATE TABLE mcp_calls (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,25 +183,94 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(6)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(7)
       const names = upgraded.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .all()
         .map((r) => (r as { name: string }).name)
       expect(names).toEqual([...TABLES].sort())
       expect((upgraded.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(1)
-      // The pre-v3 row survives with a NULL args_hash; the column now exists.
+      // The pre-v3 row survives with NULL args_hash and (pre-v7) NULL
+      // session_kind; both columns now exist.
       const old = upgraded.db
-        .prepare('SELECT tool, args_hash FROM mcp_calls WHERE session_id = ?')
-        .get('old-sess') as { tool: string; args_hash: string | null }
+        .prepare('SELECT tool, args_hash, session_kind FROM mcp_calls WHERE session_id = ?')
+        .get('old-sess') as { tool: string; args_hash: string | null; session_kind: string | null }
       expect(old.tool).toBe('get_context')
       expect(old.args_hash).toBeNull()
+      expect(old.session_kind).toBeNull()
       // The pre-v5 task row survives with the default priority + NULL approval.
       const oldTask = upgraded.db
         .prepare('SELECT priority, waiting_approval_id FROM tasks WHERE id = ?')
         .get('keep-me') as { priority: number; waiting_approval_id: string | null }
       expect(oldTask.priority).toBe(0)
       expect(oldTask.waiting_approval_id).toBeNull()
+    } finally {
+      upgraded.close()
+    }
+  })
+
+  it('upgrades a v6 db to v7: mcp_calls.session_kind + runner tables, snapshot taken first (phase 14)', () => {
+    dir = mkdtempSync(join(tmpdir(), 'appdata-'))
+    const dbPath = join(dir, 'appdata.db')
+    // Simulate a real phase-12/13 install: no runner tables, mcp_calls in its
+    // exact v6 shape (args_hash present, no session_kind), user_version 6.
+    const first = openAppData(dbPath)
+    first.db.exec('DROP TABLE runner_runs; DROP TABLE runner_submissions')
+    first.db.exec(`DROP TABLE mcp_calls;
+      CREATE TABLE mcp_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT,
+        tool TEXT NOT NULL,
+        params_json TEXT,
+        args_hash TEXT,
+        result_status TEXT,
+        error TEXT,
+        started_unix_ms INTEGER NOT NULL,
+        duration_ms INTEGER,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      )`)
+    first.db
+      .prepare('INSERT INTO mcp_calls (session_id, tool, args_hash, started_unix_ms) VALUES (?, ?, ?, ?)')
+      .run('v6-sess', 'get_context', 'sha256:v6', 1000)
+    first.db.pragma('user_version = 6')
+    first.close()
+
+    const upgraded = openAppData(dbPath)
+    try {
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(7)
+      // The v6 row survives; the new nullable column reads NULL on it.
+      const old = upgraded.db
+        .prepare('SELECT tool, args_hash, session_kind FROM mcp_calls WHERE session_id = ?')
+        .get('v6-sess') as { tool: string; args_hash: string; session_kind: string | null }
+      expect(old).toEqual({ tool: 'get_context', args_hash: 'sha256:v6', session_kind: null })
+      // …and the column really takes values now.
+      upgraded.db
+        .prepare('INSERT INTO mcp_calls (session_id, session_kind, tool, started_unix_ms) VALUES (?, ?, ?, ?)')
+        .run('r-sess', 'runner', 'get_skill', 2000)
+      expect(
+        (upgraded.db.prepare('SELECT session_kind FROM mcp_calls WHERE session_id = ?').get('r-sess') as {
+          session_kind: string
+        }).session_kind
+      ).toBe('runner')
+      // Both runner tables (and their indexes) exist.
+      const names = upgraded.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'runner_%' ORDER BY name")
+        .all()
+        .map((r) => (r as { name: string }).name)
+      expect(names).toEqual(['runner_runs', 'runner_submissions'])
+      const indexes = upgraded.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_runner_%' ORDER BY name")
+        .all()
+        .map((r) => (r as { name: string }).name)
+      expect(indexes).toEqual(['idx_runner_runs_started', 'idx_runner_runs_task', 'idx_runner_submissions_task'])
+      // §21 rule 9: the pre-upgrade snapshot exists and is frozen at v6.
+      const snapshot = upgraded.backupCreated
+      expect(snapshot).not.toBeNull()
+      expect(existsSync(snapshot as string)).toBe(true)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v7$/)
+      const header = readFileSync(snapshot as string)
+      expect(header.subarray(0, 16).toString('latin1')).toBe(`SQLite format 3${String.fromCharCode(0)}`)
+      expect(header.readUInt32BE(60)).toBe(6)
     } finally {
       upgraded.close()
     }
@@ -210,15 +299,15 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     const upgraded = openAppData(dbPath)
     try {
       // Main db really upgraded in place.
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(6)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(7)
       expect(
         upgraded.db.prepare("SELECT count(*) AS c FROM sqlite_master WHERE name = 'skill_settings'").get()
       ).toEqual({ c: 1 })
-      // Snapshot at the derived default location: <db parent>/backups/<stamp>-pre-appdata-v6/appdata.db.
+      // Snapshot at the derived default location: <db parent>/backups/<stamp>-pre-appdata-v7/appdata.db.
       const snapshot = upgraded.backupCreated
       expect(snapshot).not.toBeNull()
       expect(existsSync(snapshot as string)).toBe(true)
-      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v6$/)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v7$/)
       expect(dirname(dirname(snapshot as string))).toBe(join(dir, 'backups'))
       // The snapshot is a valid sqlite db frozen at the OLD version: header
       // magic + user_version (byte 60, big-endian) read straight off disk —
@@ -255,7 +344,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     const elsewhere = join(dir, 'elsewhere')
     const upgraded = openAppData(dbPath, elsewhere)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(6)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(7)
       expect(upgraded.backupCreated).not.toBeNull()
       expect(dirname(dirname(upgraded.backupCreated as string))).toBe(elsewhere)
       expect(existsSync(upgraded.backupCreated as string)).toBe(true)

@@ -34,6 +34,7 @@ import {
 import { meteredComplete } from '../../models'
 import { estimatingTokenCounter, type TokenCounter } from '../../retrieval'
 import {
+  ExtractionUnavailableError,
   normalizeItemText,
   type ExtractedComponent,
   type ExtractedCorrection,
@@ -582,6 +583,27 @@ export async function runFuzzyExtraction(options: FuzzyExtractionOptions): Promi
         `local extraction confidence ${sessionConfidence.toFixed(2)} < ${EXTRACTION_ESCALATE_CONFIDENCE} and no cloud tier is configured — low-confidence items will be staged for review`
       )
     }
+  }
+
+  // P0.1 (MCP-COVERAGE §9.5, phase 14): every local call threw — the run
+  // learned NOTHING, and returning the empty local state would let the
+  // workflow flip the exactly-once `extract-<sessionId>` task to 'done',
+  // silently tombstoning the session as extracted forever. Throw an ordinary
+  // retryable error instead so the §20 retry/defer machinery re-attempts.
+  // Placement is load-bearing: this sits AFTER both escalation gates, so a
+  // cloud rescue that produced output already returned above (tier 'cloud')
+  // and is never killed — only the no-cloud and cloud-also-all-failed paths
+  // reach here. The empty-transcript path (totalCalls === 0 — nothing was
+  // ever asked of a model) returned tier 'none' long before this point and
+  // still skips quietly.
+  if (localRun.totalCalls > 0 && localRun.failedCalls === localRun.totalCalls) {
+    throw new ExtractionUnavailableError(
+      `extraction: all ${localRun.totalCalls} local fuzzy-pass calls failed` +
+        (cloudCaller !== null
+          ? ' and the cloud escalation failed on every call'
+          : ' and no cloud tier is configured') +
+        ' — no model tier produced output; retry later instead of committing an empty extraction'
+    )
   }
 
   return {

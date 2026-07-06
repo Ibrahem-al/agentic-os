@@ -18,9 +18,10 @@ import {
   TASK_PRIORITY,
   TASK_YIELD_MAX_MS
 } from '../../src/main/config'
+import { ExtractionUnavailableError } from '../../src/main/agents'
 import { KernelApprovalPendingError } from '../../src/main/kernel'
 import { openAppData, type AppData } from '../../src/main/storage'
-import { DurableTaskQueue, TaskFatalError } from '../../src/main/triggers'
+import { DurableTaskQueue, TaskFatalError, TaskRetryAtError, TaskRetryError } from '../../src/main/triggers'
 
 interface TaskRow {
   id: string
@@ -413,5 +414,135 @@ describe('DurableTaskQueue (§8 mirror + §20 retry + §13 approvals)', () => {
     expect(ran).toEqual([])
     await vi.advanceTimersByTimeAsync(2_000)
     expect(ran).toEqual(['later'])
+  })
+
+  it('TaskRetryAtError re-pends at exactly the stated time without consuming a §20 attempt (P0.7)', async () => {
+    const queue = makeQueue()
+    let execs = 0
+    let retryAt = 0
+    queue.registerHandler('quota', () => {
+      execs += 1
+      if (execs === 1) {
+        retryAt = Date.now() + 10 * 60_000
+        throw new TaskRetryAtError(retryAt, 'quota window exhausted — resets soon')
+      }
+      throw new Error(`boom ${execs}`)
+    })
+    queue.start()
+    queue.enqueue({ id: 'q1', kind: 'quota' })
+    await tick()
+    expect(execs).toBe(1)
+    // Re-pended at EXACTLY retryAt — no backoff arithmetic — error recorded.
+    const parked = row('q1')
+    expect(parked.status).toBe('pending')
+    expect(parked.not_before_unix_ms).toBe(retryAt)
+    expect(parked.last_error).toContain('quota window exhausted')
+    // Nothing runs before the stated moment…
+    await vi.advanceTimersByTimeAsync(10 * 60_000 - 20)
+    expect(execs).toBe(1)
+    // …and the wake-up execution starts a FULL fresh §20 round: 4 more
+    // executions (1m/5m/25m backoffs) before deferral — the retry-at
+    // execution consumed no attempt.
+    await vi.advanceTimersByTimeAsync(40)
+    expect(execs).toBe(2)
+    await vi.advanceTimersByTimeAsync(JOB_RETRY_BACKOFF_MS[0] + 10)
+    expect(execs).toBe(3)
+    await vi.advanceTimersByTimeAsync(JOB_RETRY_BACKOFF_MS[1] + 10)
+    expect(execs).toBe(4)
+    await vi.advanceTimersByTimeAsync(JOB_RETRY_BACKOFF_MS[2] + 10)
+    expect(execs).toBe(5)
+    const after = row('q1')
+    expect(after.status).toBe('deferred')
+    expect(after.attempts).toBe(5) // lifetime count stays honest
+    expect(after.last_error).toContain('deferred after 4 attempts') // the round never saw the retry-at exec
+  })
+
+  it('retryDeferred re-runs a deferred task now with a fresh round (§4.E retry_task)', async () => {
+    const queue = makeQueue()
+    const ran: string[] = []
+    queue.registerHandler('probe', (payload, ctx) => {
+      ran.push(`${ctx.taskId}:${String(payload['tag'])}`)
+      return Promise.resolve()
+    })
+    queue.start()
+    // A task deferred by a previous round, simulated directly in the mirror
+    // (same approach as the reload test — start() already ran, so only
+    // retryDeferred can bring it back this launch).
+    appData.db
+      .prepare(
+        `INSERT INTO tasks (id, kind, payload_json, status, attempts, priority, last_error)
+         VALUES ('rd1', 'probe', '{"tag":"x"}', 'deferred', 4, 0, 'deferred after 4 attempts')`
+      )
+      .run()
+    expect(queue.retryDeferred('rd1')).toEqual({ taskId: 'rd1', status: 'pending' })
+    expect(row('rd1').status).toBe('pending')
+    expect(row('rd1').last_error).toBeNull() // fresh round, slate wiped
+    await tick()
+    expect(ran).toEqual(['rd1:x']) // payload survived the round trip
+    expect(row('rd1').status).toBe('done')
+  })
+
+  it('retryDeferred guards: NOT_FOUND / wrong status / no handler / approval-parked', async () => {
+    const queue = makeQueue()
+    queue.registerHandler('probe', () => Promise.resolve())
+    queue.start()
+    const codeOf = (fn: () => unknown): string | null => {
+      try {
+        fn()
+      } catch (err) {
+        return err instanceof TaskRetryError ? err.code : `not-a-TaskRetryError: ${String(err)}`
+      }
+      return null
+    }
+    // Unknown id.
+    expect(codeOf(() => queue.retryDeferred('ghost'))).toBe('NOT_FOUND')
+    // Wrong status (§4.E: pending/running/done are INVALID_STATE).
+    const insert = appData.db.prepare(
+      `INSERT INTO tasks (id, kind, payload_json, status, attempts, priority, waiting_approval_id)
+       VALUES (?, 'probe', '{}', ?, 0, 0, ?)`
+    )
+    insert.run('rd-done', 'done', null)
+    expect(codeOf(() => queue.retryDeferred('rd-done'))).toBe('INVALID_STATE')
+    expect(() => queue.retryDeferred('rd-done')).toThrow(/not 'deferred'/)
+    // Deferred, but its kind has no handler this launch.
+    insert.run('rd-alien', 'deferred', null)
+    appData.db.prepare(`UPDATE tasks SET kind = 'alien' WHERE id = 'rd-alien'`).run()
+    expect(codeOf(() => queue.retryDeferred('rd-alien'))).toBe('INVALID_STATE')
+    expect(() => queue.retryDeferred('rd-alien')).toThrow(/no handler registered/)
+    // Parked behind a pending §13 approval: the human decides, not retry_task.
+    insert.run('rd-parked', 'deferred', 'apr-parked')
+    expect(codeOf(() => queue.retryDeferred('rd-parked'))).toBe('INVALID_STATE')
+    expect(() => queue.retryDeferred('rd-parked')).toThrow(/approval 'apr-parked'/)
+    // None of the refused rows were touched.
+    expect(row('rd-done').status).toBe('done')
+    expect(row('rd-alien').status).toBe('deferred')
+    expect(row('rd-parked')).toMatchObject({ status: 'deferred', waiting_approval_id: 'apr-parked' })
+    await tick()
+  })
+
+  it('an ExtractionUnavailableError-throwing handler retries and DEFERS — never done, never failed (P0.1)', async () => {
+    const queue = makeQueue()
+    let attempts = 0
+    queue.registerHandler('extraction-sim', () => {
+      attempts += 1
+      throw new ExtractionUnavailableError('extraction: all 3 local fuzzy-pass calls failed')
+    })
+    queue.start()
+    queue.enqueue({ id: 'extract-p01', kind: 'extraction-sim' })
+    await tick()
+    // Retryable, not fatal: the first failure re-pends with the §20 backoff.
+    expect(row('extract-p01').status).toBe('pending')
+    await vi.advanceTimersByTimeAsync(JOB_RETRY_BACKOFF_MS[0] + 10)
+    await vi.advanceTimersByTimeAsync(JOB_RETRY_BACKOFF_MS[1] + 10)
+    await vi.advanceTimersByTimeAsync(JOB_RETRY_BACKOFF_MS[2] + 10)
+    expect(attempts).toBe(4)
+    const after = row('extract-p01')
+    expect(after.status).toBe('deferred') // NOT 'done' (silent loss) and NOT 'failed' (unretryable)
+    expect(after.last_error).toContain('fuzzy-pass calls failed')
+    // …and §4.E retryDeferred hands the exactly-once token a fresh round.
+    expect(queue.retryDeferred('extract-p01')).toEqual({ taskId: 'extract-p01', status: 'pending' })
+    await tick()
+    expect(attempts).toBe(5)
+    expect(row('extract-p01').status).toBe('pending') // failing again → a new backoff round, still not lost
   })
 })
