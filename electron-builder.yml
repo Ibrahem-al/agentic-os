@@ -113,6 +113,10 @@ win:
 
 # Recorded picks: oneClick per-user install (background cockpit app — no
 # elevation prompt, no install wizard).
+# Reinstall guard: build/installer.nsh (auto-included from buildResources)
+# defines a `preInit` macro that PROMPTS before replacing an existing install
+# (Yes → remove-and-reinstall, keeping user data; No → cancel). /SD IDYES keeps
+# electron-updater's silent auto-update working. See that file's header.
 nsis:
   oneClick: true
   perMachine: false
