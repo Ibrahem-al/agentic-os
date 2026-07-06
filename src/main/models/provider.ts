@@ -411,7 +411,10 @@ export class ProviderRouter {
   }
 
   private snapshot(): ModelSettings {
-    if (this.cached === null) this.cached = this.deps.loadSnapshot()
+    if (this.cached === null) {
+      this.cached = this.deps.loadSnapshot()
+      this.warnOnResolutionHazards(this.cached)
+    }
     return this.cached
   }
 
@@ -435,8 +438,18 @@ export class ProviderRouter {
     } else {
       desired = def.today
     }
-    // §11.4 HARD-local clamp: never subscription, whatever asked for it.
-    if (def.hardLocal && desired === 'subscription-claude') desired = 'local-qwen3'
+    // §11.4 HARD-local clamp. phase-20 §10.4: an EXPLICIT per-role override to
+    // subscription is HONORED for the two retrieval roles (the retrieval loop then
+    // forces a single critic pass — see retrievalForcesSingleIteration — so a live
+    // get_context can't fan out to ~9 subscription spawns). Every OTHER HARD-local
+    // role stays clamped to local, and the GLOBAL toggle never moves any HARD-local
+    // role (subscribable=false, handled above) — so a default install is unchanged
+    // and only a deliberate retrieval override reaches the subscription tier.
+    if (def.hardLocal && desired === 'subscription-claude') {
+      const honoredRetrievalOverride =
+        override === 'subscription-claude' && (role === 'retrieval.critic' || role === 'retrieval.rewrite')
+      if (!honoredRetrievalOverride) desired = 'local-qwen3'
+    }
     return desired
   }
 
@@ -459,7 +472,10 @@ export class ProviderRouter {
    * (only if a key exists) → local-qwen3 (always).
    */
   private route(role: RoleKey): { backend: ReasoningBackend; model: string; provider: ReasoningProvider } {
-    const s = this.snapshot()
+    return this.routeWith(this.snapshot(), role)
+  }
+
+  private routeWith(s: ModelSettings, role: RoleKey): { backend: ReasoningBackend; model: string; provider: ReasoningProvider } {
     let desired = this.desiredBackend(role, s)
 
     if (desired === 'subscription-claude') {
@@ -482,6 +498,62 @@ export class ProviderRouter {
   resolve(role: RoleKey): ResolvedRoute {
     const r = this.route(role)
     return { role, backend: r.backend, model: r.model }
+  }
+
+  /**
+   * §10.4: true when either retrieval role currently resolves to the subscription
+   * tier — only possible via a deliberate per-role override (honored in
+   * desiredBackend). The retrieval loop reads this to clamp to a SINGLE critic
+   * pass (one critic, no rewrite loop) so a live get_context can't fan out to ~9
+   * subscription spawns and trip the client MCP timeout. Default/local/cloud
+   * resolution → false → the normal LOOP_MAX_ITERATIONS.
+   */
+  retrievalForcesSingleIteration(): boolean {
+    const s = this.snapshot()
+    return (
+      this.routeWith(s, 'retrieval.critic').backend === 'subscription-claude' ||
+      this.routeWith(s, 'retrieval.rewrite').backend === 'subscription-claude'
+    )
+  }
+
+  /**
+   * Best-effort advisory logging fired once per snapshot load (boot + after each
+   * invalidate). NEVER affects routing and NEVER throws — a pathological
+   * `makeCloud` is swallowed so resolution is unaffected.
+   *
+   *  - P1.11: §17 wants the stylistic comparator on a DIFFERENT model/tier from
+   *    the candidate rewriter (self-judging bias). Warn when they resolve to the
+   *    same NON-local backend+model. (On local the comparator is inert — the
+   *    stylistic benchmark runs no cloud judging — so there is nothing to warn.)
+   *  - §10.4 honor-with-warning: a deliberate subscription override on a retrieval
+   *    role is honored (unlike other HARD-local roles) but is single-iteration.
+   */
+  private warnOnResolutionHazards(s: ModelSettings): void {
+    try {
+      const rewrite = this.routeWith(s, 'skills.rewrite')
+      const comparator = this.routeWith(s, 'skills.comparator')
+      if (
+        rewrite.backend !== 'local-qwen3' &&
+        rewrite.backend === comparator.backend &&
+        rewrite.model === comparator.model
+      ) {
+        console.warn(
+          `[provider] skills.rewrite and skills.comparator both resolve to ${rewrite.backend} / ${rewrite.model} — ` +
+            '§17 expects the stylistic comparator on a different model/tier from the candidate rewriter ' +
+            '(self-judging bias). Advisory only; the majority + zero-regression benchmark gate still applies.'
+        )
+      }
+      for (const role of ['retrieval.critic', 'retrieval.rewrite'] as const) {
+        if (this.routeWith(s, role).backend === 'subscription-claude') {
+          console.warn(
+            `[provider] ${role} is overridden to subscription-claude — the retrieval loop runs a SINGLE critic ` +
+              'pass (no rewrite loop) to bound live get_context egress/latency (§10.4).'
+          )
+        }
+      }
+    } catch {
+      // advisory only — never let a logging probe affect resolution
+    }
   }
 
   /** Resolve the role and complete the request against its backend. */

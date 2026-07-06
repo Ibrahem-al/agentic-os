@@ -66,6 +66,14 @@ export { SKILL_IMPROVEMENT_AGENT_ID }
 
 export const CLOUD_UNAVAILABLE_ERROR = 'cloud tier unavailable — configure an API key in settings to generate candidates'
 
+/**
+ * P1.8: the role whose resolved model id is recorded as "the model that produced
+ * this adoption". `skills.rewrite` authors the candidate and rides the
+ * subscription tier when the runner is on (so it mirrors runner_runs.model);
+ * on a keyed default it is the cloud model; keyless it falls back to local.
+ */
+const MODEL_BOOKKEEPING_ROLE: RoleKey = 'skills.rewrite'
+
 export interface RunImprovementOptions {
   /** Improve one skill (the manual trigger); omitted = the nightly event gate. */
   readonly skillId?: string
@@ -127,11 +135,18 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
       name: 'plan',
       async run(state): Promise<JsonObject> {
         const input = state as unknown as ImprovementInput
+        // P1.8: resolve the run's reasoning model ONCE (skills.rewrite — the role
+        // that authors the candidate, and the one that rides the subscription
+        // when the runner is on, mirroring runner_runs.model). Stamped into every
+        // benchmark_json below AND used as the drift window's END-point model.
+        // No router (today / every fake-injecting test) → null → no bookkeeping.
+        const resolvedModel = deps.router?.resolve(MODEL_BOOKKEEPING_ROLE).model ?? null
         const plan = await planImprovementRun({
           engine: deps.engine,
           db: deps.db,
           mode: input.mode,
-          skillId: input.skillId
+          skillId: input.skillId,
+          currentModel: resolvedModel
         })
         return { plan } as unknown as JsonObject
       }
@@ -390,7 +405,8 @@ async function performWrite(options: WriteOptions): Promise<SkillImprovementResu
           benchmark: benchmarkJson,
           reason: `net-positive on held-out (${(summary.heldoutScore?.candidate ?? 0).toFixed(2)} vs ${(summary.heldoutScore?.active ?? 0).toFixed(2)}) with zero regressions`,
           jobId: options.jobId,
-          adoptedAtIso: new Date().toISOString()
+          adoptedAtIso: new Date().toISOString(),
+          model: plan.resolvedModel
         })
         processed.push({
           skillId: item.skillId,
@@ -423,7 +439,8 @@ async function performWrite(options: WriteOptions): Promise<SkillImprovementResu
           benchmark: benchmarkJson,
           reason,
           jobId: options.jobId,
-          adoptedAtIso: null
+          adoptedAtIso: null,
+          model: plan.resolvedModel
         })
         processed.push({
           skillId: item.skillId,
@@ -468,7 +485,8 @@ async function performWrite(options: WriteOptions): Promise<SkillImprovementResu
         benchmark: benchmarkJson,
         reason: 'awaiting review-queue approval',
         jobId: options.jobId,
-        adoptedAtIso: null
+        adoptedAtIso: null,
+        model: plan.resolvedModel
       })
       processed.push({
         skillId: item.skillId,
@@ -499,10 +517,21 @@ async function performWrite(options: WriteOptions): Promise<SkillImprovementResu
         newRate: finding.newRate,
         predecessorRate: finding.predecessorRate,
         usesObserved: finding.usesObserved,
-        correctionsObserved: finding.correctionsObserved
+        correctionsObserved: finding.correctionsObserved,
+        // P1.8: stamp the drift window's endpoint models so the flag is auditable.
+        ...(finding.benchmarkModel !== null ? { benchmarkModel: finding.benchmarkModel } : {}),
+        ...(finding.currentModel !== null ? { currentModel: finding.currentModel } : {}),
+        ...(finding.modelChangedMidWindow ? { modelChangedMidWindow: true } : {})
       }
     })
-    if (finding.autoRevert) {
+    // P1.8: a global model bump mid-window confounds the drift signal — FLAG only,
+    // never auto-revert, regardless of the per-skill autoRevert setting.
+    if (finding.modelChangedMidWindow && finding.autoRevert) {
+      warnings.push(
+        `${finding.skillId}: drift auto-revert suppressed — reasoning model changed mid-window (${finding.benchmarkModel ?? '?'} → ${finding.currentModel ?? '?'}); a global model bump must not auto-revert a skill; flag stands`
+      )
+    }
+    if (finding.autoRevert && !finding.modelChangedMidWindow) {
       // Resume safety: the revert must target EXACTLY the flagged adoption.
       // If it was already rolled back (a re-run write step) or a newer
       // adoption has superseded it, rolling back "the latest standing

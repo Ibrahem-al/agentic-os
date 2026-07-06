@@ -36,6 +36,15 @@ jobs:
         continue-on-error: true
         run: node scripts/diag/ryu-vector-probe.mjs "${{ runner.temp }}/ryu-probe" resources/extensions/v25.9.0
 
+      # Subscription-runner CLI canary (phase 20; P2, GATED). Detects upstream
+      # drift in the `claude -p --output-format json` envelope the runner parses.
+      # `claude` is deliberately NOT installed in CI, so this ALWAYS prints
+      # "skipped: claude not installed" and exits 0 here — it only makes a real
+      # call on a machine where `claude` is resolvable. Non-gating regardless.
+      - name: Runner CLI canary (diagnostic, non-gating, gated on claude)
+        continue-on-error: true
+        run: node scripts/diag/runner-canary.mjs
+
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test

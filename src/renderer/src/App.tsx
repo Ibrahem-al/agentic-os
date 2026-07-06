@@ -70,6 +70,41 @@ const fetchDriftCount = async (): Promise<number> => {
 }
 
 /**
+ * Review throughput this week (P1.7) — staged vs decided over the last 7 days,
+ * shown in the rail so `stageAll` backlog growth is visible from any panel
+ * without opening the review queue. staged > decided ⇒ the queue is growing.
+ * Polls every 20s; failures keep the last value (the review panel reports detail).
+ */
+function useReviewWeek(): { staged: number; decided: number } {
+  const [week, setWeek] = useState({ staged: 0, decided: 0 })
+  useEffect(() => {
+    let cancelled = false
+    const refresh = async (): Promise<void> => {
+      try {
+        const rows = await call('review.staged.list', {})
+        const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
+        let staged = 0
+        let decided = 0
+        for (const row of rows) {
+          if (Date.parse(row.createdAt) >= weekAgo) staged += 1
+          if (row.decidedAt !== null && Date.parse(row.decidedAt) >= weekAgo) decided += 1
+        }
+        if (!cancelled) setWeek({ staged, decided })
+      } catch {
+        // Review subsystem unavailable this poll — keep the last value.
+      }
+    }
+    void refresh()
+    const timer = setInterval(() => void refresh(), 20_000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [])
+  return week
+}
+
+/**
  * Poll the runner health snapshot (phase 17) every 20s; failures keep the last
  * value (the settings panel reports detail). OFF by default → enabled:false →
  * the banner never shows and a keyless install is unchanged.
@@ -178,6 +213,7 @@ export default function App(): React.JSX.Element {
   const [active, setActive] = useState<PanelKey>('memory')
   const pending = usePolledCount(fetchPendingCount)
   const drift = usePolledCount(fetchDriftCount)
+  const week = useReviewWeek()
   const { status: runnerStatus, refresh: refreshRunner } = useRunnerStatus()
   const ActivePanel = PANELS.find((p) => p.key === active)?.component ?? MemoryPanel
 
@@ -238,6 +274,13 @@ export default function App(): React.JSX.Element {
               )
             })}
           </ul>
+          <div className="border-t border-line px-4 py-2.5">
+            <div className="font-mono text-[11px] text-ink-faint" data-testid="review-week-counter">
+              this week{' '}
+              <span className={week.staged > week.decided ? 'text-warn' : 'text-ink-mute'}>staged {week.staged}</span>{' '}
+              · <span className="text-ink-mute">decided {week.decided}</span>
+            </div>
+          </div>
           <SubsystemStatus />
         </nav>
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">

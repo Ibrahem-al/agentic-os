@@ -66,6 +66,7 @@ import {
   listStagedWrites,
   rejectStagedWriteWithEffects,
   renderStagedWriteDiff,
+  stagedWriteRequiresEmbedder,
   type InjectionScanner
 } from './security'
 import {
@@ -297,7 +298,8 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         validation: row.validation === null ? null : jsonObject(row.validation),
         createdAt: row.createdAt,
         decidedAt: row.decidedAt,
-        committedAt: row.committedAt
+        committedAt: row.committedAt,
+        requiresEmbedder: stagedWriteRequiresEmbedder(row)
       })
     )
   })

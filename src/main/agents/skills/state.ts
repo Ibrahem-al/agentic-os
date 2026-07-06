@@ -148,8 +148,16 @@ export function recordImprovement(
     reason: string
     jobId: string
     adoptedAtIso: string | null
+    /**
+     * P1.8: the reasoning model resolved for this run. When present it is stamped
+     * into benchmark_json as `model`, so a later drift scan can tell whether the
+     * model changed mid-window (and refuse to auto-revert if it did). Null/absent
+     * (no router) → benchmark_json is unchanged from before P1.8.
+     */
+    model?: string | null
   }
 ): void {
+  const benchmark = entry.model != null ? { ...entry.benchmark, model: entry.model } : entry.benchmark
   db.prepare(
     `INSERT INTO skill_improvements
        (id, skill_id, candidate_version_id, predecessor_version_id, predecessor_instructions,
@@ -166,7 +174,7 @@ export function recordImprovement(
     entry.predecessorInstructions,
     entry.mode,
     entry.outcome,
-    JSON.stringify(entry.benchmark),
+    JSON.stringify(benchmark),
     entry.reason,
     entry.jobId,
     entry.adoptedAtIso

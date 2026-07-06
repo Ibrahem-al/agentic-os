@@ -41,6 +41,7 @@ export {
   rejectStagedWrite,
   rejectStagedWriteWithEffects,
   renderStagedWriteDiff,
+  stagedWriteRequiresEmbedder,
   StagedWriteError,
   type ApproveResult,
   type CommitEmbedder,

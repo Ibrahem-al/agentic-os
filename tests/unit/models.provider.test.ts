@@ -11,7 +11,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CLOUD_DEFAULT_MODELS, RUNNER_MODEL_DEFAULT, SMALL_LLM_MODEL } from '../../src/main/config'
 import type { ProjectSummarizer } from '../../src/main/ingest/codebase'
 import type { SummarizerLlm } from '../../src/main/kernel/types'
@@ -377,5 +377,94 @@ describe('forRole() — one object satisfies all six structural interfaces', () 
     await reasoner.generate('b')
     expect(lastSub).toBeNull() // did NOT go subscription
     expect(lastCloud).not.toBeNull() // went cloud (skills.rewrite today tier)
+  })
+})
+
+// ── P1.11 independence warning (skills.rewrite vs skills.comparator) ──────────
+
+describe('P1.11 — warns when the rewriter and stylistic comparator are the same model/tier', () => {
+  it('warns once (per snapshot load) on a keyed default where both resolve to the same cloud model', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const router = makeRouter() // key present → rewrite + comparator both cloud-api / same model
+      router.resolve('skills.rewrite') // first resolve triggers the snapshot-load check
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(String(warn.mock.calls[0]?.[0])).toContain('skills.rewrite and skills.comparator')
+      // The cached snapshot is not re-checked → no duplicate warning on later resolves.
+      router.resolve('skills.comparator')
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('does NOT warn when the comparator is pinned to a different model (§17 independence preserved)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      snapshot = { ...defaultModelSettings(), reasoning: { backend: 'local-qwen3', models: { 'skills.comparator': 'claude-different-judge' } } }
+      makeRouter().resolve('skills.rewrite')
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('does NOT warn on a keyless install (both roles resolve local; the comparator is inert)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      hasKey = false
+      makeRouter().resolve('skills.rewrite')
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+})
+
+// ── §10.4 retrieval single-iteration clamp on a subscription override ─────────
+
+describe('§10.4 — retrieval roles honor a subscription override, and force single-iteration', () => {
+  /** Explicit per-role subscription override, subscription available (enabled+healthy+injected). */
+  function overrideRetrievalToSubscription(overrides: Partial<Record<RoleKey, 'subscription-claude'>>): void {
+    snapshot = {
+      ...defaultModelSettings(),
+      reasoning: { backend: 'local-qwen3', overrides },
+      runner: { ...runnerDefaults(), enabled: true }
+    }
+    healthy = true
+  }
+
+  it('HONORS an explicit subscription override on a retrieval role (unlike other HARD roles)', () => {
+    overrideRetrievalToSubscription({ 'retrieval.critic': 'subscription-claude' })
+    const router = makeRouter()
+    expect(router.resolve('retrieval.critic').backend).toBe('subscription-claude')
+    // The un-overridden sibling stays local; the GLOBAL toggle never moves it.
+    expect(router.resolve('retrieval.rewrite').backend).toBe('local-qwen3')
+    // And a NON-retrieval HARD role's subscription override is STILL clamped (unchanged §11.4).
+    router.invalidate()
+    snapshot = {
+      ...snapshot,
+      reasoning: { backend: 'local-qwen3', overrides: { 'retrieval.critic': 'subscription-claude', 'skills.grader': 'subscription-claude' } }
+    }
+    expect(makeRouter().resolve('skills.grader').backend).toBe('local-qwen3')
+  })
+
+  it('forces single-iteration exactly when a retrieval role resolves to subscription', () => {
+    // Default: both retrieval roles local → no clamp.
+    expect(makeRouter().retrievalForcesSingleIteration()).toBe(false)
+
+    // Critic overridden + subscription available → clamp forced.
+    overrideRetrievalToSubscription({ 'retrieval.critic': 'subscription-claude' })
+    expect(makeRouter().retrievalForcesSingleIteration()).toBe(true)
+
+    // Rewrite overridden + subscription available → clamp forced.
+    overrideRetrievalToSubscription({ 'retrieval.rewrite': 'subscription-claude' })
+    expect(makeRouter().retrievalForcesSingleIteration()).toBe(true)
+
+    // Overridden but subscription UNAVAILABLE (runner unhealthy) → falls back off
+    // subscription → no real fan-out → no clamp.
+    overrideRetrievalToSubscription({ 'retrieval.critic': 'subscription-claude' })
+    healthy = false
+    expect(makeRouter().retrievalForcesSingleIteration()).toBe(false)
   })
 })

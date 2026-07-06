@@ -305,4 +305,36 @@ describe('router-injected critic/rewrite (phase-16b, §11.4 HARD-local)', () => 
     expect(bundle.haltReason).toBe('passed')
     expect(local.criticCalls).toHaveLength(1) // ran on local despite subscription ON
   })
+
+  it('§10.4: a deliberate subscription OVERRIDE on the retrieval roles clamps to one critic pass', async () => {
+    // Explicit per-role override (not the global toggle) → honored → subscription.
+    // A low critic score would normally rewrite and loop to LOOP_MAX_ITERATIONS;
+    // the §10.4 clamp forces a SINGLE critic pass so a live get_context can't fan
+    // out to ~9 subscription spawns and trip the client MCP timeout.
+    let subCalls = 0
+    const { retriever, local } = routerRetrieverWith([], {
+      loadSnapshot: () => ({
+        ...defaultModelSettings(),
+        reasoning: {
+          backend: 'local-qwen3',
+          overrides: { 'retrieval.critic': 'subscription-claude', 'retrieval.rewrite': 'subscription-claude' }
+        },
+        runner: { enabled: true, model: RUNNER_MODEL_DEFAULT, stageAll: true, mode: 'completion', injectionPolicy: 'downgrade' }
+      }),
+      makeCloud: () => null, // roles go to subscription, not cloud; avoid the throwing default
+      subscriptionComplete: async () => {
+        subCalls += 1
+        return { text: score(2, 'thin bundle') } // low → would rewrite+loop WITHOUT the clamp
+      },
+      runnerHealthy: () => true
+    })
+
+    const bundle = await retriever.retrieve('deploy the aurora storefront', [], { taskId: 'live:sess-clamp' })
+
+    expect(bundle.iterations).toBe(1)
+    expect(bundle.haltReason).toBe('max-iterations')
+    expect(subCalls).toBe(1) // exactly one critic call; the rewrite loop never started
+    expect(local.criticCalls).toHaveLength(0) // critic ran on subscription, not local
+    expect(local.rewriteCalls).toHaveLength(0)
+  })
 })

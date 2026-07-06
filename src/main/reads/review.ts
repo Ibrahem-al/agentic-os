@@ -15,6 +15,7 @@ import {
   getStagedWrite,
   listStagedWrites,
   renderStagedWriteDiff,
+  stagedWriteRequiresEmbedder,
   type ApprovalRow,
   type StagedWriteRow
 } from '../security'
@@ -38,7 +39,8 @@ const stagedWriteDto = (row: StagedWriteRow): StagedWriteDto => ({
   validation: row.validation === null ? null : jsonObject(row.validation),
   createdAt: row.createdAt,
   decidedAt: row.decidedAt,
-  committedAt: row.committedAt
+  committedAt: row.committedAt,
+  requiresEmbedder: stagedWriteRequiresEmbedder(row)
 })
 
 export interface ListStagedWritesArgs {

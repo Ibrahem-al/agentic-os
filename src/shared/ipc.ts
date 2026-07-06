@@ -118,6 +118,13 @@ export interface StagedWriteDto {
   readonly createdAt: string
   readonly decidedAt: string | null
   readonly committedAt: string | null
+  /**
+   * §9.2 preflight (P1.7): committing this row needs a live embedder — true only
+   * for an extraction CREATE that computes an embedding at commit (a new
+   * retrievable node). The approve UI reads this to warn, not error, when Ollama
+   * is down at click time (esp. under stageAll). False for every other row.
+   */
+  readonly requiresEmbedder: boolean
 }
 
 export interface ApprovalDto {

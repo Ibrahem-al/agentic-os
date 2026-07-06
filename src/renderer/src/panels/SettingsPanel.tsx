@@ -49,6 +49,32 @@ function errMessage(err: unknown): string {
   return err instanceof IpcError ? err.message : String(err)
 }
 
+/**
+ * First-enable consent (P1.10 / §10.7). The runner ships OFF; the first time the
+ * user turns it on we require an explicit acknowledgement of the egress before
+ * the toggle persists. "First" is remembered in renderer localStorage (Node-free)
+ * so a later off→on does not re-nag someone who already consented. A pre-enabled
+ * install (config already on) seeds the flag so it never prompts retroactively.
+ */
+const RUNNER_CONSENT_KEY = 'agentic-os:runner-egress-consent'
+
+function hasRunnerConsent(): boolean {
+  try {
+    return localStorage.getItem(RUNNER_CONSENT_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function markRunnerConsent(): void {
+  try {
+    localStorage.setItem(RUNNER_CONSENT_KEY, '1')
+  } catch {
+    // Storage unavailable (private mode / disabled) — consent degrades to
+    // per-session: the dialog simply shows again on the next enable, which is safe.
+  }
+}
+
 export default function SettingsPanel(): React.JSX.Element {
   const toast = useToast()
   const query = useIpc('settings.get', undefined)
@@ -78,6 +104,9 @@ export default function SettingsPanel(): React.JSX.Element {
   const [runnerBusy, setRunnerBusy] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<RunnerTestConnectionDto | null>(null)
+  // First-enable §10.7 egress consent (P1.10).
+  const [consentOpen, setConsentOpen] = useState(false)
+  const [consentAck, setConsentAck] = useState(false)
 
   const installHook = async (): Promise<void> => {
     setInstallingHook(true)
@@ -108,6 +137,9 @@ export default function SettingsPanel(): React.JSX.Element {
     setProvider(fresh.cloudProvider)
     setModelOverride(fresh.cloudModels[fresh.cloudProvider] ?? '')
     setSmallLlm(fresh.smallLlmModel ?? '')
+    // A runner that is already on has, by definition, been consented to — seed
+    // the flag so a later off→on is never re-prompted retroactively.
+    if (fresh.runner?.enabled === true) markRunnerConsent()
   }
 
   useEffect(() => {
@@ -171,6 +203,26 @@ export default function SettingsPanel(): React.JSX.Element {
     } finally {
       setRunnerBusy(false)
     }
+  }
+
+  /**
+   * Enable-toggle gate (P1.10): the first time the runner is turned ON, require
+   * the §10.7 egress acknowledgement before it persists. Turning OFF, or turning
+   * ON after a prior consent, persists immediately.
+   */
+  const handleRunnerToggle = (next: boolean): void => {
+    if (next && !hasRunnerConsent()) {
+      setConsentAck(false)
+      setConsentOpen(true)
+      return
+    }
+    void saveRunner({ enabled: next })
+  }
+
+  const confirmRunnerConsent = (): void => {
+    markRunnerConsent()
+    setConsentOpen(false)
+    void saveRunner({ enabled: true })
   }
 
   /** Manual 1-turn canary (§3.7 — never scheduled); refresh the status after. */
@@ -415,7 +467,7 @@ export default function SettingsPanel(): React.JSX.Element {
                 testId="settings-runner-enable"
                 checked={runnerCfg.enabled}
                 disabled={runnerBusy}
-                onChange={(next) => void saveRunner({ enabled: next })}
+                onChange={handleRunnerToggle}
               />
               <span className="text-[13px]">{runnerCfg.enabled ? 'enabled' : 'disabled'}</span>
               <div className="ml-auto">
@@ -479,8 +531,8 @@ export default function SettingsPanel(): React.JSX.Element {
               )}
             </div>
             <div className="text-[11px] text-ink-faint">
-              test connection runs one manual 1-turn canary against the claude cli. it is never scheduled. the full
-              consent dialog, quota history, and run log arrive next.
+              test connection runs one manual 1-turn canary against the claude cli. it is never scheduled. quota
+              history and the run log are not surfaced here yet.
             </div>
           </div>
         </section>
@@ -566,6 +618,49 @@ export default function SettingsPanel(): React.JSX.Element {
           </div>
         </section>
       </div>
+
+      {consentOpen && (
+        <Modal
+          title="enable subscription runner"
+          onClose={() => setConsentOpen(false)}
+          footer={
+            <>
+              <Button onClick={() => setConsentOpen(false)}>cancel</Button>
+              <Button
+                variant="primary"
+                testId="settings-runner-consent-confirm"
+                disabled={!consentAck}
+                onClick={confirmRunnerConsent}
+              >
+                enable runner
+              </Button>
+            </>
+          }
+        >
+          <div className="flex flex-col gap-3 text-[13px] leading-6" data-testid="settings-runner-consent">
+            <p>
+              With the subscription runner enabled, the text being reasoned about — session transcripts, skill
+              feedback, and (if you opt those roles in) retrieved memory snippets — is sent to Anthropic under your
+              Claude account, the same vendor your Claude Code sessions already go to.
+            </p>
+            <p className="text-ink-mute">
+              Your memory graph, embeddings, and search index never leave your machine.
+            </p>
+            <label className="mt-1 flex items-center gap-2 text-[12px]">
+              <input
+                type="checkbox"
+                aria-label="I understand what is sent to Anthropic"
+                data-testid="settings-runner-consent-ack"
+                checked={consentAck}
+                onChange={(e) => setConsentAck(e.target.checked)}
+                className="size-3.5"
+                style={{ accentColor: 'var(--color-accent)' }}
+              />
+              <span>I understand what is sent to Anthropic.</span>
+            </label>
+          </div>
+        </Modal>
+      )}
 
       {keyModal !== null && (
         <Modal

@@ -143,6 +143,13 @@ export interface PlanOptions {
   /** Required in manual mode: the one skill to improve. */
   readonly skillId?: string | null
   readonly now?: Date
+  /**
+   * P1.8: the reasoning model (skills.rewrite) resolved for THIS run — the drift
+   * window's END-point model + the value stamped into every benchmark_json the
+   * write step records. Null (default) when no router is injected → today's
+   * behavior (no model comparison; drift never suppressed).
+   */
+  readonly currentModel?: string | null
 }
 
 /** The event gate + drift scan — everything the later steps need, read-only. */
@@ -205,16 +212,22 @@ export async function planImprovementRun(options: PlanOptions): Promise<PlanStat
     })
   }
 
-  const drift = options.mode === 'nightly' ? await scanDrift(options.engine, options.db, now) : []
-  return { mode: options.mode, runStartedAt, work, skipped, drift, warnings }
+  const currentModel = options.currentModel ?? null
+  const drift = options.mode === 'nightly' ? await scanDrift(options.engine, options.db, now, currentModel) : []
+  return { mode: options.mode, runStartedAt, work, skipped, drift, warnings, resolvedModel: currentModel }
 }
 
 // ── §20 drift watch: corrections rate over the next 20 uses vs predecessor ──
 
-export async function scanDrift(engine: StorageEngine, db: BetterSqlite3.Database, now: Date): Promise<DriftFinding[]> {
+export async function scanDrift(
+  engine: StorageEngine,
+  db: BetterSqlite3.Database,
+  now: Date,
+  currentModel: string | null = null
+): Promise<DriftFinding[]> {
   const findings: DriftFinding[] = []
   for (const adoption of listOpenDriftWatches(db)) {
-    const finding = await evaluateDrift(engine, db, adoption, now)
+    const finding = await evaluateDrift(engine, db, adoption, now, currentModel)
     if (finding !== null) findings.push(finding)
   }
   return findings
@@ -224,7 +237,8 @@ async function evaluateDrift(
   engine: StorageEngine,
   db: BetterSqlite3.Database,
   adoption: ImprovementRow,
-  now: Date
+  now: Date,
+  currentModel: string | null
 ): Promise<DriftFinding | null> {
   const adoptedAt = adoption.adoptedAt
   if (adoptedAt === null) return null
@@ -252,6 +266,14 @@ async function evaluateDrift(
   const watchComplete = useTimes.length >= DRIFT_WATCH_USES
   const settings = getSkillSettings(db, adoption.skillId)
 
+  // P1.8: the model the adoption was benchmarked with (stamped into
+  // benchmark_json) vs the model resolved for this scan. A mismatch means a
+  // global model bump happened mid-window — the drift signal is confounded, so
+  // the write step must FLAG only, never auto-revert.
+  const benchmarkModel = typeof adoption.benchmark['model'] === 'string' ? (adoption.benchmark['model'] as string) : null
+  const modelChangedMidWindow = benchmarkModel !== null && currentModel !== null && benchmarkModel !== currentModel
+  const modelFields = { benchmarkModel, currentModel, modelChangedMidWindow }
+
   if (newRate > predecessorRate) {
     return {
       improvementId: adoption.id,
@@ -263,7 +285,8 @@ async function evaluateDrift(
       usesObserved,
       correctionsObserved: corrections,
       verdict: 'worse',
-      autoRevert: settings.autoRevert
+      autoRevert: settings.autoRevert,
+      ...modelFields
     }
   }
   if (watchComplete) {
@@ -277,7 +300,8 @@ async function evaluateDrift(
       usesObserved,
       correctionsObserved: corrections,
       verdict: 'cleared',
-      autoRevert: settings.autoRevert
+      autoRevert: settings.autoRevert,
+      ...modelFields
     }
   }
   return null // watch still open, nothing worse yet

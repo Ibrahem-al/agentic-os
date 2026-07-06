@@ -155,6 +155,17 @@ export interface DriftFinding {
   readonly verdict: 'worse' | 'cleared'
   /** Whether the per-skill setting asks for auto-revert on a worse verdict. */
   readonly autoRevert: boolean
+  /**
+   * P1.8 model-version bookkeeping. `benchmarkModel` is the reasoning model
+   * stamped into this adoption's benchmark_json (skills.rewrite at adoption
+   * time); `currentModel` is what that role resolves to NOW (drift-scan time).
+   * When both are known and differ, `modelChangedMidWindow` is set: the drift is
+   * treated as FLAG-ONLY regardless of `autoRevert` — a global model bump must
+   * never auto-revert a skill (the drift signal is confounded).
+   */
+  readonly benchmarkModel: string | null
+  readonly currentModel: string | null
+  readonly modelChangedMidWindow: boolean
 }
 
 export interface PlanState {
@@ -165,6 +176,12 @@ export interface PlanState {
   readonly skipped: readonly SkillSkipNote[]
   readonly drift: readonly DriftFinding[]
   readonly warnings: readonly string[]
+  /**
+   * P1.8: the reasoning model (skills.rewrite) resolved for THIS run, or null
+   * when no router is injected. Stamped into every benchmark_json the write step
+   * records, and passed to scanDrift as the drift window's END-point model.
+   */
+  readonly resolvedModel: string | null
 }
 
 // ── testset step ─────────────────────────────────────────────────────────────

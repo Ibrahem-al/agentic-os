@@ -76,10 +76,15 @@ export function createRetriever(deps: RetrieverDeps): Retriever {
     if (options.spendMeter && options.taskId === undefined) {
       throw new Error('retrieve: options.taskId is required when a spendMeter is provided')
     }
-    const maxIterations = options.maxIterations ?? LOOP_MAX_ITERATIONS
-    if (!Number.isSafeInteger(maxIterations) || maxIterations < 1) {
-      throw new Error(`retrieve: maxIterations must be a positive integer, got ${maxIterations}`)
+    const requestedMax = options.maxIterations ?? LOOP_MAX_ITERATIONS
+    if (!Number.isSafeInteger(requestedMax) || requestedMax < 1) {
+      throw new Error(`retrieve: maxIterations must be a positive integer, got ${requestedMax}`)
     }
+    // §10.4: a deliberate subscription override on retrieval.critic/rewrite forces
+    // a SINGLE critic pass (no rewrite loop) so a live get_context can't fan out to
+    // ~9 subscription spawns and trip the client MCP timeout. Both roles are §11.4
+    // HARD-local by default, so this only bites the explicit override.
+    const maxIterations = deps.router?.retrievalForcesSingleIteration() === true ? 1 : requestedMax
     const passScore = options.passScore ?? RETRIEVAL_CRITIC_PASS_SCORE
     const passOptions: PassOptions = {
       tags,
