@@ -25,6 +25,7 @@ import * as z from 'zod'
 import { INACTIVITY_CHECK_INTERVAL_MS, MCP_INACTIVITY_TIMEOUT_MS, TASK_PRIORITY } from '../config'
 import type { ExtractionAgent } from '../agents'
 import type { JsonObject, WorkflowRunner } from '../kernel'
+import type { ModelSettings } from '../models'
 import { TaskFatalError, type DurableTaskQueue, type EnqueueResult } from './queue'
 
 export const EXTRACTION_TASK_KIND = 'extraction'
@@ -212,10 +213,15 @@ export class InactivityMonitor {
     this.intervalMs = deps.intervalMs ?? INACTIVITY_CHECK_INTERVAL_MS
     // The NOT EXISTS keeps the sweep O(new sessions): ids with ANY extraction
     // task (done, failed, pending — the exactly-once key) never re-surface.
+    // P0.5: exclude a headless RUNNER's own transport sessions (session_kind
+    // 'runner', stamped by McpCallLog.record) — an agent-mode child reads via
+    // read_session/get_pending_work, and its quiet session must NEVER be
+    // recursively extracted. Interactive rows stay NULL and are unaffected.
     this.selectQuiet = deps.db.prepare(
       `SELECT session_id AS sessionId, MAX(started_unix_ms) AS lastUnixMs
        FROM mcp_calls
        WHERE session_id IS NOT NULL
+         AND (session_kind IS NULL OR session_kind != 'runner')
          AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.id = 'extract-' || mcp_calls.session_id)
        GROUP BY session_id
        HAVING MAX(started_unix_ms) <= ?`
@@ -251,9 +257,68 @@ export class InactivityMonitor {
 
 // ── The 'extraction' task handler ────────────────────────────────────────────
 
+/**
+ * Agent-mode routing deps (phase-19; §8 Phase 5). Present ONLY when the runner
+ * booted AND the MCP server is up (boot wires it together with the extraction
+ * agent's own `agentMode` deps); absent ⇒ the handler always runs today's path
+ * ⇒ DEFAULT == TODAY.
+ */
+export interface ExtractionHandlerAgentMode {
+  /** Live settings read — runner.enabled/mode/injectionPolicy/stageAll, per task. */
+  readonly loadSettings: () => ModelSettings
+  /** The subscription runner's live health gate (the §8 Phase 5 precondition). */
+  readonly runner: { isHealthy(): boolean }
+  /**
+   * P1.6: scan the transcript with the regex-tier scanner, persist findings to
+   * injection_flags (source `runner:<taskId>`), and return whether it flagged.
+   * Built at boot over a regex-only InjectionScanner + parseTranscriptFile.
+   */
+  readonly scanTranscript: (transcriptPath: string, taskId: string) => Promise<boolean>
+}
+
 export interface ExtractionHandlerDeps {
   readonly agent: ExtractionAgent
   readonly runner: WorkflowRunner
+  /**
+   * Phase-19: when present, a PRIMARY extraction may route to agent mode (spawn a
+   * headless `claude -p` that connects back + stages). Absent ⇒ today's path.
+   */
+  readonly agentMode?: ExtractionHandlerAgentMode
+}
+
+/**
+ * Decide whether a primary extraction runs in AGENT MODE (§8 Phase 5) or today's
+ * path. Agent mode requires the runner enabled + healthy + mode 'agent' (read
+ * live so a settings change applies to the next session). P1.6: the transcript
+ * is scanned once (findings persisted to injection_flags regardless of policy);
+ * under the default 'downgrade' policy a flagged transcript falls back to
+ * completion mode (no tools mounted — blast radius collapses to staged items). A
+ * scan failure never blocks (the child's output only ever stages anyway).
+ */
+async function resolveExtractionRoute(
+  am: ExtractionHandlerAgentMode,
+  transcriptPath: string | undefined,
+  taskId: string
+): Promise<{ mode: 'agent'; stageAll: boolean } | { mode: 'normal' }> {
+  const rs = am.loadSettings().runner
+  if (rs === undefined || !rs.enabled || rs.mode !== 'agent' || !am.runner.isHealthy()) {
+    return { mode: 'normal' }
+  }
+  if (transcriptPath !== undefined) {
+    let flagged = false
+    try {
+      flagged = await am.scanTranscript(transcriptPath, taskId)
+    } catch (err) {
+      console.warn(`[triggers] injection scan failed for ${taskId} (${String(err)}) — proceeding in agent mode`)
+    }
+    if (flagged && rs.injectionPolicy === 'downgrade') {
+      console.log(
+        `[triggers] ${taskId}: transcript injection-flagged — downgrading to completion-mode extraction (no tools)`
+      )
+      return { mode: 'normal' }
+    }
+  }
+  return { mode: 'agent', stageAll: rs.stageAll }
 }
 
 /** Does the error chain end in "this session has nothing to extract"? */
@@ -290,7 +355,7 @@ export function registerExtractionHandler(queue: DurableTaskQueue, deps: Extract
       const existing = await deps.runner.getJob(workflowJobId)
       let result
       if (existing !== undefined) {
-        // Resume the SAME workflow job (main OR delegate) — no re-buying.
+        // Resume the SAME workflow job (main / delegate / agent) — no re-buying.
         result = await deps.agent.resumeExtraction(workflowJobId)
       } else if (isContinuation) {
         result = await deps.agent.runDelegateExtraction(
@@ -298,11 +363,32 @@ export function registerExtractionHandler(queue: DurableTaskQueue, deps: Extract
           { jobId: workflowJobId }
         )
       } else {
-        result = await deps.agent.runExtraction(sessionId, {
-          jobId: workflowJobId,
-          ...(transcriptPath !== undefined ? { transcriptPath } : {}),
-          ...(cwd !== undefined ? { cwd } : {})
-        })
+        // Phase-19: a primary extraction routes to AGENT MODE when the runner is
+        // enabled + healthy + mode 'agent' and the transcript is not
+        // injection-flagged under the downgrade policy; otherwise today's path
+        // (completion-mode subscription or two-tier local — DEFAULT == TODAY).
+        const route =
+          deps.agentMode !== undefined
+            ? await resolveExtractionRoute(deps.agentMode, transcriptPath, ctx.taskId)
+            : ({ mode: 'normal' } as const)
+        if (route.mode === 'agent') {
+          result = await deps.agent.runAgentExtraction(
+            {
+              taskId: ctx.taskId,
+              sessionId,
+              ...(transcriptPath !== undefined ? { transcriptPath } : {}),
+              ...(cwd !== undefined ? { cwd } : {}),
+              stageAll: route.stageAll
+            },
+            { jobId: workflowJobId }
+          )
+        } else {
+          result = await deps.agent.runExtraction(sessionId, {
+            jobId: workflowJobId,
+            ...(transcriptPath !== undefined ? { transcriptPath } : {}),
+            ...(cwd !== undefined ? { cwd } : {})
+          })
+        }
       }
       const c = result.committed
       const committedTotal =

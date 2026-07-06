@@ -15,10 +15,12 @@
 import { spawn as nodeSpawn } from 'node:child_process'
 import { basename } from 'node:path'
 import type BetterSqlite3 from 'better-sqlite3'
+import { RUNNER_MODEL_DEFAULT } from '../config'
 import type { CallBudget } from '../models/callBudget'
 import type { SubscriptionComplete } from '../models/provider'
 import type { ModelSettings } from '../models/settings'
 import type { Telemetry } from '../telemetry'
+import { runAgentMode as runAgentModeChild, type RunAgentModeResult } from './agent'
 import { resolveClaudeBinary, type BinaryResolveDeps } from './binary'
 import {
   makeSubscriptionComplete,
@@ -80,6 +82,24 @@ export {
   type CompletionDeps,
   type TestConnectionResult
 } from './completion'
+export {
+  buildAgentArgv,
+  runAgentMode,
+  RUNNER_AGENT_ALLOWED_TOOLS,
+  RUNNER_AGENT_SCOPE_GUARD,
+  RUNNER_AGENT_SETTINGS,
+  type RunAgentModeOptions,
+  type RunAgentModeResult
+} from './agent'
+export {
+  deleteRunnerMcpConfig,
+  runnerConfigDir,
+  runnerMcpConfigObject,
+  runnerMcpConfigPath,
+  writeRunnerMcpConfig,
+  RUNNER_TOKEN_ENV_REF,
+  type RunnerMcpConfig
+} from './mcpConfig'
 
 // ── the facade ────────────────────────────────────────────────────────────────
 
@@ -93,6 +113,8 @@ export interface RunnerDeps {
   readonly env?: NodeJS.ProcessEnv
   readonly homeDir?: string
   readonly execPath?: string
+  /** `<userData>` — agent mode writes each spawn's `.mcp.json` under `<userData>/runner/`. */
+  readonly userDataDir?: string
   readonly spawnImpl?: SpawnImpl
   readonly ttlMs?: number
   readonly minVersion?: string
@@ -184,6 +206,55 @@ export class Runner {
   /** The manual 1-turn canary (§3.7 — user-triggered, NEVER scheduled). */
   testConnection(): Promise<TestConnectionResult> {
     return runTestConnection(this.completionDeps)
+  }
+
+  /**
+   * Agent mode (phase 19; §3.2/§8 Phase 5) — spawn a headless `claude -p` that
+   * connects back to the loopback MCP with the runner token, reads its inputs
+   * via READ tools, and stages its outputs via `submit_extraction_items`. Writes
+   * the per-task `.mcp.json` (real token ONLY in the child env, §10.5/P0.3),
+   * spawns on the background lane, and deletes the config afterwards; the caller
+   * (the delegate, 18) then loads `runner_submissions` bound to `task.taskId`.
+   *
+   * Runs ONLY when the handler has already checked `enabled ∧ healthy ∧
+   * mode==='agent'`; a stale health cache leaving the binary unresolved, or a
+   * missing `userDataDir`, throws (the queue fails the extraction task and
+   * retries) rather than spawning blind.
+   */
+  async runAgentMode(task: {
+    readonly taskId: string
+    readonly brief: string
+    readonly runnerToken: string
+    readonly sessionId?: string
+    readonly model?: string
+    readonly mcpUrl?: string
+  }): Promise<RunAgentModeResult> {
+    const invocation = this.resolveBinary()
+    if (invocation === null) {
+      throw new Error('runner agent mode: no claude binary resolved (health should have gated this call)')
+    }
+    const userDataDir = this.deps.userDataDir
+    if (userDataDir === undefined || userDataDir === '') {
+      throw new Error('runner agent mode: userDataDir is not configured — cannot write the per-task .mcp.json')
+    }
+    const model = task.model ?? this.deps.loadSettings().runner?.model ?? RUNNER_MODEL_DEFAULT
+    return runAgentModeChild({
+      taskId: task.taskId,
+      brief: task.brief,
+      runnerToken: task.runnerToken,
+      userDataDir,
+      invocation,
+      db: this.deps.db,
+      telemetry: this.deps.telemetry,
+      model,
+      ...(task.sessionId !== undefined ? { sessionId: task.sessionId } : {}),
+      ...(task.mcpUrl !== undefined ? { mcpUrl: task.mcpUrl } : {}),
+      ...(this.deps.now !== undefined ? { now: this.deps.now } : {}),
+      ...(this.deps.platform !== undefined ? { platform: this.deps.platform } : {}),
+      ...(this.deps.env !== undefined ? { env: this.deps.env } : {}),
+      ...(this.deps.spawnImpl !== undefined ? { spawnImpl: this.deps.spawnImpl } : {}),
+      ...(this.deps.laneFor !== undefined ? { laneFor: this.deps.laneFor } : {})
+    })
   }
 
   /** Kill every in-flight runner child of THIS process (will-quit). */

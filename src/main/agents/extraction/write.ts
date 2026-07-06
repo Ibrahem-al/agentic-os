@@ -49,8 +49,16 @@ function dispositionOf(
   itemKey: string,
   confidence: number,
   tierPass: ExtractionPass,
-  verification: VerifyState
+  verification: VerifyState,
+  stageAll: boolean
 ): Disposition {
+  // runner.stageAll (§3.6, agent mode): every model-extracted item stages for
+  // human review regardless of confidence — a background subscription child's
+  // output never auto-commits. Deterministic-pass facts bypass this gate
+  // entirely (they are not model output), so they still commit.
+  if (stageAll) {
+    return { commit: false, reason: 'runner.stageAll — agent-mode submission staged for review regardless of confidence' }
+  }
   if (confidence >= WRITE_GATE_CONFIDENCE) return { commit: true, confidence, pass: tierPass }
   const verdict: VerificationResult | undefined = verification.results.find((r) => r.itemKey === itemKey)
   if (verdict !== undefined && verdict.verdict === 'confirm') {
@@ -142,10 +150,18 @@ export interface GatedWriteOptions {
    * reversible delta — the per-action complement of §18's undo-by-source.
    */
   readonly audit?: AuditLog
+  /**
+   * runner.stageAll (§3.6, phase-19 agent mode): force EVERY fuzzy item to stage
+   * for human review regardless of confidence. Default false ⇒ today's
+   * confidence/verifier gate (DEFAULT == TODAY). Deterministic-pass facts commit
+   * either way (they never pass through the per-item gate).
+   */
+  readonly stageAll?: boolean
 }
 
 export async function performGatedWrite(options: GatedWriteOptions): Promise<ExtractionResult> {
   const { engine, db, collected, plan, extraction, resolution, verification, audit } = options
+  const stageAll = options.stageAll === true
   const sessionNodeId = collected.sessionNodeId
   const sessionRef: NodeRef = { label: 'Session', id: sessionNodeId }
   const deterministic: EdgeProps = { extracted_by: extractionProvenance('deterministic'), confidence: 1.0 }
@@ -228,7 +244,7 @@ export async function performGatedWrite(options: GatedWriteOptions): Promise<Ext
   const committedComponents: CommittedComponent[] = []
   for (const component of resolution.components) {
     const itemKey = itemKeyOf('components', component.name)
-    const disposition = dispositionOf(itemKey, component.confidence, tierPass, verification)
+    const disposition = dispositionOf(itemKey, component.confidence, tierPass, verification, stageAll)
     const targetId = component.resolution.id
     if (!disposition.commit) {
       const provenance = { extracted_by: extractionProvenance(tierPass), confidence: component.confidence }
@@ -313,7 +329,7 @@ export async function performGatedWrite(options: GatedWriteOptions): Promise<Ext
       continue // folded into its same-session survivor — nothing to write
     }
     const itemKey = itemKeyOf('preferences', preference.statement)
-    const disposition = dispositionOf(itemKey, preference.confidence, tierPass, verification)
+    const disposition = dispositionOf(itemKey, preference.confidence, tierPass, verification, stageAll)
     const targetId = preference.resolution.id
     const prefTags = preference.tags
       .map((name) => resolution.tags.find((t) => t.name.toLowerCase() === name.toLowerCase()))
@@ -393,7 +409,7 @@ export async function performGatedWrite(options: GatedWriteOptions): Promise<Ext
   const committedCorrections: CommittedCorrection[] = []
   for (const correction of resolution.corrections) {
     const itemKey = itemKeyOf('corrections', correction.content)
-    const disposition = dispositionOf(itemKey, correction.confidence, tierPass, verification)
+    const disposition = dispositionOf(itemKey, correction.confidence, tierPass, verification, stageAll)
     const provenance = {
       extracted_by: extractionProvenance(disposition.commit ? disposition.pass : tierPass),
       confidence: disposition.commit ? disposition.confidence : correction.confidence

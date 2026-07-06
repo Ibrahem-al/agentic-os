@@ -26,6 +26,7 @@ import {
   OllamaClient,
   ProviderRouter,
   Reranker,
+  RUNNER_TOKEN_SECRET,
   SpendMeter,
   activeCloudModel,
   createCloudBrain,
@@ -41,6 +42,7 @@ import {
   DockerLane,
   PermissionEngine,
   registerInternalAgents,
+  untrusted,
   type InjectionScanner
 } from './security'
 import { createRetriever } from './retrieval'
@@ -49,6 +51,7 @@ import { AgenticOsMcpServer, claudeMcpAddCommand, McpClientManager, writeSampleM
 import {
   createExtractionAgent,
   createSkillImprovementAgent,
+  parseTranscriptFile,
   registerSkillImprovementHandler,
   type ExtractionAgent,
   type SkillImprovementAgent
@@ -532,7 +535,22 @@ function bootAgents(): void {
     // boot injects it" — this is that injection.
     ...(providerRouter !== null ? { router: providerRouter } : {}),
     // §13 (phase 09): the write step's lane job records a reversible delta.
-    ...(securityInstances !== null ? { audit: securityInstances.audit } : {})
+    ...(securityInstances !== null ? { audit: securityInstances.audit } : {}),
+    // Phase-19 (§8 Phase 5): agent-mode spawn deps — present ONLY when the runner
+    // booted AND the MCP server is up (the child connects back to it). SHIPS OFF:
+    // the handler routes here only when runner.enabled + mode 'agent' (default
+    // disabled + completion), so a default install never spawns a runner child.
+    // The token getter reads the CURRENT keychain runner token (rotated per boot).
+    ...(subscriptionRunner !== null && mcpServer !== null && keychain !== null
+      ? {
+          agentMode: {
+            runner: subscriptionRunner,
+            runnerToken: () => keychain?.getSecret(RUNNER_TOKEN_SECRET) ?? null,
+            server: mcpServer,
+            mcpUrl: mcpServer.url
+          }
+        }
+      : {})
   })
   console.log(
     `[agents] extraction agent ready — the phase-11 session-end triggers drive it (cloud tier: ${
@@ -589,7 +607,36 @@ async function bootTriggers(): Promise<void> {
   })
 
   if (extractionAgent !== null) {
-    registerExtractionHandler(queue, { agent: extractionAgent, runner: kernelInstances.runner })
+    // Phase-19 (§8 Phase 5): agent-mode routing. Present ONLY when the runner +
+    // MCP server booted; the routing itself checks runner.enabled + healthy +
+    // mode 'agent' LIVE per session (default disabled + completion ⇒ today's
+    // path). P1.6: the transcript is scanned with the regex-only scanner
+    // (free/offline) and a flagged transcript downgrades to completion mode.
+    const runnerInjectionScanner = createInjectionScanner({ db: appData.db })
+    const scanTranscript = async (transcriptPath: string, taskId: string): Promise<boolean> => {
+      let text: string
+      try {
+        text = parseTranscriptFile(transcriptPath).text
+      } catch {
+        return false // no readable transcript → nothing to scan
+      }
+      if (text.trim() === '') return false
+      const res = await runnerInjectionScanner.scan(untrusted(text), `runner:${taskId}`)
+      return res.flagged
+    }
+    registerExtractionHandler(queue, {
+      agent: extractionAgent,
+      runner: kernelInstances.runner,
+      ...(subscriptionRunner !== null && mcpServer !== null
+        ? {
+            agentMode: {
+              loadSettings: () => loadModelSettings(settingsPath(userDataDir)),
+              runner: subscriptionRunner,
+              scanTranscript
+            }
+          }
+        : {})
+    })
   } else {
     console.warn('[triggers] extraction agent unavailable — session-end tasks will defer to a later launch')
   }

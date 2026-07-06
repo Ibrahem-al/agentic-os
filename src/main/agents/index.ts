@@ -5,11 +5,14 @@
  */
 export {
   EXTRACTION_AGENT_ID,
+  EXTRACTION_AGENT_WORKFLOW,
   EXTRACTION_DELEGATE_WORKFLOW,
   EXTRACTION_WORKFLOW,
   createExtractionAgent,
   sessionNodeIdOf,
   type ExtractionAgent,
+  type RunAgentExtractionInput,
+  type RunAgentExtractionOptions,
   type RunDelegateExtractionInput,
   type RunDelegateExtractionOptions,
   type RunExtractionOptions
@@ -40,6 +43,7 @@ export {
   extractionProvenance,
   itemKeyOf,
   normalizeItemText,
+  type AgentModeRunner,
   type CollectedCall,
   type CollectedState,
   type DeterministicPlan,
@@ -47,6 +51,7 @@ export {
   type ExtractedCorrection,
   type ExtractedPreference,
   type ExtractionAgentDeps,
+  type ExtractionAgentModeDeps,
   type ExtractionCloud,
   type ExtractionEmbedder,
   type ExtractionErrorCode,
@@ -64,6 +69,7 @@ export {
   type ResolvedComponent,
   type ResolvedCorrection,
   type ResolvedPreference,
+  type RunnerTemplateController,
   type TranscriptDigest,
   type VerificationResult,
   type VerifyState

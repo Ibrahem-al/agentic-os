@@ -33,6 +33,7 @@ export {
   extractionContinuationTaskId,
   extractionTaskId,
   registerExtractionHandler,
+  type ExtractionHandlerAgentMode,
   type ExtractionHandlerDeps,
   type HookResponse,
   type SessionEndOrigin,

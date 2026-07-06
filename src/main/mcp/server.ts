@@ -46,10 +46,26 @@ import { MCP_TOOLS, ToolError, type McpReadContext, type ToolContext } from './t
  * Runner MCP sessions are scoped SERVER-SIDE to READ + STAGING tools (§14b B3),
  * independent of the client's `--allowedTools`: even a tampered runner client
  * cannot widen its own surface. Mirrors the `mcp-runner:` permission profile so
- * the dispatch allowlist and the §13 engine agree by construction. (Agent-mode
- * per-task templates that narrow this further land at FP-5.)
+ * the dispatch allowlist and the §13 engine agree by construction. Agent-mode
+ * runs narrow this FURTHER per bound task via `registerRunnerTaskTemplate` (§3.2,
+ * FP-5) — a tighter subset enforced below.
  */
 const RUNNER_SESSION_ALLOWLIST: ReadonlySet<string> = new Set<string>([...READ_TOOLS, ...STAGING_TOOLS])
+
+/**
+ * The agent-mode extraction template (§3.2/FP-5): the ONLY tools an agent-mode
+ * extraction child may call — read its inputs (`read_session`,
+ * `get_pending_work`) and stage its outputs (`submit_extraction_items`). A
+ * strict subset of READ+STAGING, matching `RUNNER_AGENT_ALLOWED_TOOLS` in
+ * `runner/agent.ts` (bare names here; that list carries the `mcp__<server>__`
+ * prefix). Registered per bound task while a run is live; a call outside it is
+ * PERMISSION_DENIED server-side even if `--allowedTools` was tampered.
+ */
+export const RUNNER_EXTRACTION_TEMPLATE_TOOLS: readonly string[] = [
+  'read_session',
+  'get_pending_work',
+  'submit_extraction_items'
+]
 
 /** Node lowercases incoming header names; match RUNNER_TASK_HEADER accordingly. */
 const RUNNER_TASK_HEADER_LC = RUNNER_TASK_HEADER.toLowerCase()
@@ -186,6 +202,11 @@ export class AgenticOsMcpServer {
   private inflightInteractive = 0
   private inflightRunner = 0
   private readonly runnerSessionCalls: BetterSqlite3.Statement
+  // Agent-mode per-task templates (§3.2/FP-5): a bound task id → the exact tool
+  // set its runner session may call, tighter than RUNNER_SESSION_ALLOWLIST.
+  // Registered when an agent-mode run starts, released (+ session reaped) when it
+  // ends. Empty on a default install / completion mode — no narrowing applies.
+  private readonly runnerTaskTemplates = new Map<string, ReadonlySet<string>>()
 
   constructor(deps: AgenticOsMcpServerDeps) {
     this.deps = deps
@@ -212,6 +233,36 @@ export class AgenticOsMcpServer {
    */
   setReadContext(readContext: McpReadContext): void {
     this.readContext = readContext
+  }
+
+  /**
+   * Register a NARROWED per-task tool template for an agent-mode run (§3.2/FP-5).
+   * While registered, a runner session bound to `taskId` (via
+   * X-Agentic-Os-Runner-Task at initialize) may call ONLY `tools` — enforced in
+   * dispatch, independent of the client's `--allowedTools`, so a tampered runner
+   * child cannot widen its own surface. Defaults to the extraction template
+   * (read + submit). Called BEFORE the child spawns, so the template is in place
+   * by the time the child connects back.
+   */
+  registerRunnerTaskTemplate(taskId: string, tools: readonly string[] = RUNNER_EXTRACTION_TEMPLATE_TOOLS): void {
+    this.runnerTaskTemplates.set(taskId, new Set(tools))
+  }
+
+  /**
+   * Release a per-task template AND reap the runner transport session bound to
+   * `taskId` (§10.15 session reaper) — called when the agent-mode run completes.
+   * Dropping the template first means any late call from a lingering child faces
+   * the default allowlist (never a widened surface); closing its session frees
+   * the SDK server so a late call 404s and must re-initialize.
+   */
+  releaseRunnerTaskTemplate(taskId: string): void {
+    this.runnerTaskTemplates.delete(taskId)
+    for (const [sid, session] of [...this.sessions]) {
+      if (session.kind === 'runner' && session.boundTaskId === taskId) {
+        this.sessions.delete(sid)
+        void session.server.close().catch(() => undefined)
+      }
+    }
   }
 
   /**
@@ -480,13 +531,19 @@ export class AgenticOsMcpServer {
       // so the finally still writes the mcp_calls row: the refusal is audited
       // and counts toward the session's own call budget.
       if (isRunner) {
-        // (1) Server-side template allowlist — READ + STAGING only (FP-5 tightens
-        // per task template). Independent of the §13 engine (which also blocks
-        // it via the mcp-runner profile) — two layers, one source of truth.
-        if (!RUNNER_SESSION_ALLOWLIST.has(name)) {
+        // (1) Server-side allowlist — READ + STAGING by default, NARROWED to the
+        // bound task's template when an agent-mode run registered one (§3.2/FP-5:
+        // read + submit only). Independent of the §13 engine (which also blocks
+        // it via the mcp-runner profile) and of the client's `--allowedTools` —
+        // layered defense, one source of truth.
+        const template = session?.boundTaskId !== undefined ? this.runnerTaskTemplates.get(session.boundTaskId) : undefined
+        const allowlist = template ?? RUNNER_SESSION_ALLOWLIST
+        if (!allowlist.has(name)) {
           throw new ToolError(
             'PERMISSION_DENIED',
-            `tool '${name}' is not permitted for a runner MCP session (server-side allowlist: read + staging only)`
+            template !== undefined
+              ? `tool '${name}' is not in the per-task runner template for '${session?.boundTaskId ?? ''}' (agent-mode extraction: read + submit only)`
+              : `tool '${name}' is not permitted for a runner MCP session (server-side allowlist: read + staging only)`
           )
         }
         // (2) Per-session tool-call ceiling (RUNNER_SESSION_MAX_TOOL_CALLS). The
