@@ -123,9 +123,95 @@ export async function generateCandidate(options: GenerateCandidateOptions): Prom
   }
 }
 
-const normalizeMd = (text: string): string => text.replace(/\r\n/g, '\n').trim()
+/**
+ * Line-ending-normalized comparison form (the "did the candidate actually
+ * change?" check). Exported so `propose_skill_revision` (the MCP tool) applies
+ * the SAME differs-from-active rule at the boundary that this step applies.
+ */
+export const normalizeMd = (text: string): string => text.replace(/\r\n/g, '\n').trim()
 
 /** Content-hash helper shared with tests (stable candidate identity). */
 export function instructionsHash(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 8)
+}
+
+// ── Provided candidate (phase-18: propose_skill_revision) ────────────────────
+
+/**
+ * A SKILL.md revision an external Claude proposed via `propose_skill_revision`
+ * (staged through `queue.enqueue`, carried in the task payload). The candidate
+ * step uses it INSTEAD of the cloud rewrite LLM — but it still rides the full
+ * benchmark + §17 adoption gate below, so a provided candidate NEVER
+ * self-certifies. `skillId` scopes it to one work item; `versionId` is the
+ * caller's claim, recomputed from the content here (never trusted).
+ */
+export interface ProvidedCandidate {
+  readonly skillId: string
+  readonly versionId: string
+  readonly instructions: string
+  readonly proposedBy: string
+}
+
+export interface UseProvidedCandidateOptions {
+  readonly item: SkillWorkItem
+  /** Baseline instructions in SKILL.md form (what the revision must differ from). */
+  readonly skillMd: string
+  /** The frontmatter name the candidate must keep. */
+  readonly expectedName: string
+  readonly provided: ProvidedCandidate
+}
+
+/**
+ * Validate a client-provided SKILL.md candidate the SAME way `generateCandidate`
+ * validates the rewrite LLM's reply (parse, name must match the baseline, must
+ * differ), recomputing the version id from the content. Returns a candidate
+ * with `error` set instead of throwing, so the run continues + the write step
+ * records a `failed-candidate` outcome honestly.
+ */
+export function useProvidedCandidate(options: UseProvidedCandidateOptions): SkillCandidate {
+  const { item, skillMd, expectedName, provided } = options
+  const fail = (error: string): SkillCandidate => ({
+    skillId: item.skillId,
+    candidateVersionId: '',
+    instructions: '',
+    error
+  })
+  let parsed
+  try {
+    parsed = parseSkillMd(provided.instructions)
+  } catch (err) {
+    return fail(`provided candidate is not a valid SKILL.md: ${err instanceof SkillMdError ? err.message : String(err)}`)
+  }
+  if (parsed.name !== expectedName) {
+    return fail(`provided candidate frontmatter name '${parsed.name}' must stay exactly '${expectedName}'`)
+  }
+  if (normalizeMd(provided.instructions) === normalizeMd(skillMd)) {
+    return fail('provided candidate is identical to the current skill — a revision must differ')
+  }
+  return {
+    skillId: item.skillId,
+    // Recompute the identity from the content (the caller's versionId is a claim).
+    candidateVersionId: candidateVersionIdOf(item.skillId, provided.instructions),
+    instructions: provided.instructions,
+    error: null
+  }
+}
+
+/**
+ * Decode the `providedCandidate` sub-object from a skill-improvement task payload
+ * (`{ skillId, providedCandidate: { versionId, instructions, proposedBy } }`),
+ * folding in the top-level skillId. Returns undefined when absent/malformed so
+ * the run falls back to the normal cloud-rewrite path.
+ */
+export function decodeProvidedCandidate(skillId: string, raw: unknown): ProvidedCandidate | undefined {
+  if (skillId === '' || raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const r = raw as Record<string, unknown>
+  const instructions = typeof r['instructions'] === 'string' ? r['instructions'] : ''
+  if (instructions === '') return undefined
+  return {
+    skillId,
+    versionId: typeof r['versionId'] === 'string' ? r['versionId'] : '',
+    instructions,
+    proposedBy: typeof r['proposedBy'] === 'string' ? r['proposedBy'] : ''
+  }
 }

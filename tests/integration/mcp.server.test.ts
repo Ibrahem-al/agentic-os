@@ -245,7 +245,7 @@ describe('the §12 tool surface', () => {
     expect(missing.body.error.code).toBe('NOT_FOUND')
   })
 
-  it('P0.6: an UNDECLARED tool is blocked fail-closed; a declared-but-unimplemented one is NOT_FOUND — both clean + logged', async () => {
+  it('P0.6: an UNDECLARED tool is blocked fail-closed; a declared tool with bad args is a clean INVALID_INPUT — both logged', async () => {
     // Post-14b the interactive mcp: profile declares the full planned surface
     // and the §13 mcp-call scope check is live: an UNDECLARED name (no handler,
     // in no tier set) is hard-blocked BEFORE dispatch — still a clean structured
@@ -254,14 +254,13 @@ describe('the §12 tool surface', () => {
     expect(undeclared.isError).toBe(true)
     expect(undeclared.body.error.code).toBe('PERMISSION_DENIED')
     expect(undeclared.body.error.message).toContain('delete_everything')
-    // A DECLARED name whose handler has not landed yet (submit_extraction_items —
-    // tiered in STAGING_TOOLS, deferred to phase-19 agent mode) passes the scope
-    // check and reaches the dispatcher's own NOT_FOUND — the clean-structured-error
-    // path stays exercised. (get_runner_status moved here to a real handler at phase-17.)
-    const unimplemented = await call(client, 'submit_extraction_items', {})
-    expect(unimplemented.isError).toBe(true)
-    expect(unimplemented.body.error.code).toBe('NOT_FOUND')
-    expect(unimplemented.body.error.message).toContain('get_context')
+    // Phase-18 filled the staging+control seams — every declared tool now has a
+    // handler. submit_extraction_items passes the scope check and reaches its zod
+    // boundary; empty args fail it → a clean INVALID_INPUT (the structured-error
+    // path stays exercised now that no declared tool is unimplemented).
+    const badArgs = await call(client, 'submit_extraction_items', {})
+    expect(badArgs.isError).toBe(true)
+    expect(badArgs.body.error.code).toBe('INVALID_INPUT')
   })
 })
 

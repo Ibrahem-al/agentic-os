@@ -463,7 +463,8 @@ export class AgenticOsMcpServer {
     // gauge, and the runner-only guards. An unknown session ⇒ interactive: the
     // only way to reach dispatch is a live, mapped session, so this is a
     // defensive default that preserves the exact pre-14b interactive path.
-    const isRunner = this.sessions.get(sessionId)?.kind === 'runner'
+    const session = this.sessions.get(sessionId)
+    const isRunner = session?.kind === 'runner'
     const agentId = isRunner ? `mcp-runner:${sessionId}` : `mcp:${sessionId}`
 
     const startedUnixMs = Date.now()
@@ -522,7 +523,10 @@ export class AgenticOsMcpServer {
             ...(this.deps.audit !== undefined ? { audit: this.deps.audit } : {}),
             ...(this.deps.spendMeter !== undefined ? { spendMeter: this.deps.spendMeter } : {}),
             // §4 read tools' late-bound deps (empty on an un-wired server).
-            ...this.readContext
+            ...this.readContext,
+            // Runner sessions carry their spawning task id (§14b P0.6 #3):
+            // submit_extraction_items keys its rows to it instead of a continuation.
+            ...(session?.boundTaskId !== undefined ? { boundTaskId: session.boundTaskId } : {})
           }
           return tool.handle(args, ctx)
         }

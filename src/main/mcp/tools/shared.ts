@@ -21,6 +21,7 @@ import type { ProjectSummarizer, WatchedFolderStore } from '../../ingest'
 import type { AuditLog, InjectionScanner } from '../../security'
 import type { WorkflowRunner } from '../../kernel'
 import type { Keychain, OllamaClient, ProviderRouter } from '../../models'
+import type { DurableTaskQueue } from '../../triggers'
 import type { ApprovalLister, RunnerStatusSource, TriggerStatusDeps } from '../../reads'
 import type { AppStatusDto } from '../../../shared/ipc'
 
@@ -66,8 +67,16 @@ export interface McpReadContext {
   readonly runnerStatus?: RunnerStatusSource
   /** Phase-11 trigger runtime for get_triggers_status (null = not armed this launch). */
   readonly triggers?: TriggerStatusDeps | null
-  /** Watched-folder store for list_watched_folders. */
+  /** Watched-folder store for list_watched_folders + scan_watched_folder. */
   readonly watchedFolders?: Pick<WatchedFolderStore, 'list'>
+  /**
+   * The §8 durable task queue (phase-18 control/staging tools). Late-bound at
+   * bootIpc (triggers boot before it). Absent ⇒ triggers did not boot ⇒ the
+   * tools that enqueue (run_extraction / improve_skill_now / run_maintenance /
+   * retry_task / propose_skill_revision / submit_extraction_items continuation)
+   * return a clean INVALID_STATE rather than crashing.
+   */
+  readonly queue?: DurableTaskQueue
   /** Live Ollama health for get_app_status (null = model layer absent this launch). */
   readonly ollama?: Pick<OllamaClient, 'status'> | null
   /** Keychain — PRESENCE reads only — for get_settings_summary (null = absent). */
@@ -93,6 +102,13 @@ export interface ToolContext extends McpReadContext {
   readonly db: BetterSqlite3.Database
   /** MCP transport session id (also the §6 correlation key). */
   readonly sessionId: string
+  /**
+   * Runner sessions only (§14b P0.6 #3): the task id bound at initialize via
+   * X-Agentic-Os-Runner-Task. submit_extraction_items keys its runner_submissions
+   * rows to this already-running delegate task instead of synthesizing a
+   * continuation. Undefined on interactive sessions ⇒ the continuation path.
+   */
+  readonly boundTaskId?: string
   /** §13 injection scanner for the ingest tools (phase 09; absent = no scan). */
   readonly scanner?: InjectionScanner
   /** §13 audit log — ingest writes record reversible deltas (phase 09). */

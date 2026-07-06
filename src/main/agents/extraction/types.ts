@@ -13,7 +13,7 @@
 import type BetterSqlite3 from 'better-sqlite3'
 import { EXTRACTION_PROVENANCE } from '../../config'
 import type { WorkflowRunner } from '../../kernel'
-import type { CloudBrain, SpendMeter } from '../../models'
+import type { CloudBrain, ProviderRouter, SpendMeter } from '../../models'
 import type { AuditLog } from '../../security'
 import type { StorageEngine } from '../../storage'
 
@@ -67,6 +67,15 @@ export interface ExtractionAgentDeps {
    * boot always wires it.
    */
   readonly audit?: AuditLog
+  /**
+   * §11.4 provider router (phase-18). When present it OWNS role→backend
+   * resolution PER RUN for the three extraction roles (`extraction.fuzzy`
+   * decides the two-tier-vs-subscription mode; `extraction.tiebreak`;
+   * `extraction.verify`) and WINS over `llm`/`cloud`; when absent the agent uses
+   * today's `llm`/`cloud` unchanged (DEFAULT == TODAY). Only boot injects it, so
+   * every existing fake-injecting test rig (no router) keeps its exact behavior.
+   */
+  readonly router?: ProviderRouter
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -104,7 +113,13 @@ export class ExtractionUnavailableError extends ExtractionError {
 
 // ── Provenance (§18 v3.1: `extraction@<version>/<pass>`) ─────────────────────
 
-export type ExtractionPass = 'deterministic' | 'llm-local' | 'llm-cloud' | 'llm-local+verified'
+export type ExtractionPass =
+  | 'deterministic'
+  | 'llm-local'
+  | 'llm-cloud'
+  | 'llm-local+verified'
+  /** §2.2 single-tier subscription-Claude extraction (phase-18; the runner tier). */
+  | 'llm-subscription'
 
 export function extractionProvenance(pass: ExtractionPass): string {
   return `${EXTRACTION_PROVENANCE}/${pass}`
@@ -216,7 +231,7 @@ export interface ExtractedCorrection {
   readonly chunk: number
 }
 
-export type ExtractionTier = 'local' | 'cloud' | 'none'
+export type ExtractionTier = 'local' | 'cloud' | 'none' | 'subscription'
 
 export interface FuzzyExtractionState {
   readonly tier: ExtractionTier
@@ -296,7 +311,18 @@ export interface VerificationResult {
 }
 
 export interface VerifyState {
-  readonly mode: 'cloud' | 'none-needed' | 'skipped-no-cloud' | 'skipped-cloud-extractor'
+  readonly mode:
+    | 'cloud'
+    | 'none-needed'
+    | 'skipped-no-cloud'
+    | 'skipped-cloud-extractor'
+    /**
+     * §17 self-judging guard for the subscription tier (phase-18): the
+     * subscription extracted, so verifying with the same subscription tier would
+     * be self-judging — mirror `skipped-cloud-extractor` (below-gate items → the
+     * human queue) UNLESS an independent cloud-api verifier is configured.
+     */
+    | 'skipped-subscription-extractor'
   readonly results: readonly VerificationResult[]
   readonly warnings: readonly string[]
 }

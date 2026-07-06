@@ -13,6 +13,7 @@ import { TASK_CLASS_BAND, TASK_PRIORITY } from '../../config'
 import type { WorkflowRunner } from '../../kernel'
 import { TaskFatalError, type DurableTaskQueue, type EnqueueResult } from '../../triggers/queue'
 import type { SkillImprovementAgent } from './agent'
+import { decodeProvidedCandidate } from './candidate'
 import { SkillImprovementError } from './types'
 
 export const SKILL_IMPROVEMENT_TASK_KIND = 'skill-improvement'
@@ -37,13 +38,21 @@ function fatalCode(err: unknown): string | null {
 export function registerSkillImprovementHandler(queue: DurableTaskQueue, deps: SkillImprovementHandlerDeps): void {
   queue.registerHandler(SKILL_IMPROVEMENT_TASK_KIND, async (payload, ctx) => {
     const skillId = typeof payload['skillId'] === 'string' && payload['skillId'] !== '' ? payload['skillId'] : undefined
+    // phase-18: a `propose_skill_revision` task carries a client-provided
+    // SKILL.md the candidate step uses instead of the cloud rewrite (still gated).
+    // Only bound on the FIRST run — resume replays it from the checkpointed state.
+    const providedCandidate = skillId !== undefined ? decodeProvidedCandidate(skillId, payload['providedCandidate']) : undefined
     const workflowJobId = `${ctx.taskId}-wf`
     try {
       const existing = await deps.runner.getJob(workflowJobId)
       const result =
         existing !== undefined
           ? await deps.agent.resumeImprovement(workflowJobId)
-          : await deps.agent.runImprovement({ jobId: workflowJobId, ...(skillId !== undefined ? { skillId } : {}) })
+          : await deps.agent.runImprovement({
+              jobId: workflowJobId,
+              ...(skillId !== undefined ? { skillId } : {}),
+              ...(providedCandidate !== undefined ? { providedCandidate } : {})
+            })
       const counts = new Map<string, number>()
       for (const entry of result.processed) counts.set(entry.outcome, (counts.get(entry.outcome) ?? 0) + 1)
       const outcomeNote =

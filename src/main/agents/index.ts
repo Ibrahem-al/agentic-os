@@ -5,10 +5,13 @@
  */
 export {
   EXTRACTION_AGENT_ID,
+  EXTRACTION_DELEGATE_WORKFLOW,
   EXTRACTION_WORKFLOW,
   createExtractionAgent,
   sessionNodeIdOf,
   type ExtractionAgent,
+  type RunDelegateExtractionInput,
+  type RunDelegateExtractionOptions,
   type RunExtractionOptions
 } from './extraction/agent'
 export { planDeterministic } from './extraction/deterministic'
@@ -16,10 +19,17 @@ export {
   FUZZY_PASS_SCHEMAS,
   FUZZY_SYSTEM_PROMPTS,
   chunkTranscript,
+  componentFromSubmission,
+  correctionFromSubmission,
   extractItemsReply,
   extractJsonArray,
   extractJsonObject,
+  normalizeComponent,
+  normalizeCorrection,
+  normalizePreference,
+  preferenceFromSubmission,
   runFuzzyExtraction,
+  type ExtractionMode,
   type FuzzyExtractionOptions
 } from './extraction/fuzzy'
 export { TIEBREAK_SYSTEM_PROMPT, resolveEntities, type ResolveOptions } from './extraction/resolve'
@@ -58,7 +68,7 @@ export {
   type VerificationResult,
   type VerifyState
 } from './extraction/types'
-export { VERIFIER_SYSTEM_PROMPT, WRITE_GATE_CONFIDENCE, runVerification } from './extraction/verify'
+export { VERIFIER_SYSTEM_PROMPT, WRITE_GATE_CONFIDENCE, runVerification, type ExtractionVerifier } from './extraction/verify'
 export { performGatedWrite, type GatedWriteOptions } from './extraction/write'
 
 // ── skill-improvement agent (phase 12) ───────────────────────────────────────

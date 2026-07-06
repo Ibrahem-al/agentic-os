@@ -17,6 +17,7 @@
  * `extract-<sessionId>` — the queue's id dedup makes hook + spool +
  * inactivity converge on ONE extraction per session, durably.
  */
+import { createHash } from 'node:crypto'
 import { readdirSync, readFileSync, renameSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import type BetterSqlite3 from 'better-sqlite3'
@@ -43,7 +44,7 @@ const SessionEndPayloadSchema = z.object({
 
 export type SessionEndPayload = z.output<typeof SessionEndPayloadSchema>
 
-export type SessionEndOrigin = 'hook' | 'spool' | 'inactivity'
+export type SessionEndOrigin = 'hook' | 'spool' | 'inactivity' | 'mcp'
 
 /** Enqueue the extraction task for a finished session (deterministic id). */
 export function enqueueExtraction(
@@ -61,6 +62,40 @@ export function enqueueExtraction(
       cwd: session.cwd ?? null,
       origin
     }
+  })
+}
+
+const sha8 = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 8)
+
+/**
+ * The continuation-task id (phase-18): a batch of items an external Claude
+ * staged in `runner_submissions` gets processed by one delegate extraction.
+ * Distinct from the §6 `extract-<sid>` dedup token — these are NOT exactly-once
+ * and are swept after retention (jobs.ts). `submit_extraction_items` MUST key
+ * its `runner_submissions` rows by this same id so the delegate loads them.
+ */
+export function extractionContinuationTaskId(sessionId: string, batchId: string): string {
+  return `extract-cont-${sessionId}-${sha8(batchId)}`
+}
+
+/**
+ * Enqueue a delegate/continuation extraction (phase-18): the interactive
+ * `submit_extraction_items` MCP tool calls this when no runner task is bound, so
+ * Claude's submitted items get resolved → verified → written through the same
+ * §17 gates. Payload is `{ continuation: true, sessionId }` (the delegate loads
+ * the items from `runner_submissions` keyed by the task id). Dedup by id: a
+ * re-submission of the same batch converges on one delegate run.
+ */
+export function enqueueExtractionContinuation(
+  queue: DurableTaskQueue,
+  sessionId: string,
+  batchId: string
+): EnqueueResult {
+  return queue.enqueue({
+    id: extractionContinuationTaskId(sessionId, batchId),
+    kind: EXTRACTION_TASK_KIND,
+    priority: TASK_PRIORITY.extraction,
+    payload: { continuation: true, sessionId }
   })
 }
 
@@ -235,6 +270,11 @@ function isNothingToExtract(err: unknown): boolean {
  * Register the 'extraction' handler: run the phase-08 workflow for the task's
  * session — resuming the SAME workflow job on retries, so model passes that
  * already checkpointed are never re-run (phase-08 crash-resume design).
+ *
+ * Phase-18: a continuation task (`extract-cont-*`, payload `{continuation:true}`)
+ * routes to the DELEGATE variant instead, which resolves/verifies/writes the
+ * items an external Claude staged in `runner_submissions` (tier 'subscription').
+ * Both variants share the `<taskId>-wf` job id + resume path.
  */
 export function registerExtractionHandler(queue: DurableTaskQueue, deps: ExtractionHandlerDeps): void {
   queue.registerHandler(EXTRACTION_TASK_KIND, async (payload, ctx) => {
@@ -242,19 +282,28 @@ export function registerExtractionHandler(queue: DurableTaskQueue, deps: Extract
     if (sessionId === '') throw new TaskFatalError(`extraction task ${ctx.taskId} carries no sessionId`)
     const transcriptPath = typeof payload['transcriptPath'] === 'string' ? payload['transcriptPath'] : undefined
     const cwd = typeof payload['cwd'] === 'string' ? payload['cwd'] : undefined
+    const isContinuation = payload['continuation'] === true
     // Deterministic workflow job id, distinct from the task id (both live in
     // the tasks table): retries resume it instead of starting over.
     const workflowJobId = `${ctx.taskId}-wf`
     try {
       const existing = await deps.runner.getJob(workflowJobId)
-      const result =
-        existing !== undefined
-          ? await deps.agent.resumeExtraction(workflowJobId)
-          : await deps.agent.runExtraction(sessionId, {
-              jobId: workflowJobId,
-              ...(transcriptPath !== undefined ? { transcriptPath } : {}),
-              ...(cwd !== undefined ? { cwd } : {})
-            })
+      let result
+      if (existing !== undefined) {
+        // Resume the SAME workflow job (main OR delegate) — no re-buying.
+        result = await deps.agent.resumeExtraction(workflowJobId)
+      } else if (isContinuation) {
+        result = await deps.agent.runDelegateExtraction(
+          { taskId: ctx.taskId, sessionId, ...(transcriptPath !== undefined ? { transcriptPath } : {}) },
+          { jobId: workflowJobId }
+        )
+      } else {
+        result = await deps.agent.runExtraction(sessionId, {
+          jobId: workflowJobId,
+          ...(transcriptPath !== undefined ? { transcriptPath } : {}),
+          ...(cwd !== undefined ? { cwd } : {})
+        })
+      }
       const c = result.committed
       const committedTotal =
         c.usedSkills + c.usedMcps + c.usedPlugins + c.components + c.mergedComponents + c.preferences +

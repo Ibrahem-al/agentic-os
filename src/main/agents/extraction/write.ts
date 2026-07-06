@@ -149,7 +149,12 @@ export async function performGatedWrite(options: GatedWriteOptions): Promise<Ext
   const sessionNodeId = collected.sessionNodeId
   const sessionRef: NodeRef = { label: 'Session', id: sessionNodeId }
   const deterministic: EdgeProps = { extracted_by: extractionProvenance('deterministic'), confidence: 1.0 }
-  const tierPass: ExtractionPass = extraction.tier === 'cloud' ? 'llm-cloud' : 'llm-local'
+  const tierPass: ExtractionPass =
+    extraction.tier === 'cloud'
+      ? 'llm-cloud'
+      : extraction.tier === 'subscription'
+        ? 'llm-subscription'
+        : 'llm-local'
 
   interface CommittedNode {
     label: NodeLabel

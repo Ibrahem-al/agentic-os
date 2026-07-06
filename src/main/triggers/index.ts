@@ -29,6 +29,8 @@ export {
   createSessionEndHookHandler,
   drainSessionSpool,
   enqueueExtraction,
+  enqueueExtractionContinuation,
+  extractionContinuationTaskId,
   extractionTaskId,
   registerExtractionHandler,
   type ExtractionHandlerDeps,

@@ -21,7 +21,7 @@ import type { JsonObject, WorkflowStep } from '../../kernel'
 import { meteredComplete } from '../../models'
 import type { RoleKey } from '../../models'
 import { runBenchmark } from './benchmark'
-import { generateCandidate } from './candidate'
+import { generateCandidate, useProvidedCandidate, type ProvidedCandidate } from './candidate'
 import { planImprovementRun } from './gate'
 import {
   adoptSkillVersion,
@@ -71,6 +71,12 @@ export interface RunImprovementOptions {
   readonly skillId?: string
   /** Caller-supplied job id (the queue handler); defaults to a random UUID. */
   readonly jobId?: string
+  /**
+   * A client-provided SKILL.md revision (propose_skill_revision, phase-18): the
+   * candidate step validates + uses it instead of the cloud rewrite LLM. It
+   * still rides the full benchmark + §17 gate — never auto-adopted from here.
+   */
+  readonly providedCandidate?: ProvidedCandidate
 }
 
 export interface SkillImprovementAgent {
@@ -81,6 +87,8 @@ export interface SkillImprovementAgent {
 interface ImprovementInput {
   readonly mode: 'nightly' | 'manual'
   readonly skillId: string | null
+  /** phase-18: a client-provided candidate for `skillId` (else the cloud rewrite runs). */
+  readonly providedCandidate?: ProvidedCandidate | null
 }
 
 /**
@@ -149,10 +157,22 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
       name: 'candidate',
       async run(state, ctx): Promise<JsonObject> {
         const plan = state['plan'] as PlanState
+        const provided = (state['providedCandidate'] ?? null) as ProvidedCandidate | null
         const cloud = cloudCallFor(deps, 'skills.rewrite', ctx.jobId)
         const candidates: SkillCandidate[] = []
         const warnings: string[] = []
         for (const item of plan.work) {
+          const baseline = baselineSkillMdOf(item)
+          // A client-provided revision (propose_skill_revision) bypasses the
+          // rewrite LLM entirely — validated + version-id recomputed here, BEFORE
+          // the no-cloud guard (a provided candidate needs no cloud tier). It
+          // still runs the full benchmark + §17 gate below; never self-certifies.
+          if (provided !== null && provided.skillId === item.skillId) {
+            const candidate = useProvidedCandidate({ item, skillMd: baseline.md, expectedName: baseline.name, provided })
+            if (candidate.error !== null) warnings.push(`${item.skillId}: ${candidate.error}`)
+            candidates.push(candidate)
+            continue
+          }
           if (cloud === null) {
             // No cloud/subscription tier for the rewrite (keyless default resolves
             // local) → skip, exactly as today. DEFAULT == TODAY.
@@ -164,7 +184,6 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
             })
             continue
           }
-          const baseline = baselineSkillMdOf(item)
           const candidate = await generateCandidate({
             item,
             skillMd: baseline.md,
@@ -255,7 +274,8 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
       const jobId = options.jobId ?? randomUUID()
       const input: ImprovementInput = {
         mode: options.skillId !== undefined && options.skillId !== '' ? 'manual' : 'nightly',
-        skillId: options.skillId ?? null
+        skillId: options.skillId ?? null,
+        providedCandidate: options.providedCandidate ?? null
       }
       await deps.runner.run(SKILL_IMPROVEMENT_WORKFLOW, input as unknown as JsonObject, {
         jobId,

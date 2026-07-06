@@ -523,6 +523,14 @@ function bootAgents(): void {
     embedder: ollama,
     llm: ollama,
     cloud,
+    // Phase-18: the §11.4 provider router owns the 3 extraction roles' backend
+    // resolution per run (extraction.fuzzy decides two-tier vs the subscription
+    // single tier; extraction.tiebreak; extraction.verify) and WINS over
+    // llm/cloud when present. A keyless, runner-off default resolves every role to
+    // its today tier ⇒ DEFAULT == TODAY (two-tier local + cloud escalation,
+    // byte-identical). Mirrors the skill-improvement agent below. types.ts: "Only
+    // boot injects it" — this is that injection.
+    ...(providerRouter !== null ? { router: providerRouter } : {}),
     // §13 (phase 09): the write step's lane job records a reversible delta.
     ...(securityInstances !== null ? { audit: securityInstances.audit } : {})
   })
@@ -543,7 +551,7 @@ function bootAgents(): void {
       cloud,
       // Phase-16b: the router wins when present (cloud roles route through it
       // with the same §14 $0.50 ceiling; a keyless default resolves them local
-      // ⇒ skipped exactly as today). Extraction stays UNWIRED (deferred: 18).
+      // ⇒ skipped exactly as today). Extraction is now wired the same way (phase-18).
       ...(providerRouter !== null ? { router: providerRouter } : {}),
       audit: securityInstances.audit
     })
@@ -725,6 +733,11 @@ function bootIpc(): void {
       ...(subscriptionRunner !== null ? { runnerStatus: subscriptionRunner } : {}),
       triggers,
       watchedFolders: new WatchedFolderStore({ configPath: join(userDataDir, WATCHED_FOLDERS_CONFIG_FILENAME) }),
+      // Phase-18: the §8 queue backs the staged-write + control tools
+      // (run_extraction / improve_skill_now / run_maintenance / retry_task /
+      // propose_skill_revision / submit_extraction_items). Absent ⇒ those tools
+      // return a clean INVALID_STATE (triggers did not boot this launch).
+      ...(triggerInstances !== null ? { queue: triggerInstances.queue } : {}),
       ollama,
       keychain,
       appStatus: {
