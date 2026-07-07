@@ -90,6 +90,10 @@ export interface TaskSweepResult {
  * workflow jobs go regardless (resume() no-ops on done rows) — that includes
  * extract-*-wf checkpoints, safe because their task rows are kept and done
  * tasks never re-fire.
+ *
+ * Phase-18 exemption: `extract-cont-*` rows (delegate/continuation tasks + their
+ * `-wf` jobs) are NOT §6 exactly-once tokens — nothing re-derives them from a
+ * quiet session — so they sweep after retention like any other finished row.
  */
 export function runTaskRetentionSweep(db: BetterSqlite3.Database, now: Date = new Date()): TaskSweepResult {
   // tasks.updated_at is TEXT strftime('%Y-%m-%dT%H:%M:%fZ') — the same shape
@@ -114,7 +118,8 @@ export function runTaskRetentionSweep(db: BetterSqlite3.Database, now: Date = ne
     .prepare(
       `DELETE FROM tasks
        WHERE status IN ('done', 'failed') AND updated_at < ?
-         AND kind != ? AND NOT (kind = 'workflow' AND id LIKE 'extract-%')`
+         AND NOT (kind = ? AND id NOT LIKE 'extract-cont-%')
+         AND NOT (kind = 'workflow' AND id LIKE 'extract-%' AND id NOT LIKE 'extract-cont-%')`
     )
     .run(cutoffIso, EXTRACTION_TASK_KIND).changes
   return { taskRows, checkpointRows, cutoffIso }

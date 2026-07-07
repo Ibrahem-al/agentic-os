@@ -29,11 +29,14 @@ import {
   EXTRACTION_ESCALATE_TRANSCRIPT_TOKENS,
   EXTRACTION_LOCAL_CHUNK_TOKENS,
   EXTRACTION_MAX_ITEMS_PER_PASS,
-  EXTRACTION_PASS_MAX_TOKENS
+  EXTRACTION_PASS_MAX_TOKENS,
+  EXTRACTION_SUBSCRIPTION_CHUNK_TOKENS,
+  EXTRACTION_SUBSCRIPTION_PASS_MAX_TOKENS
 } from '../../config'
 import { meteredComplete } from '../../models'
 import { estimatingTokenCounter, type TokenCounter } from '../../retrieval'
 import {
+  ExtractionUnavailableError,
   normalizeItemText,
   type ExtractedComponent,
   type ExtractedCorrection,
@@ -276,7 +279,14 @@ const cleanStringList = (value: unknown, maxItems: number, maxChars: number): st
   return out
 }
 
-function normalizeComponent(raw: unknown, chunk: number): ExtractedComponent | null {
+/**
+ * Normalize a raw model item (snake_case, the fuzzy-pass JSON shape) into an
+ * `ExtractedComponent`. EXPORTED (phase-18) so the interactive
+ * `submit_extraction_items` MCP tool normalizes agent-submitted items through
+ * the exact same field-by-field rules before staging them in
+ * `runner_submissions` (identical dedup keys + clamping as the local passes).
+ */
+export function normalizeComponent(raw: unknown, chunk: number): ExtractedComponent | null {
   if (!isRecord(raw)) return null
   const name = cleanText(raw['name'], 200)
   if (name === null) return null
@@ -291,7 +301,8 @@ function normalizeComponent(raw: unknown, chunk: number): ExtractedComponent | n
   }
 }
 
-function normalizePreference(raw: unknown, chunk: number): ExtractedPreference | null {
+/** Normalize a raw model preference item (phase-18: also `submit_extraction_items`). */
+export function normalizePreference(raw: unknown, chunk: number): ExtractedPreference | null {
   if (!isRecord(raw)) return null
   const statement = cleanText(raw['statement'], 400)
   if (statement === null) return null
@@ -305,7 +316,8 @@ function normalizePreference(raw: unknown, chunk: number): ExtractedPreference |
   }
 }
 
-function normalizeCorrection(raw: unknown, chunk: number): ExtractedCorrection | null {
+/** Normalize a raw model correction item (phase-18: also `submit_extraction_items`). */
+export function normalizeCorrection(raw: unknown, chunk: number): ExtractedCorrection | null {
   if (!isRecord(raw)) return null
   const content = cleanText(raw['content'], 400)
   if (content === null) return null
@@ -315,6 +327,63 @@ function normalizeCorrection(raw: unknown, chunk: number): ExtractedCorrection |
     confidence: cleanConfidence(raw['confidence']),
     evidence: cleanText(raw['evidence'], 300) ?? '',
     chunk
+  }
+}
+
+// ── Submission read-back (phase-18: runner_submissions → typed items) ─────────
+
+/** A non-negative integer chunk index from a stored submission payload. */
+const cleanChunk = (value: unknown): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0
+  return Math.max(0, Math.trunc(value))
+}
+
+/**
+ * Rebuild an `ExtractedComponent` from a `runner_submissions` payload — the
+ * ALREADY-normalized (camelCase) `ExtractedComponent` JSON the delegate reads
+ * back. Defensive (a corrupt row must never crash the delegate workflow):
+ * missing fields default, confidence clamps, garbage → null (dropped).
+ */
+export function componentFromSubmission(value: unknown): ExtractedComponent | null {
+  if (!isRecord(value)) return null
+  const name = cleanText(value['name'], 200)
+  if (name === null) return null
+  return {
+    name,
+    type: (cleanText(value['type'], 24) ?? 'other').toLowerCase(),
+    dependsOn: cleanStringList(value['dependsOn'], 10, 200),
+    confidence: cleanConfidence(value['confidence']),
+    evidence: cleanText(value['evidence'], 300) ?? '',
+    chunk: cleanChunk(value['chunk'])
+  }
+}
+
+/** Rebuild an `ExtractedPreference` from a stored `runner_submissions` payload. */
+export function preferenceFromSubmission(value: unknown): ExtractedPreference | null {
+  if (!isRecord(value)) return null
+  const statement = cleanText(value['statement'], 400)
+  if (statement === null) return null
+  return {
+    statement,
+    tags: cleanStringList(value['tags'], 5, 40).map((t) => t.toLowerCase()),
+    derivedFrom: cleanText(value['derivedFrom'], 300),
+    confidence: cleanConfidence(value['confidence']),
+    evidence: cleanText(value['evidence'], 300) ?? '',
+    chunk: cleanChunk(value['chunk'])
+  }
+}
+
+/** Rebuild an `ExtractedCorrection` from a stored `runner_submissions` payload. */
+export function correctionFromSubmission(value: unknown): ExtractedCorrection | null {
+  if (!isRecord(value)) return null
+  const content = cleanText(value['content'], 400)
+  if (content === null) return null
+  return {
+    content,
+    skill: cleanText(value['skill'], 100),
+    confidence: cleanConfidence(value['confidence']),
+    evidence: cleanText(value['evidence'], 300) ?? '',
+    chunk: cleanChunk(value['chunk'])
   }
 }
 
@@ -474,6 +543,18 @@ const mean = (values: readonly number[]): number | null =>
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
+/**
+ * Extraction mode (phase-18). `'two-tier'` (the default, DEFAULT == TODAY) is
+ * today's local-first fuzzy passes + the two §20 cloud-escalation gates.
+ * `'subscription'` is the §2.2 SINGLE tier: the big-context subscription Claude
+ * IS the primary reasoning tier, so there is nothing smaller to escalate FROM —
+ * Gate A/B become no-ops, chunks grow to `EXTRACTION_SUBSCRIPTION_CHUNK_TOKENS`
+ * (30k) and the pass cap to `EXTRACTION_SUBSCRIPTION_PASS_MAX_TOKENS` (2k). The
+ * agent decides the mode once per run from
+ * `router.resolve('extraction.fuzzy').backend`.
+ */
+export type ExtractionMode = 'two-tier' | 'subscription'
+
 export interface FuzzyExtractionOptions {
   readonly llm: ExtractionLlm
   /** Cloud tier + the job's task id for §14 metered spend; null = not configured. */
@@ -481,6 +562,8 @@ export interface FuzzyExtractionOptions {
   readonly transcript: TranscriptDigest | null
   /** Injectable for tests; defaults to the conservative estimating counter. */
   readonly counter?: TokenCounter
+  /** Extraction mode (phase-18); absent → `'two-tier'` (today, unchanged). */
+  readonly mode?: ExtractionMode
 }
 
 export async function runFuzzyExtraction(options: FuzzyExtractionOptions): Promise<FuzzyExtractionState> {
@@ -497,6 +580,47 @@ export async function runFuzzyExtraction(options: FuzzyExtractionOptions): Promi
       escalationReason: null,
       chunkTexts: [],
       warnings: transcript === null ? [] : ['transcript rendered no conversation text — fuzzy passes skipped']
+    }
+  }
+
+  // ESCALATION-MODE branch (phase-18): the subscription tier is a SINGLE
+  // big-context tier — run the fuzzy passes once over 30k chunks, no Gate A/B,
+  // no cloud escalation (there is no smaller tier to escalate from). `options.llm`
+  // is the router-bound `extraction.fuzzy` reasoner resolving to subscription-claude.
+  if ((options.mode ?? 'two-tier') === 'subscription') {
+    const subscriptionCaller: PassCaller = async (pass, prompt, system) => {
+      const result = await options.llm.generate(prompt, {
+        system,
+        maxTokens: EXTRACTION_SUBSCRIPTION_PASS_MAX_TOKENS,
+        temperature: 0,
+        // The subscription backend has no constrained decoding; the router folds
+        // the schema into the prompt as a shape instruction, so replies still
+        // arrive as the `{"items": [...]}` shape `extractItemsReply` reads.
+        format: FUZZY_PASS_SCHEMAS[pass]
+      })
+      return result.text
+    }
+    const subscriptionChunks = chunkTranscript(transcript.text, EXTRACTION_SUBSCRIPTION_CHUNK_TOKENS, counter)
+    const run = await runPasses(subscriptionCaller, subscriptionChunks, 'subscription')
+    // P0.1 (MCP-COVERAGE §9.5): every subscription call threw — the run learned
+    // NOTHING; throw the ordinary retryable error rather than tombstone the
+    // session as extracted-empty (the queue's §20 round re-attempts).
+    if (run.totalCalls > 0 && run.failedCalls === run.totalCalls) {
+      throw new ExtractionUnavailableError(
+        `extraction: all ${run.totalCalls} subscription fuzzy-pass calls failed — ` +
+          'no model tier produced output; retry later instead of committing an empty extraction'
+      )
+    }
+    return {
+      tier: 'subscription',
+      components: run.components,
+      preferences: run.preferences,
+      corrections: run.corrections,
+      sessionConfidence: mean(run.callScores),
+      escalated: false,
+      escalationReason: null,
+      chunkTexts: subscriptionChunks,
+      warnings: run.warnings
     }
   }
 
@@ -582,6 +706,27 @@ export async function runFuzzyExtraction(options: FuzzyExtractionOptions): Promi
         `local extraction confidence ${sessionConfidence.toFixed(2)} < ${EXTRACTION_ESCALATE_CONFIDENCE} and no cloud tier is configured — low-confidence items will be staged for review`
       )
     }
+  }
+
+  // P0.1 (MCP-COVERAGE §9.5, phase 14): every local call threw — the run
+  // learned NOTHING, and returning the empty local state would let the
+  // workflow flip the exactly-once `extract-<sessionId>` task to 'done',
+  // silently tombstoning the session as extracted forever. Throw an ordinary
+  // retryable error instead so the §20 retry/defer machinery re-attempts.
+  // Placement is load-bearing: this sits AFTER both escalation gates, so a
+  // cloud rescue that produced output already returned above (tier 'cloud')
+  // and is never killed — only the no-cloud and cloud-also-all-failed paths
+  // reach here. The empty-transcript path (totalCalls === 0 — nothing was
+  // ever asked of a model) returned tier 'none' long before this point and
+  // still skips quietly.
+  if (localRun.totalCalls > 0 && localRun.failedCalls === localRun.totalCalls) {
+    throw new ExtractionUnavailableError(
+      `extraction: all ${localRun.totalCalls} local fuzzy-pass calls failed` +
+        (cloudCaller !== null
+          ? ' and the cloud escalation failed on every call'
+          : ' and no cloud tier is configured') +
+        ' — no model tier produced output; retry later instead of committing an empty extraction'
+    )
   }
 
   return {

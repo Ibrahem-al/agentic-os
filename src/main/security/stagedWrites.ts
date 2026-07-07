@@ -143,6 +143,22 @@ export function getStagedWrite(db: BetterSqlite3.Database, id: string): StagedWr
   return row === undefined ? undefined : decodeRow(row)
 }
 
+/**
+ * §9.2 preflight (P1.7): does approving this staged row need a live embedder at
+ * commit time? True for EXACTLY the case `commitExtraction` embeds — an
+ * extraction `create` of a retrievable node marked `embedOnCommit` — so the
+ * approve UI can preflight `OllamaClient.status()` and WARN (never block) when
+ * Ollama is down at click time (esp. under stageAll, where a batch of new
+ * Preferences all need a vector at commit). A non-throwing read over the raw
+ * payload: correction/skill-improvement rows and merge/`embedOnCommit:false`
+ * extractions are always false.
+ */
+export function stagedWriteRequiresEmbedder(row: Pick<StagedWriteRow, 'kind' | 'payload'>): boolean {
+  if (row.kind !== 'extraction') return false
+  const p = row.payload
+  return p['op'] === 'create' && p['embedOnCommit'] === true && p['node'] !== null && p['node'] !== undefined
+}
+
 // ── human-readable diff (§13 "user-visible diff before commit") ──────────────
 
 export async function renderStagedWriteDiff(

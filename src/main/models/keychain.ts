@@ -27,7 +27,11 @@ export interface SafeStorageLike {
 }
 
 /** Well-known secret names (free-form names are also allowed). */
-export type KnownSecretName = `apiKey.${CloudProvider}` | 'mcp.bearerToken' | 'hooks.sessionEndToken'
+export type KnownSecretName =
+  | `apiKey.${CloudProvider}`
+  | 'mcp.bearerToken'
+  | 'hooks.sessionEndToken'
+  | 'runner.token'
 
 export const MCP_BEARER_TOKEN_SECRET = 'mcp.bearerToken'
 /**
@@ -37,6 +41,15 @@ export const MCP_BEARER_TOKEN_SECRET = 'mcp.bearerToken'
  * command line, which must never expose the real MCP surface.
  */
 export const SESSION_END_HOOK_TOKEN_SECRET = 'hooks.sessionEndToken'
+/**
+ * The headless-runner MCP token (phase 14, MCP-COVERAGE §10.1/§10.5) — a
+ * THIRD token, distinct from both above: only spawned `claude -p` children
+ * ever hold it (via env-var expansion, never plaintext on disk), and unlike
+ * the long-lived MCP bearer token it is ROTATED on every boot, so its
+ * lifetime is one app process generation — a zombie child orphaned by a
+ * crash 401s on its next call instead of riding the restarted server.
+ */
+export const RUNNER_TOKEN_SECRET = 'runner.token'
 
 export function apiKeySecretName(provider: CloudProvider): KnownSecretName {
   return `apiKey.${provider}`
@@ -130,6 +143,30 @@ export class Keychain {
     if (existing) return existing
     const token = randomBytes(32).toString('base64url')
     this.setSecret(SESSION_END_HOOK_TOKEN_SECRET, token)
+    return token
+  }
+
+  /**
+   * The runner token (phase 14) — get-or-create for callers that need the
+   * CURRENT value without invalidating live children. Idempotent.
+   */
+  ensureRunnerToken(): string {
+    const existing = this.getSecret(RUNNER_TOKEN_SECRET)
+    if (existing) return existing
+    const token = randomBytes(32).toString('base64url')
+    this.setSecret(RUNNER_TOKEN_SECRET, token)
+    return token
+  }
+
+  /**
+   * UNCONDITIONALLY mint + persist a fresh runner token, killing whatever
+   * token existed before — never read-existing. Boot calls this BEFORE the
+   * MCP server starts (P0.3/§10.1 zombie defense): a child that survived the
+   * previous process holds a token that no longer authenticates.
+   */
+  rotateRunnerToken(): string {
+    const token = randomBytes(32).toString('base64url')
+    this.setSecret(RUNNER_TOKEN_SECRET, token)
     return token
   }
 

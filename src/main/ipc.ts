@@ -13,8 +13,6 @@
  * this layer only relays it.
  */
 import { app, BrowserWindow, dialog, ipcMain, type IpcMainInvokeEvent } from 'electron'
-import { readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type BetterSqlite3 from 'better-sqlite3'
 import type {
@@ -24,7 +22,6 @@ import type {
   IngestCodebaseResultDto,
   IngestDocumentResultDto,
   IpcChannel,
-  IpcCloudProvider,
   IpcErrorCode,
   IpcNodeLabel,
   IpcRequest,
@@ -32,51 +29,32 @@ import type {
   IpcResult,
   JsonObject,
   JsonValue,
-  LabelCountDto,
-  MemoryEdgeDto,
-  MemoryNodeDetailDto,
-  MemoryNodeSummaryDto,
   OllamaPullProgressDto,
+  ReasoningSettingsDto,
+  RunnerSettingsDto,
   SettingsDto,
-  SkillDetailDto,
   SkillImprovementDto,
   SkillImprovementEntryDto,
   SkillSummaryDto,
-  SpendEntryDto,
-  SpendSummaryDto,
   StagedWriteDto,
-  TaskDto,
-  TraceSpanDto,
-  TraceSummaryDto,
   WatchedFolderDto
 } from '../shared/ipc'
-import { IPC_EVENT_INGEST_PROGRESS, IPC_EVENT_OLLAMA_PULL, IPC_INVOKE_PREFIX, IPC_NODE_LABELS } from '../shared/ipc'
-import {
-  CLOUD_DEFAULT_MODELS,
-  CLOUD_PROVIDERS,
-  HOOK_SESSION_END_URL,
-  SPEND_CEILING_USD_DEFAULT,
-  SPOOL_DIR,
-  WATCHED_FOLDERS_CONFIG_FILENAME,
-  type CloudProvider
-} from './config'
-import {
-  NODE_TABLES,
-  REL_TABLES,
-  nodeTable,
-  type NodeLabel,
-  type StorageEngine
-} from './storage'
+import { IPC_EVENT_INGEST_PROGRESS, IPC_EVENT_OLLAMA_PULL, IPC_INVOKE_PREFIX } from '../shared/ipc'
+import { CLOUD_PROVIDERS, WATCHED_FOLDERS_CONFIG_FILENAME, type CloudProvider } from './config'
+import { type StorageEngine } from './storage'
 import {
   Keychain,
   OllamaClient,
   OllamaError,
   Reranker,
   apiKeySecretName,
+  defaultReasoningSettings,
+  defaultRunnerSettings,
   loadModelSettings,
   saveModelSettings,
   settingsPath,
-  type ModelSettings
+  type ModelSettings,
+  type ProviderRouter
 } from './models'
 import { searchMemory } from './retrieval'
 import {
@@ -89,6 +67,7 @@ import {
   listStagedWrites,
   rejectStagedWriteWithEffects,
   renderStagedWriteDiff,
+  stagedWriteRequiresEmbedder,
   type InjectionScanner
 } from './security'
 import {
@@ -118,6 +97,21 @@ import {
   type TriggerSchedules,
   type TriggerWatchers
 } from './triggers'
+import {
+  getNode,
+  getRunnerStatus,
+  getSettingsSummary,
+  getSkillDetail,
+  getSpendSummary,
+  getTrace,
+  getTriggersStatus,
+  listInjectionFlags,
+  listNodes,
+  listTasks,
+  listTraces,
+  memoryCounts
+} from './reads'
+import type { Runner, TestConnectionResult } from './runner'
 
 /** The phase-11 trigger runtime the status/installer channels read. */
 export interface IpcTriggerDeps {
@@ -141,6 +135,32 @@ export interface IpcDeps {
   readonly triggers: IpcTriggerDeps | null
   readonly userDataDir: string
   readonly subsystems: AppStatusDto['subsystems']
+  /**
+   * Phase-16b (P1.1): fired by the settings mutators (save / setApiKey /
+   * clearApiKey) AFTER a successful mutation so boot can drop the ProviderRouter's
+   * cached snapshot (router.invalidate()); a provider/key/role change then takes
+   * effect on the NEXT reasoning call with no app restart. Optional — unset in
+   * every test rig and any launch without a router (the mutation still persists,
+   * only the live re-route is skipped).
+   */
+  readonly onSettingsChanged?: () => void
+  /**
+   * Phase-17 subscription runner — backs `runner.status` (health snapshot +
+   * latest runner_runs row) and `runner.testConnection` (the manual 1-turn
+   * canary, §3.7). Optional: null/absent when the runner did not boot (storage
+   * down) or in test rigs; `runner.status` then reports the disabled/unknown
+   * shape and `runner.testConnection` surfaces UNAVAILABLE.
+   */
+  readonly runner?: Pick<Runner, 'healthSnapshot' | 'testConnection' | 'isHealthy'> | null
+  /**
+   * Phase-21: the phase-16 ProviderRouter (live role resolution). Read by
+   * `runner.status` to fill the DTO's `effectiveBackend` — where a
+   * subscription-eligible role actually lands while the runner is falling back.
+   * Optional/null (like `onSettingsChanged`): unset in test rigs and any launch
+   * without a router, in which case `effectiveBackend` reports null (DEFAULT ==
+   * TODAY).
+   */
+  readonly router?: ProviderRouter | null
 }
 
 /** The name decisions are recorded under (§13 decided_by / decidedBy). */
@@ -186,49 +206,16 @@ const jsonObject = (value: unknown): JsonObject => {
   return typeof result === 'object' && result !== null && !Array.isArray(result) ? result : {}
 }
 
-// ── memory browser helpers ────────────────────────────────────────────────────
-
-/** The property that names a node in lists (label-specific, schema-backed). */
-const DISPLAY_PROPS: Readonly<Record<IpcNodeLabel, readonly string[]>> = {
-  Session: ['transcript_ref'],
-  Project: ['name'],
-  Skill: ['name'],
-  SkillVersion: ['status'],
-  Example: ['kind', 'content'],
-  Correction: ['content'],
-  Preference: ['statement'],
-  MCP: ['name'],
-  Plugin: ['name'],
-  Component: ['name'],
-  Document: ['source'],
-  Knowledge: ['content'],
-  Tag: ['name']
-}
-
-const truncate = (text: string, max = 140): string =>
-  text.length > max ? `${text.slice(0, max - 1)}…` : text
-
-const displayOf = (label: IpcNodeLabel, row: Record<string, unknown>, id: string): string => {
-  const parts = DISPLAY_PROPS[label]
-    .map((prop) => row[prop])
-    .filter((v): v is string => typeof v === 'string' && v !== '')
-  return parts.length > 0 ? truncate(parts.join(' · ').replace(/\s+/g, ' ')) : id
-}
-
-const assertLabel = (label: string): IpcNodeLabel => {
-  if (!(IPC_NODE_LABELS as readonly string[]).includes(label)) {
-    throw new IngestError('INVALID_INPUT', `unknown node label '${label}'`)
+/** Compose the runner test-connection canary result into one operator line (§3.7). */
+const testConnectionMessage = (r: TestConnectionResult): string => {
+  if (r.ok) {
+    const version = r.version !== null ? ` (claude ${r.version})` : ''
+    const sample = r.sample !== undefined && r.sample !== '' ? ` — replied: ${r.sample}` : ''
+    return `Connected${version}${sample}`
   }
-  return label as IpcNodeLabel
-}
-
-/** Node columns worth shipping to the inspector (embedding never crosses). */
-const inspectableColumns = (label: NodeLabel): string[] => {
-  const spec = nodeTable(label)
-  const cols = ['id', ...spec.properties.map((p) => p.name)]
-  if (spec.provenance) cols.push('extracted_by', 'confidence')
-  cols.push('created_at', 'updated_at')
-  return cols
+  const detail = r.error ?? `runner ${r.state}`
+  // The one actionable line for the common expired-login case (§3.7 banner copy).
+  return r.state === 'auth-expired' ? `${detail} — run \`claude /login\` in any terminal, then Retry` : detail
 }
 
 // ── registration ──────────────────────────────────────────────────────────────
@@ -280,39 +267,9 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   // ── memory browser ─────────────────────────────────────────────────────────
 
-  register('memory.counts', async () => {
-    const engine = need.engine()
-    const counts: LabelCountDto[] = []
-    for (const spec of NODE_TABLES) {
-      const rows = await engine.cypher(`MATCH (n:${spec.label}) RETURN count(n) AS c`)
-      counts.push({ label: spec.label, count: Number(rows[0]?.['c'] ?? 0) })
-    }
-    return counts
-  })
+  register('memory.counts', () => memoryCounts(need.engine()))
 
-  register('memory.list', async ({ label, limit, offset }) => {
-    const engine = need.engine()
-    const safeLabel = assertLabel(label)
-    const safeLimit = Math.min(Math.max(Math.trunc(limit) || 0, 1), 200)
-    const safeOffset = Math.max(Math.trunc(offset) || 0, 0)
-    const displayCols = DISPLAY_PROPS[safeLabel]
-    const select = ['n.id AS id', 'n.updated_at AS updated_at', ...displayCols.map((p) => `n.${p} AS ${p}`)]
-    const rows = await engine.cypher(
-      `MATCH (n:${safeLabel}) RETURN ${select.join(', ')} ORDER BY n.updated_at DESC, n.id SKIP ${safeOffset} LIMIT ${safeLimit}`
-    )
-    const totalRows = await engine.cypher(`MATCH (n:${safeLabel}) RETURN count(n) AS c`)
-    const summaries: MemoryNodeSummaryDto[] = rows.map((row) => {
-      const id = String(row['id'] ?? '')
-      const updated = row['updated_at']
-      return {
-        label: safeLabel,
-        id,
-        display: displayOf(safeLabel, row, id),
-        updatedAt: updated instanceof Date ? updated.toISOString() : updated == null ? null : String(updated)
-      }
-    })
-    return { rows: summaries, total: Number(totalRows[0]?.['c'] ?? 0) }
-  })
+  register('memory.list', ({ label, limit, offset }) => listNodes(need.engine(), { label, limit, offset }))
 
   register('memory.search', async ({ query, labels, k }) => {
     const hits = await searchMemory(
@@ -333,67 +290,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     }))
   })
 
-  register('memory.node', async ({ label, id }) => {
-    const engine = need.engine()
-    const safeLabel = assertLabel(label)
-    const cols = inspectableColumns(safeLabel)
-    const propRows = await engine.cypher(
-      `MATCH (n:${safeLabel} {id: $id}) RETURN ${cols.map((c) => `n.${c} AS ${c}`).join(', ')} LIMIT 1`,
-      { id }
-    )
-    const propRow = propRows[0]
-    if (propRow === undefined) {
-      throw new IngestError('NOT_FOUND', `${safeLabel} ${id} does not exist`)
-    }
-
-    const edges: { outgoing: MemoryEdgeDto[]; incoming: MemoryEdgeDto[] } = { outgoing: [], incoming: [] }
-    const relSelect = 'r.extracted_by AS r_extracted_by, r.confidence AS r_confidence, r.created_at AS r_created_at'
-    for (const rel of REL_TABLES) {
-      for (const [from, to] of rel.pairs) {
-        if (from === safeLabel) {
-          const otherCols = DISPLAY_PROPS[to].map((p) => `m.${p} AS ${p}`).join(', ')
-          const rows = await engine.cypher(
-            `MATCH (n:${safeLabel} {id: $id})-[r:${rel.type}]->(m:${to}) RETURN m.id AS id${otherCols ? `, ${otherCols}` : ''}, ${relSelect} LIMIT 100`,
-            { id }
-          )
-          for (const row of rows) edges.outgoing.push(edgeDto(rel.type, 'out', to, row))
-        }
-        if (to === safeLabel) {
-          const otherCols = DISPLAY_PROPS[from].map((p) => `m.${p} AS ${p}`).join(', ')
-          const rows = await engine.cypher(
-            `MATCH (m:${from})-[r:${rel.type}]->(n:${safeLabel} {id: $id}) RETURN m.id AS id${otherCols ? `, ${otherCols}` : ''}, ${relSelect} LIMIT 100`,
-            { id }
-          )
-          for (const row of rows) edges.incoming.push(edgeDto(rel.type, 'in', from, row))
-        }
-      }
-    }
-
-    const detail: MemoryNodeDetailDto = {
-      label: safeLabel,
-      id,
-      props: jsonObject(propRow),
-      outgoing: edges.outgoing,
-      incoming: edges.incoming
-    }
-    return detail
-  })
-
-  const edgeDto = (
-    type: string,
-    direction: 'out' | 'in',
-    label: IpcNodeLabel,
-    row: Record<string, unknown>
-  ): MemoryEdgeDto => {
-    const id = String(row['id'] ?? '')
-    const props: JsonObject = {}
-    for (const [key, value] of Object.entries(row)) {
-      if (key.startsWith('r_') && value !== null && value !== undefined) {
-        props[key.slice(2)] = jsonify(value)
-      }
-    }
-    return { type, direction, label, id, display: displayOf(label, row, id), props }
-  }
+  register('memory.node', ({ label, id }) => getNode(need.engine(), { label, id }))
 
   // ── review queue ───────────────────────────────────────────────────────────
 
@@ -411,7 +308,8 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         validation: row.validation === null ? null : jsonObject(row.validation),
         createdAt: row.createdAt,
         decidedAt: row.decidedAt,
-        committedAt: row.committedAt
+        committedAt: row.committedAt,
+        requiresEmbedder: stagedWriteRequiresEmbedder(row)
       })
     )
   })
@@ -479,20 +377,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     return null
   })
 
-  register('review.flags.list', () => {
-    const rows = need
-      .db()
-      .prepare('SELECT id, source, detector, pattern, excerpt, created_at FROM injection_flags ORDER BY created_at DESC, id LIMIT 500')
-      .all() as { id: string; source: string; detector: 'regex' | 'llm'; pattern: string; excerpt: string; created_at: string }[]
-    return rows.map((row) => ({
-      id: row.id,
-      source: row.source,
-      detector: row.detector,
-      pattern: row.pattern,
-      excerpt: row.excerpt,
-      createdAt: row.created_at
-    }))
-  })
+  register('review.flags.list', () => listInjectionFlags(need.db()))
 
   // ── audit / undo ───────────────────────────────────────────────────────────
 
@@ -532,87 +417,11 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   // ── spend ──────────────────────────────────────────────────────────────────
 
-  register('spend.summary', () => {
-    const db = need.db()
-    const total = db.prepare('SELECT COALESCE(SUM(usd), 0) AS t FROM spend').get() as { t: number }
-    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-    const last24h = db.prepare('SELECT COALESCE(SUM(usd), 0) AS t FROM spend WHERE created_at >= ?').get(cutoff) as {
-      t: number
-    }
-    const byTask = db
-      .prepare(
-        `SELECT task_id, SUM(usd) AS usd, COUNT(*) AS calls, MAX(created_at) AS last_at
-         FROM spend WHERE task_id IS NOT NULL GROUP BY task_id ORDER BY usd DESC LIMIT 20`
-      )
-      .all() as { task_id: string; usd: number; calls: number; last_at: string }[]
-    const recent = db
-      .prepare(
-        `SELECT id, task_id, provider, model, input_tokens, output_tokens, usd, created_at
-         FROM spend ORDER BY created_at DESC, id DESC LIMIT 50`
-      )
-      .all() as {
-      id: number
-      task_id: string | null
-      provider: string | null
-      model: string | null
-      input_tokens: number | null
-      output_tokens: number | null
-      usd: number
-      created_at: string
-    }[]
-    const summary: SpendSummaryDto = {
-      totalUsd: total.t,
-      last24hUsd: last24h.t,
-      ceilingUsd: SPEND_CEILING_USD_DEFAULT,
-      byTask: byTask.map((row) => ({ taskId: row.task_id, usd: row.usd, calls: row.calls, lastAt: row.last_at })),
-      recent: recent.map(
-        (row): SpendEntryDto => ({
-          id: row.id,
-          taskId: row.task_id,
-          provider: row.provider,
-          model: row.model,
-          inputTokens: row.input_tokens,
-          outputTokens: row.output_tokens,
-          usd: row.usd,
-          createdAt: row.created_at
-        })
-      )
-    }
-    return summary
-  })
+  register('spend.summary', () => getSpendSummary(need.db()))
 
   // ── tasks & watched folders ────────────────────────────────────────────────
 
-  register('tasks.list', () => {
-    const rows = need
-      .db()
-      .prepare(
-        `SELECT id, kind, status, attempts, not_before_unix_ms, last_error, created_at, updated_at
-         FROM tasks ORDER BY updated_at DESC LIMIT 200`
-      )
-      .all() as {
-      id: string
-      kind: string
-      status: TaskDto['status']
-      attempts: number
-      not_before_unix_ms: number | null
-      last_error: string | null
-      created_at: string
-      updated_at: string
-    }[]
-    return rows.map(
-      (row): TaskDto => ({
-        id: row.id,
-        kind: row.kind,
-        status: row.status,
-        attempts: row.attempts,
-        notBeforeUnixMs: row.not_before_unix_ms,
-        lastError: row.last_error,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      })
-    )
-  })
+  register('tasks.list', () => listTasks(need.db()))
 
   const watchStore = new WatchedFolderStore({
     configPath: join(deps.userDataDir, WATCHED_FOLDERS_CONFIG_FILENAME)
@@ -661,44 +470,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   // ── triggers & automation (phase 11) ───────────────────────────────────────
 
-  const claudeSettingsPath = join(homedir(), '.claude', 'settings.json')
-
-  register('triggers.status', () => {
-    let installed: boolean | null = null
-    try {
-      installed = readFileSync(claudeSettingsPath, 'utf8').includes('session-end.')
-    } catch (err) {
-      installed = (err as NodeJS.ErrnoException).code === 'ENOENT' ? false : null
-    }
-    const hook = {
-      endpoint: HOOK_SESSION_END_URL,
-      spoolDir: SPOOL_DIR,
-      settingsPath: claudeSettingsPath,
-      installed
-    }
-    const triggers = deps.triggers
-    if (triggers === null) {
-      return {
-        available: false,
-        queue: { counts: {}, runningTaskId: null },
-        schedules: [],
-        watchedFolders: [],
-        rules: [],
-        ruleErrors: [],
-        hook
-      }
-    }
-    const watcherStatus = triggers.watchers.status()
-    return {
-      available: true,
-      queue: { counts: triggers.queue.counts(), runningTaskId: triggers.queue.runningTaskId },
-      schedules: triggers.schedules.status(),
-      watchedFolders: watcherStatus.folders,
-      rules: watcherStatus.rules,
-      ruleErrors: triggers.ruleErrors.map((e) => ({ file: e.file, error: e.error })),
-      hook
-    }
-  })
+  register('triggers.status', () => getTriggersStatus({ triggers: deps.triggers }))
 
   register('triggers.installHook', () => {
     const keychain = need.keychain()
@@ -725,66 +497,9 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   // ── traces ─────────────────────────────────────────────────────────────────
 
-  register('traces.recent', ({ limit }) => {
-    const db = need.db()
-    const safeLimit = Math.min(Math.max(Math.trunc(limit ?? 50) || 50, 1), 200)
-    const rows = db
-      .prepare(
-        `SELECT trace_id,
-                MIN(start_unix_ms) AS start_ms,
-                MAX(COALESCE(end_unix_ms, start_unix_ms)) AS end_ms,
-                COUNT(*) AS span_count,
-                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count
-         FROM traces GROUP BY trace_id ORDER BY start_ms DESC LIMIT ?`
-      )
-      .all(safeLimit) as { trace_id: string; start_ms: number; end_ms: number; span_count: number; error_count: number }[]
-    const rootStmt = db.prepare(
-      `SELECT name FROM traces WHERE trace_id = ?
-       ORDER BY (parent_span_id IS NOT NULL AND parent_span_id != ''), start_unix_ms, id LIMIT 1`
-    )
-    return rows.map((row): TraceSummaryDto => {
-      const root = rootStmt.get(row.trace_id) as { name: string } | undefined
-      return {
-        traceId: row.trace_id,
-        rootName: root?.name ?? '(unknown)',
-        startUnixMs: row.start_ms,
-        durationMs: row.end_ms > row.start_ms ? row.end_ms - row.start_ms : null,
-        spanCount: row.span_count,
-        errorCount: row.error_count
-      }
-    })
-  })
+  register('traces.recent', ({ limit }) => listTraces(need.db(), { limit }))
 
-  register('traces.spans', ({ traceId }) => {
-    const rows = need
-      .db()
-      .prepare(
-        `SELECT span_id, parent_span_id, name, kind, start_unix_ms, end_unix_ms, status, attributes_json
-         FROM traces WHERE trace_id = ? ORDER BY start_unix_ms, id`
-      )
-      .all(traceId) as {
-      span_id: string
-      parent_span_id: string | null
-      name: string
-      kind: string | null
-      start_unix_ms: number
-      end_unix_ms: number | null
-      status: string | null
-      attributes_json: string | null
-    }[]
-    return rows.map(
-      (row): TraceSpanDto => ({
-        spanId: row.span_id,
-        parentSpanId: row.parent_span_id === '' ? null : row.parent_span_id,
-        name: row.name,
-        kind: row.kind,
-        startUnixMs: row.start_unix_ms,
-        endUnixMs: row.end_unix_ms,
-        status: row.status,
-        attributes: row.attributes_json === null ? {} : jsonObject(JSON.parse(row.attributes_json))
-      })
-    )
-  })
+  register('traces.spans', ({ traceId }) => getTrace(need.db(), { traceId }))
 
   // ── skills ─────────────────────────────────────────────────────────────────
 
@@ -826,55 +541,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     })
   })
 
-  register('skills.detail', async ({ id }) => {
-    const engine = need.engine()
-    const skillRows = await engine.cypher(
-      `MATCH (s:Skill {id: $id}) RETURN s.id AS id, s.name AS name, s.instructions AS instructions,
-       s.current_version AS current_version LIMIT 1`,
-      { id }
-    )
-    const skill = skillRows[0]
-    if (skill === undefined) throw new IngestError('NOT_FOUND', `Skill ${id} does not exist`)
-    const versionRows = await engine.cypher(
-      `MATCH (s:Skill {id: $id})-[:HAS_VERSION]->(v:SkillVersion)
-       RETURN v.id AS id, v.status AS status, v.benchmark_score AS score, v.instructions AS instructions,
-              v.created_at AS created_at ORDER BY v.created_at DESC LIMIT 20`,
-      { id }
-    )
-    const exampleRows = await engine.cypher(
-      `MATCH (s:Skill {id: $id})-[:HAS_EXAMPLE]->(e:Example)
-       RETURN e.id AS id, e.kind AS kind, e.content AS content ORDER BY e.created_at DESC LIMIT 20`,
-      { id }
-    )
-    const correctionRows = await engine.cypher(
-      `MATCH (c:Correction)-[:IMPROVED]->(s:Skill {id: $id})
-       RETURN c.id AS id, c.content AS content ORDER BY c.created_at DESC LIMIT 20`,
-      { id }
-    )
-    const detail: SkillDetailDto = {
-      id: String(skill['id']),
-      name: String(skill['name'] ?? skill['id']),
-      instructions: String(skill['instructions'] ?? ''),
-      currentVersion: skill['current_version'] == null ? null : String(skill['current_version']),
-      versions: versionRows.map((row) => ({
-        id: String(row['id']),
-        status: String(row['status'] ?? 'unknown'),
-        benchmarkScore: typeof row['score'] === 'number' ? row['score'] : null,
-        instructions: String(row['instructions'] ?? ''),
-        createdAt: row['created_at'] instanceof Date ? row['created_at'].toISOString() : null
-      })),
-      examples: exampleRows.map((row) => ({
-        id: String(row['id']),
-        kind: String(row['kind'] ?? 'unknown'),
-        content: String(row['content'] ?? '')
-      })),
-      corrections: correctionRows.map((row) => ({
-        id: String(row['id']),
-        content: String(row['content'] ?? '')
-      }))
-    }
-    return detail
-  })
+  register('skills.detail', ({ id }) => getSkillDetail(need.engine(), { id }))
 
   // ── skill improvement (§17 agent #4, phase 12) ─────────────────────────────
 
@@ -1016,11 +683,11 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   const settingsFile = (): string => settingsPath(deps.userDataDir)
 
   const settingsDto = async (): Promise<SettingsDto> => {
-    const settings = loadModelSettings(settingsFile())
-    const keychain = deps.keychain
-    const apiKeysPresent = Object.fromEntries(
-      CLOUD_PROVIDERS.map((provider) => [provider, keychain?.getApiKey(provider) !== undefined])
-    ) as Record<IpcCloudProvider, boolean>
+    // The sanitized model settings (provider + model names + API-key PRESENCE
+    // booleans, never key material) are assembled by the shared getSettingsSummary
+    // reused by the get_settings_summary MCP tool; the dashboard adds the live
+    // Ollama health and the MCP connect block on top (both stay dashboard-only).
+    const summary = getSettingsSummary({ userDataDir: deps.userDataDir, keychain: deps.keychain })
     const ollamaStatus =
       deps.ollama !== null
         ? await deps.ollama.status()
@@ -1031,12 +698,12 @@ export function registerIpcHandlers(deps: IpcDeps): void {
             installUrl: 'https://ollama.com/download'
           }
     return {
-      cloudProvider: settings.cloudProvider,
-      cloudModels: settings.cloudModels,
-      smallLlmModel: settings.smallLlmModel ?? null,
-      providers: CLOUD_PROVIDERS,
-      defaultModels: CLOUD_DEFAULT_MODELS,
-      apiKeysPresent,
+      cloudProvider: summary.cloudProvider,
+      cloudModels: summary.cloudModels,
+      smallLlmModel: summary.smallLlmModel,
+      providers: summary.providers,
+      defaultModels: summary.defaultModels,
+      apiKeysPresent: summary.apiKeysPresent,
       ollama: {
         state: ollamaStatus.state,
         installedModels: ollamaStatus.installedModels,
@@ -1047,7 +714,13 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         url: deps.mcpUrl,
         connectCommand: claudeMcpAddCommand(),
         sampleConfigPath: join(deps.userDataDir, '.mcp.json')
-      }
+      },
+      // Phase-16b: surface the reasoning/runner sections getSettingsSummary
+      // (phase-15) already returns — validated JsonObjects derived from
+      // ModelSettings.reasoning/runner. Present only once the user opts in;
+      // absent and inert on a default install (DEFAULT == TODAY).
+      ...(summary.reasoning !== undefined ? { reasoning: summary.reasoning as unknown as ReasoningSettingsDto } : {}),
+      ...(summary.runner !== undefined ? { runner: summary.runner as unknown as RunnerSettingsDto } : {})
     }
   }
 
@@ -1061,7 +734,24 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     }
     const smallLlm = patch.smallLlmModel === undefined ? (current.smallLlmModel ?? null) : patch.smallLlmModel
     if (smallLlm !== null && smallLlm !== '') next.smallLlmModel = smallLlm
+    // Phase-16b: `next` is rebuilt from an explicit field list that would DROP
+    // the additive reasoning/runner sections. Merge a patch onto whatever is on
+    // disk (materializing the phase-doc default the first time a section is
+    // touched); when the patch omits a section, PRESERVE the on-disk one — an
+    // absent section MUST stay absent (DEFAULT == TODAY), never be resurrected.
+    // The loadModelSettings ladder re-validates both on the settingsDto readback.
+    if (patch.reasoning !== undefined) {
+      next.reasoning = { ...defaultReasoningSettings(), ...current.reasoning, ...patch.reasoning }
+    } else if (current.reasoning !== undefined) {
+      next.reasoning = current.reasoning
+    }
+    if (patch.runner !== undefined) {
+      next.runner = { ...defaultRunnerSettings(), ...current.runner, ...patch.runner }
+    } else if (current.runner !== undefined) {
+      next.runner = current.runner
+    }
     saveModelSettings(settingsFile(), next)
+    deps.onSettingsChanged?.()
     return settingsDto()
   })
 
@@ -1070,6 +760,9 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       throw new IngestError('INVALID_INPUT', `unknown provider '${provider}'`)
     }
     need.keychain().setApiKey(provider as CloudProvider, key)
+    // Phase-16b: a key change flips makeCloud() between a tier and null; invalidate
+    // so the next reasoning call re-routes without an app restart (P1.1).
+    deps.onSettingsChanged?.()
     return null
   })
 
@@ -1078,6 +771,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       throw new IngestError('INVALID_INPUT', `unknown provider '${provider}'`)
     }
     need.keychain().deleteSecret(apiKeySecretName(provider as CloudProvider))
+    deps.onSettingsChanged?.()
     return null
   })
 
@@ -1116,5 +810,23 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       send({ model, status: 'error', done: true, error: message })
       throw err
     }
+  })
+
+  // ── runner (phase 17) ────────────────────────────────────────────────────────
+
+  // Enable/model live in settings.json (saved via settings.save); this is the
+  // read-only health + latest-run view for the settings panel + banner. Always
+  // answerable — an absent runner reports the disabled/unknown shape (off is the
+  // default, not a fault).
+  register('runner.status', () =>
+    getRunnerStatus({ runner: deps.runner ?? null, db: need.db(), router: deps.router ?? null })
+  )
+
+  // The manual 1-turn canary — the closest thing to an auth probe (§3.7). Only
+  // ever user-triggered from the settings panel, NEVER scheduled.
+  register('runner.testConnection', async () => {
+    const runner = deps.runner ?? raiseUnavailable('the subscription runner')
+    const result = await runner.testConnection()
+    return { ok: result.ok, message: testConnectionMessage(result) }
   })
 }

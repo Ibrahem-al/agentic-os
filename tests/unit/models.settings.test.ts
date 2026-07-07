@@ -9,10 +9,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   activeCloudModel,
   defaultModelSettings,
+  defaultReasoningSettings,
+  defaultRunnerSettings,
   loadModelSettings,
   saveModelSettings,
   settingsPath
 } from '../../src/main/models'
+import { RUNNER_MODEL_DEFAULT } from '../../src/main/config'
 
 let dir: string
 let filePath: string
@@ -67,5 +70,67 @@ describe('model settings', () => {
 
   it('settingsPath resolves inside userData', () => {
     expect(settingsPath('C:/data')).toContain('settings.json')
+  })
+})
+
+// ── phase-16 reasoning + runner sections (§2.1/§11.4) ────────────────────────
+
+describe('phase-16 reasoning + runner settings', () => {
+  it('a default install materializes NEITHER section (DEFAULT == TODAY)', () => {
+    // The prime directive: a fresh settings.json is byte-identical to pre-phase-16,
+    // so the router reads "no reasoning config → today's per-role tiers".
+    const settings = loadModelSettings(filePath)
+    expect(settings.reasoning).toBeUndefined()
+    expect(settings.runner).toBeUndefined()
+    // The factory defaults exist for opt-in, and the runner default is DISABLED.
+    expect(defaultReasoningSettings()).toEqual({ backend: 'local-qwen3' })
+    expect(defaultRunnerSettings().enabled).toBe(false)
+    expect(defaultRunnerSettings()).toEqual({
+      enabled: false,
+      model: RUNNER_MODEL_DEFAULT,
+      stageAll: true,
+      mode: 'completion',
+      injectionPolicy: 'downgrade'
+    })
+  })
+
+  it('round-trips both new sections through save/load losslessly', () => {
+    const settings = defaultModelSettings()
+    settings.reasoning = {
+      backend: 'subscription-claude',
+      overrides: { 'extraction.fuzzy': 'cloud-api', 'skills.grader': 'local-qwen3' },
+      models: { 'context.summarize': 'qwen3:8b' }
+    }
+    settings.runner = {
+      enabled: true,
+      model: 'sonnet',
+      stageAll: false,
+      mode: 'agent',
+      injectionPolicy: 'proceed',
+      verifierModel: 'qwen3:4b',
+      binaryPath: '/opt/claude'
+    }
+    saveModelSettings(filePath, settings)
+    expect(loadModelSettings(filePath)).toEqual(settings)
+  })
+
+  it('normalizes a partial section on disk with the phase-doc defaults', () => {
+    // Only `enabled` present → the rest fill from defaultRunnerSettings();
+    // only `backend` present → reasoning has no overrides/models.
+    writeFileSync(filePath, JSON.stringify({ runner: { enabled: true }, reasoning: { backend: 'subscription-claude' } }))
+    const settings = loadModelSettings(filePath)
+    expect(settings.runner).toEqual({ enabled: true, model: RUNNER_MODEL_DEFAULT, stageAll: true, mode: 'completion', injectionPolicy: 'downgrade' })
+    expect(settings.reasoning).toEqual({ backend: 'subscription-claude' })
+  })
+
+  it('rejects invalid backend / mode / non-boolean values loudly', () => {
+    writeFileSync(filePath, JSON.stringify({ reasoning: { backend: 'gpt-9000' } }))
+    expect(() => loadModelSettings(filePath)).toThrow(/reasoning\.backend/)
+    writeFileSync(filePath, JSON.stringify({ reasoning: { overrides: { 'skills.rewrite': 'nope' } } }))
+    expect(() => loadModelSettings(filePath)).toThrow(/is not a valid backend/)
+    writeFileSync(filePath, JSON.stringify({ runner: { enabled: 'yes' } }))
+    expect(() => loadModelSettings(filePath)).toThrow(/runner\.enabled must be a boolean/)
+    writeFileSync(filePath, JSON.stringify({ runner: { mode: 'telepathy' } }))
+    expect(() => loadModelSettings(filePath)).toThrow(/runner\.mode/)
   })
 })

@@ -43,12 +43,14 @@ export {
   KeychainError,
   KEYCHAIN_FILENAME,
   MCP_BEARER_TOKEN_SECRET,
+  RUNNER_TOKEN_SECRET,
   SESSION_END_HOOK_TOKEN_SECRET,
   apiKeySecretName,
   keychainPath,
   type KnownSecretName,
   type SafeStorageLike
 } from './keychain'
+export { CallBudget, CallBudgetExceededError, RunnerQuotaError } from './callBudget'
 export {
   FALLBACK_PRICE,
   PRICE_TABLE,
@@ -63,8 +65,35 @@ export {
   SETTINGS_FILENAME,
   activeCloudModel,
   defaultModelSettings,
+  defaultReasoningSettings,
+  defaultRunnerSettings,
   loadModelSettings,
   saveModelSettings,
   settingsPath,
-  type ModelSettings
+  type ModelSettings,
+  type ReasoningSettings,
+  type RunnerSettings
 } from './settings'
+export {
+  CloudApiProvider,
+  LocalQwen3Provider,
+  ProviderRouter,
+  ProviderUnavailableError,
+  ROLE_DEFAULTS,
+  ROLE_KEYS,
+  SubscriptionClaudeProvider,
+  type OllamaLike,
+  type ProviderCloudTier,
+  type ProviderRouterDeps,
+  type ReasoningBackend,
+  type ReasoningProvider,
+  type ReasoningRequest,
+  type ReasoningResult,
+  type ResolvedRoute,
+  type RoleDefault,
+  type RoleGenerateOptions,
+  type RoleKey,
+  type RoleReasoner,
+  type SubscriptionBudget,
+  type SubscriptionComplete
+} from './provider'

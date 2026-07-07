@@ -18,9 +18,11 @@ import {
   listStagedWrites,
   rejectStagedWrite,
   renderStagedWriteDiff,
+  stagedWriteRequiresEmbedder,
   StagedWriteError,
   type StagedWritesDeps
 } from '../../src/main/security'
+import { getStagedWriteRead } from '../../src/main/reads'
 import { openAppData, type AppData } from '../../src/main/storage'
 import { basisEmbedding, openTestStore, type TestStore } from './helpers'
 
@@ -306,5 +308,50 @@ describe('extraction payload flow (§17 low-confidence items)', () => {
     expect(staged.every((r) => r.status === 'staged')).toBe(true)
     const committed = listStagedWrites(appData.db, { status: 'committed' })
     expect(committed.length).toBeGreaterThan(0)
+  })
+})
+
+// P1.7 (§9.2): the approve UI preflights OllamaClient.status() only when a row
+// actually needs an embedder at commit — an extraction CREATE with embedOnCommit.
+describe('requiresEmbedder preflight flag (P1.7 / §9.2)', () => {
+  const embedCreate = {
+    op: 'create',
+    node: { label: 'Preference', id: 'pref-re-embed', props: { statement: 'Prefer pnpm.', extracted_by: 'extraction@0.0.1/llm-local', confidence: 0.4 } },
+    embedOnCommit: true,
+    edges: [],
+    tagCreates: [],
+    provenance: { extracted_by: 'extraction@0.0.1/llm-local', confidence: 0.4 },
+    evidence: 'they said pnpm',
+    reason: 'new preference',
+    session: 'session-s9'
+  }
+
+  it('is TRUE for an embed-on-commit extraction create (the exact case commit embeds)', async () => {
+    const id = stageExtraction(embedCreate, 'Preference', 'pref-re-embed')
+    expect(stagedWriteRequiresEmbedder(getStagedWrite(appData.db, id)!)).toBe(true)
+    // …and it is surfaced on the read-path DTO the approve UI consumes.
+    const dto = await getStagedWriteRead({ db: appData.db, engine: store.engine }, { id })
+    expect(dto.requiresEmbedder).toBe(true)
+    rejectStagedWrite(appData.db, id, { decidedBy: 'tester' })
+  })
+
+  it('is FALSE for a merge (no node), an embedOnCommit:false create, and a correction', async () => {
+    const mergeId = stageExtraction(
+      { ...embedCreate, op: 'merge', node: null, embedOnCommit: false, edges: [] },
+      'Preference',
+      'pref-1'
+    )
+    const noEmbedId = stageExtraction(
+      { ...embedCreate, node: { ...embedCreate.node, id: 'pref-re-noembed' }, embedOnCommit: false },
+      'Preference',
+      'pref-re-noembed'
+    )
+    const correctionId = stageCorrection({ statement: 'x' }, 'tweak')
+
+    for (const id of [mergeId, noEmbedId, correctionId]) {
+      expect(stagedWriteRequiresEmbedder(getStagedWrite(appData.db, id)!)).toBe(false)
+      const dto = await getStagedWriteRead({ db: appData.db, engine: store.engine }, { id })
+      expect(dto.requiresEmbedder).toBe(false)
+    }
   })
 })

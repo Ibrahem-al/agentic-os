@@ -31,14 +31,29 @@ export {
 } from './schema'
 export { isMutatingCypher, openRyuGraphEngine, ryuPlatformDir, type RyuGraphEngineOptions } from './ryugraph'
 export {
+  backupGraphDir,
   defaultMigrations,
+  graphDirHasData,
   GraphSchemaNewerError,
   MIGRATIONS,
+  snapshotDir,
   UPDATE_PATH_PROBE_ENV,
   UPDATE_PATH_PROBE_MIGRATION,
   type Migration,
   type MigrationContext
 } from './migrations'
 export { exportGraph, type ExportResult } from './export'
-export { openAppData, type AppData } from './appdata'
+export { APPDATA_USER_VERSION, appDataIntegrityOk, openAppData, snapshotAppDataDb, type AppData } from './appdata'
 export { WriteLane, type WriteJobRecord } from './writeLane'
+export {
+  collectAssets,
+  dataManifestPath,
+  readDataManifest,
+  verifyDataManifest,
+  writeDataManifest,
+  type DataManifest,
+  type ManifestAsset,
+  type ManifestFinding,
+  type WriteManifestInfo
+} from './manifest'
+export { performPendingReset, resetMarkerPath, type ResetLogger, type ResetResult } from './reset'

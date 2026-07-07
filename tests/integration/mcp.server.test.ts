@@ -17,14 +17,18 @@ import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { AgenticOsMcpServer, McpClientManager } from '../../src/main/mcp'
+import { AgenticOsMcpServer, McpClientManager, MCP_TOOLS } from '../../src/main/mcp'
 import { createRetriever, searchMemory, type RetrievalDeps, type Retriever, type SmallLlm } from '../../src/main/retrieval'
+import { RUNNER_SESSION_MAX_TOOL_CALLS, RUNNER_TASK_HEADER } from '../../src/main/config'
+import type { ActionExecutor, KernelAction } from '../../src/main/kernel'
 import { openKernelStack, spanAttributes, spanRows, type KernelTestStack } from '../fixtures/kernel-helpers'
 import { GLOBAL_PREFERENCE_IDS, seedFixtureGraph } from '../fixtures/graph-seed'
 import { FakeEmbedder, FakeReranker } from '../fixtures/retrieval-fakes'
 import { openTestStore, type TestStore } from './helpers'
 
 const BEARER_TOKEN = 'test-bearer-token-abc123'
+/** The SECOND accepted bearer — headless runner sessions (§14b B3). */
+const RUNNER_TOKEN = 'test-runner-token-def456'
 
 /** Critic that always passes → each get_context is one read-path pass. */
 const passingCritic: SmallLlm = {
@@ -90,6 +94,7 @@ beforeAll(async () => {
   retriever = createRetriever({ ...retrieval, llm: passingCritic })
   server = new AgenticOsMcpServer({
     bearerToken: BEARER_TOKEN,
+    runnerToken: RUNNER_TOKEN,
     engine: store.engine,
     retriever,
     retrieval,
@@ -141,17 +146,20 @@ describe('auth (§12 bearer token)', () => {
 })
 
 describe('the §12 tool surface', () => {
-  it('lists exactly the seven v1 tools, no others', async () => {
+  it('advertises exactly the composed tool registry — the §4 read surface + phase-17 get_runner_status included', async () => {
     const tools = await client.listTools()
-    expect(tools.tools.map((t) => t.name).sort()).toEqual([
-      'get_context',
-      'get_skill',
-      'ingest_codebase',
-      'ingest_document',
-      'list_skills',
-      'propose_correction',
-      'search_memory'
-    ])
+    const names = tools.tools.map((t) => t.name)
+    // The SDK round-trip advertises exactly the composed registry (read+write+control).
+    expect(names.slice().sort()).toEqual(MCP_TOOLS.map((t) => t.name).sort())
+    expect(new Set(names).size).toBe(names.length) // no duplicate names
+    // The phase-05 v1 seven are still there…
+    for (const name of ['get_context', 'search_memory', 'list_skills', 'get_skill', 'propose_correction', 'ingest_document', 'ingest_codebase']) {
+      expect(names).toContain(name)
+    }
+    // …the phase-15 §4 read tools + the phase-17 get_runner_status are now live.
+    for (const name of ['list_sessions', 'read_session', 'get_pending_work', 'get_usage', 'list_tasks', 'get_app_status', 'get_settings_summary', 'get_runner_status']) {
+      expect(names).toContain(name)
+    }
   })
 
   it('get_context returns a bundle from the fixture graph (DoD)', async () => {
@@ -237,11 +245,22 @@ describe('the §12 tool surface', () => {
     expect(missing.body.error.code).toBe('NOT_FOUND')
   })
 
-  it('unknown tools come back as a clean structured error (and are still logged)', async () => {
-    const reply = await call(client, 'delete_everything', {})
-    expect(reply.isError).toBe(true)
-    expect(reply.body.error.code).toBe('NOT_FOUND')
-    expect(reply.body.error.message).toContain('get_context')
+  it('P0.6: an UNDECLARED tool is blocked fail-closed; a declared tool with bad args is a clean INVALID_INPUT — both logged', async () => {
+    // Post-14b the interactive mcp: profile declares the full planned surface
+    // and the §13 mcp-call scope check is live: an UNDECLARED name (no handler,
+    // in no tier set) is hard-blocked BEFORE dispatch — still a clean structured
+    // error (§15), not a crash. (Pre-14b this fell through to NOT_FOUND.)
+    const undeclared = await call(client, 'delete_everything', {})
+    expect(undeclared.isError).toBe(true)
+    expect(undeclared.body.error.code).toBe('PERMISSION_DENIED')
+    expect(undeclared.body.error.message).toContain('delete_everything')
+    // Phase-18 filled the staging+control seams — every declared tool now has a
+    // handler. submit_extraction_items passes the scope check and reaches its zod
+    // boundary; empty args fail it → a clean INVALID_INPUT (the structured-error
+    // path stays exercised now that no declared tool is unimplemented).
+    const badArgs = await call(client, 'submit_extraction_items', {})
+    expect(badArgs.isError).toBe(true)
+    expect(badArgs.body.error.code).toBe('INVALID_INPUT')
   })
 })
 
@@ -453,15 +472,9 @@ describe('the MCP client manager consumes this server (§12 client side)', () =>
         bearerTokenSecret: 'mcp.bearerToken'
       })
       const tools = await manager.listTools('agentic-os-self')
-      expect(tools.map((t) => t.name).sort()).toEqual([
-        'get_context',
-        'get_skill',
-        'ingest_codebase',
-        'ingest_document',
-        'list_skills',
-        'propose_correction',
-        'search_memory'
-      ])
+      expect(tools.map((t) => t.name).sort()).toEqual(MCP_TOOLS.map((t) => t.name).sort())
+      expect(tools.some((t) => t.name === 'get_context')).toBe(true)
+      expect(tools.some((t) => t.name === 'list_sessions')).toBe(true)
       expect(tools.every((t) => typeof t.inputSchema === 'object')).toBe(true)
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -558,5 +571,210 @@ describe('searchMemory (module surface behind search_memory)', () => {
     const scores = hits.map((h) => h.rerankScore)
     expect([...scores].sort((a, b) => b - a)).toEqual(scores)
     expect(hits[0]?.id).toBe('k-vacuum')
+  })
+})
+
+/**
+ * §14b B3 — the dual-token dispatch spine (SECURITY-CRITICAL). Its own server +
+ * store + kernel stack so the main suite's strict global asserts (mcp_calls
+ * count, `/^mcp:/` spans) stay untouched. The executor is a spy that wraps the
+ * REAL kernel: it records the agent id + the split gauges AT the moment the
+ * kernel is invoked, which is after dispatch's runner guards (allowlist/budget)
+ * — so "kernel never consulted" and "gauge=runner:1" are both observable.
+ */
+describe('§14b B3 dual-token dispatch (runner sessions, allowlist, budget, gauge split)', () => {
+  let rStore: TestStore
+  let rStack: KernelTestStack
+  let rServer: AgenticOsMcpServer
+  let rUrl: string
+  let executeAgentIds: string[]
+  let gaugeAtExecute: { interactive: number; runner: number } | null
+
+  async function connectR(
+    token: string,
+    extraHeaders?: Record<string, string>
+  ): Promise<{ client: Client; transport: StreamableHTTPClientTransport }> {
+    const transport = new StreamableHTTPClientTransport(new URL(rUrl), {
+      requestInit: { headers: { Authorization: `Bearer ${token}`, ...extraHeaders } }
+    })
+    const c = new Client({ name: 'b3-test-client', version: '0.0.1' })
+    await c.connect(transport)
+    return { client: c, transport }
+  }
+
+  async function callR(c: Client, name: string, args: Record<string, unknown>): Promise<ToolReply> {
+    const result = (await c.callTool({ name, arguments: args })) as {
+      content: { type: string; text: string }[]
+      isError?: boolean
+    }
+    return { isError: result.isError === true, body: JSON.parse(result.content[0]?.text ?? '') }
+  }
+
+  beforeAll(async () => {
+    rStore = await openTestStore()
+    await seedFixtureGraph(rStore.engine)
+    rStack = openKernelStack()
+    const retrieval: RetrievalDeps = { engine: rStore.engine, embedder: new FakeEmbedder(), reranker: new FakeReranker() }
+    const retriever = createRetriever({ ...retrieval, llm: passingCritic })
+    executeAgentIds = []
+    gaugeAtExecute = null
+    const spyExecutor: ActionExecutor = {
+      execute<T>(agentId: string, action: KernelAction, fn: () => Promise<T> | T): Promise<T> {
+        executeAgentIds.push(agentId)
+        gaugeAtExecute = { interactive: rServer.inflightInteractiveCalls, runner: rServer.inflightRunnerCalls }
+        return rStack.kernel.execute(agentId, action, fn)
+      }
+    }
+    rServer = new AgenticOsMcpServer({
+      bearerToken: BEARER_TOKEN,
+      runnerToken: RUNNER_TOKEN,
+      engine: rStore.engine,
+      retriever,
+      retrieval,
+      llm: fakeSummarizer,
+      db: rStack.appData.db,
+      executor: spyExecutor,
+      port: 0
+    })
+    await rServer.start()
+    rUrl = rServer.url
+  })
+
+  afterAll(async () => {
+    await rServer.stop()
+    rStack.cleanup()
+    await rStore.cleanup()
+  })
+
+  it('accepts BOTH the interactive bearer and the runner token at initialize', async () => {
+    const inter = await connectR(BEARER_TOKEN)
+    const run = await connectR(RUNNER_TOKEN)
+    expect(inter.transport.sessionId).toBeTruthy()
+    expect(run.transport.sessionId).toBeTruthy()
+    expect(run.transport.sessionId).not.toBe(inter.transport.sessionId)
+    await inter.client.close()
+    await run.client.close()
+  })
+
+  it('a runner token cannot address an INTERACTIVE session id (per-request kind re-check → 401)', async () => {
+    const inter = await connectR(BEARER_TOKEN)
+    const res = await fetch(rUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'mcp-session-id': inter.transport.sessionId as string,
+        Authorization: `Bearer ${RUNNER_TOKEN}`
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
+    })
+    expect(res.status).toBe(401)
+    await inter.client.close()
+  })
+
+  it('an interactive token cannot address a RUNNER session id (per-request kind re-check → 401)', async () => {
+    const run = await connectR(RUNNER_TOKEN)
+    const res = await fetch(rUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'mcp-session-id': run.transport.sessionId as string,
+        Authorization: `Bearer ${BEARER_TOKEN}`
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
+    })
+    expect(res.status).toBe(401)
+    await run.client.close()
+  })
+
+  it('runs a runner READ call as mcp-runner:<sid> and counts it on the RUNNER gauge only (P0.9)', async () => {
+    const run = await connectR(RUNNER_TOKEN)
+    const sid = run.transport.sessionId as string
+    const before = executeAgentIds.length
+    const reply = await callR(run.client, 'list_skills', {})
+    expect(reply.isError).toBe(false)
+    // Kernel invoked under the runner-profile agent id (selects READ+STAGING).
+    expect(executeAgentIds[executeAgentIds.length - 1]).toBe(`mcp-runner:${sid}`)
+    expect(executeAgentIds.length).toBe(before + 1)
+    // Mid-flight the runner gauge was 1, the interactive gauge 0 — a background
+    // runner never drives the §8 interactive yield.
+    expect(gaugeAtExecute).toEqual({ interactive: 0, runner: 1 })
+    // Both gauges settle back to 0 after the call.
+    expect(rServer.inflightRunnerCalls).toBe(0)
+    expect(rServer.inflightInteractiveCalls).toBe(0)
+    // The row is logged as a runner call (§6 sweep skips it).
+    const row = rStack.appData.db
+      .prepare('SELECT session_kind FROM mcp_calls WHERE session_id = ? AND tool = ?')
+      .get(sid, 'list_skills') as { session_kind: string } | undefined
+    expect(row?.session_kind).toBe('runner')
+    await run.client.close()
+  })
+
+  it('an interactive READ call runs as mcp:<sid> on the INTERACTIVE gauge only (session_kind NULL)', async () => {
+    const inter = await connectR(BEARER_TOKEN)
+    const sid = inter.transport.sessionId as string
+    const reply = await callR(inter.client, 'list_skills', {})
+    expect(reply.isError).toBe(false)
+    expect(executeAgentIds[executeAgentIds.length - 1]).toBe(`mcp:${sid}`)
+    expect(gaugeAtExecute).toEqual({ interactive: 1, runner: 0 })
+    const row = rStack.appData.db
+      .prepare('SELECT session_kind FROM mcp_calls WHERE session_id = ? AND tool = ?')
+      .get(sid, 'list_skills') as { session_kind: string | null } | undefined
+    expect(row?.session_kind).toBeNull()
+    await inter.client.close()
+  })
+
+  it('blocks a runner from a non-allowlisted CONTROL tool SERVER-SIDE, before the kernel (allowlist)', async () => {
+    const run = await connectR(RUNNER_TOKEN)
+    const sid = run.transport.sessionId as string
+    const before = executeAgentIds.length
+    // ingest_document is a control tool — outside the runner READ+STAGING allowlist.
+    const reply = await callR(run.client, 'ingest_document', { path_or_content: '# note\nbody' })
+    expect(reply.isError).toBe(true)
+    expect(reply.body.error.code).toBe('PERMISSION_DENIED')
+    // The server-side guarantee: the kernel/executor was NEVER consulted.
+    expect(executeAgentIds.length).toBe(before)
+    // …but the refusal is still logged (finally) as a runner error row.
+    const row = rStack.appData.db
+      .prepare('SELECT session_kind, result_status FROM mcp_calls WHERE session_id = ? AND tool = ?')
+      .get(sid, 'ingest_document') as { session_kind: string; result_status: string } | undefined
+    expect(row?.session_kind).toBe('runner')
+    expect(row?.result_status).toBe('error')
+    await run.client.close()
+  })
+
+  it('trips the RUNNER_SESSION_MAX_TOOL_CALLS ceiling (structured error, kernel not consulted)', async () => {
+    const run = await connectR(RUNNER_TOKEN)
+    const sid = run.transport.sessionId as string
+    // Pre-seed this session at its ceiling of already-logged runner calls.
+    const seed = rStack.appData.db.prepare(
+      `INSERT INTO mcp_calls (session_id, session_kind, tool, args_hash, result_status, started_unix_ms, duration_ms)
+       VALUES (?, 'runner', 'list_skills', ?, 'ok', ?, 1)`
+    )
+    const hash = `sha256:${'0'.repeat(64)}`
+    for (let i = 0; i < RUNNER_SESSION_MAX_TOOL_CALLS; i += 1) seed.run(sid, hash, Date.now())
+    const before = executeAgentIds.length
+    const reply = await callR(run.client, 'list_skills', {}) // an ALLOWLISTED tool — only the budget can refuse it
+    expect(reply.isError).toBe(true)
+    expect(reply.body.error.code).toBe('INVALID_STATE')
+    expect(String(reply.body.error.message)).toContain(String(RUNNER_SESSION_MAX_TOOL_CALLS))
+    // Over budget ⇒ the kernel is never consulted.
+    expect(executeAgentIds.length).toBe(before)
+    await run.client.close()
+  })
+
+  it('honors X-Agentic-Os-Runner-Task on a runner initialize; 400s it on an interactive one', async () => {
+    // Runner + the header → initialize succeeds (the task binding is accepted).
+    const run = await connectR(RUNNER_TOKEN, { [RUNNER_TASK_HEADER]: 'task-abc' })
+    expect(run.transport.sessionId).toBeTruthy()
+    await run.client.close()
+    // Interactive + the header → the server 400s the initialize (misconfigured
+    // client), so the SDK connect rejects.
+    const transport = new StreamableHTTPClientTransport(new URL(rUrl), {
+      requestInit: { headers: { Authorization: `Bearer ${BEARER_TOKEN}`, [RUNNER_TASK_HEADER]: 'task-abc' } }
+    })
+    const bad = new Client({ name: 'b3-bad-task', version: '0.0.1' })
+    await expect(bad.connect(transport)).rejects.toThrow()
   })
 })

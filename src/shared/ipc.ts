@@ -118,6 +118,13 @@ export interface StagedWriteDto {
   readonly createdAt: string
   readonly decidedAt: string | null
   readonly committedAt: string | null
+  /**
+   * §9.2 preflight (P1.7): committing this row needs a live embedder — true only
+   * for an extraction CREATE that computes an embedding at commit (a new
+   * retrievable node). The approve UI reads this to warn, not error, when Ollama
+   * is down at click time (esp. under stageAll). False for every other row.
+   */
+  readonly requiresEmbedder: boolean
 }
 
 export interface ApprovalDto {
@@ -357,6 +364,28 @@ export interface OllamaStatusDto {
   readonly installUrl: string
 }
 
+/** Renderer-safe mirror of models/provider.ts ReasoningBackend (phase 16). */
+export type IpcReasoningBackend = 'local-qwen3' | 'cloud-api' | 'subscription-claude'
+
+/** Renderer-safe mirror of ReasoningSettings (§2.1/§11.4). Role keys are the
+ * §2.2 dotted strings; the main-side settings validator owns strictness. */
+export interface ReasoningSettingsDto {
+  readonly backend: IpcReasoningBackend
+  readonly overrides?: Readonly<Record<string, IpcReasoningBackend>>
+  readonly models?: Readonly<Record<string, string>>
+}
+
+/** Renderer-safe mirror of RunnerSettings (headless runner / subscription). */
+export interface RunnerSettingsDto {
+  readonly enabled: boolean
+  readonly model: string
+  readonly stageAll: boolean
+  readonly mode: 'completion' | 'agent'
+  readonly injectionPolicy: 'downgrade' | 'proceed'
+  readonly verifierModel?: string
+  readonly binaryPath?: string
+}
+
 export interface SettingsDto {
   readonly cloudProvider: IpcCloudProvider
   readonly cloudModels: Partial<Record<IpcCloudProvider, string>>
@@ -372,12 +401,27 @@ export interface SettingsDto {
     readonly connectCommand: string
     readonly sampleConfigPath: string
   }
+  /**
+   * Phase-16 sections — present only once the user opts in (absent on a default
+   * install). Phase-16b's `settings.get` assembly fills these from
+   * ModelSettings.reasoning/runner; today they are undefined and inert.
+   */
+  readonly reasoning?: ReasoningSettingsDto
+  readonly runner?: RunnerSettingsDto
 }
 
 export interface ModelSettingsPatchDto {
   readonly cloudProvider?: IpcCloudProvider
   readonly cloudModels?: Partial<Record<IpcCloudProvider, string>>
   readonly smallLlmModel?: string | null
+  /**
+   * Phase-16 sections. NOTE for phase-16b: `settings.save` (ipc.ts) rebuilds
+   * `next` from an explicit field list and silently DROPS unknown keys — merge
+   * `reasoning`/`runner` there (and fire router.invalidate()) or a saved patch
+   * vanishes on write.
+   */
+  readonly reasoning?: ReasoningSettingsDto
+  readonly runner?: RunnerSettingsDto
 }
 
 /** Pushed over IPC_EVENT_OLLAMA_PULL while settings.ollamaPull runs. */
@@ -388,6 +432,59 @@ export interface OllamaPullProgressDto {
   readonly total?: number
   readonly done: boolean
   readonly error?: string
+}
+
+// ── runner (headless subscription reasoner, phase 17) ─────────────────────────
+
+/** Renderer-safe mirror of the runner health-cache state (§9.7). */
+export type RunnerHealthStateDto = 'ok' | 'not-installed' | 'auth-expired' | 'quota-exhausted' | 'unknown'
+
+/** One runner_runs row projected for get_runner_status / the dashboard (§3.7). */
+export interface RunnerRunSummaryDto {
+  readonly id: string
+  readonly taskId: string
+  readonly mode: string
+  readonly model: string | null
+  readonly startedAt: string
+  readonly durationMs: number | null
+  readonly numTurns: number | null
+  readonly inputTokens: number | null
+  readonly outputTokens: number | null
+  /** Observability-only price estimate — subscription runs create NO spend rows. */
+  readonly shadowCostUsdEstimate: number | null
+  readonly isError: boolean | null
+  readonly exitCode: number | null
+}
+
+/**
+ * get_runner_status / runner.status: the runner health cache + latest run (§4.F).
+ * OFF by default — a keyless install reports `enabled:false`, `state:'unknown'`,
+ * and never spawns claude.
+ */
+export interface RunnerStatusDto {
+  readonly enabled: boolean
+  /** Resolved absolute claude path (P1.9/§10.12); null when unresolved/off. */
+  readonly binaryPath: string | null
+  readonly version: string | null
+  readonly versionOk: boolean
+  readonly state: RunnerHealthStateDto
+  /** ISO-8601; last time a real run/canary authenticated OK (null = never). */
+  readonly lastAuthOkAt: string | null
+  /** Last classified failure detail (auth/quota/not-installed) — the banner line. */
+  readonly lastError: string | null
+  /** True when the runner is enabled but the subscription tier is unavailable (same isHealthy() the router consults) — reasoning that would ride the subscription is falling back. Always false when disabled (local/cloud is then the CONFIGURED tier). */
+  readonly fallbackActive: boolean
+  /** Where a subscription-eligible role actually lands while falling back (live router resolution). null when not falling back, or no router wired. */
+  readonly effectiveBackend: 'cloud-api' | 'local-qwen3' | null
+  readonly lastRun: RunnerRunSummaryDto | null
+  /** Agent-mode tombstoned sessions (§3.6/§10.2); 0 in completion mode. */
+  readonly tombstonedSessions: number
+}
+
+/** runner.testConnection: the manual 1-turn canary outcome (§3.7 — never scheduled). */
+export interface RunnerTestConnectionDto {
+  readonly ok: boolean
+  readonly message: string
 }
 
 // ── triggers & automation (phase 11) ─────────────────────────────────────────
@@ -509,6 +606,11 @@ export interface IpcChannels {
   'settings.revealMcpToken': { req: void; res: { token: string } }
   'settings.ollamaStatus': { req: void; res: OllamaStatusDto }
   'settings.ollamaPull': { req: { model: string; runId: string }; res: null }
+
+  /** Phase-17 headless subscription runner. Enable/model are saved via settings.save. */
+  'runner.status': { req: void; res: RunnerStatusDto }
+  /** Manual 1-turn canary — user-triggered only, NEVER scheduled (§3.7). */
+  'runner.testConnection': { req: void; res: RunnerTestConnectionDto }
 }
 
 export type IpcChannel = keyof IpcChannels
@@ -521,6 +623,23 @@ export const IPC_EVENT_OLLAMA_PULL = 'event.ollama.pull'
 
 /** Prefix every invokable channel rides under (namespacing + preload filter). */
 export const IPC_INVOKE_PREFIX = 'agentic-os:'
+
+/**
+ * Frameless title-bar window-chrome channels. These live OUTSIDE the IpcChannels
+ * map (and outside IPC_INVOKE_PREFIX / IpcResult) on purpose: they are OS window
+ * commands + chrome state, not typed DTO queries. Adding them to the map would
+ * force req/res typing and route them through the main-side handler loop, which
+ * expects IpcResult envelopes. They mirror the bespoke event channels above
+ * (IPC_EVENT_INGEST_PROGRESS) — one shared source of truth for main + preload.
+ */
+/** Fire-and-forget window commands (renderer → main via ipcRenderer.send). */
+export const IPC_WINDOW_MINIMIZE = 'window.minimize'
+export const IPC_WINDOW_TOGGLE_MAXIMIZE = 'window.toggle-maximize'
+export const IPC_WINDOW_CLOSE = 'window.close'
+/** Seed query for the maximize/restore icon — returns a bare boolean (not IpcResult). */
+export const IPC_WINDOW_IS_MAXIMIZED = 'window.is-maximized'
+/** Maximize-state push (main → renderer, boolean payload); mirrors event.ingest.progress. */
+export const IPC_EVENT_WINDOW_MAXIMIZE = 'event.window.maximize'
 
 /** Stable error codes the renderer may branch on (message is for display). */
 export type IpcErrorCode =

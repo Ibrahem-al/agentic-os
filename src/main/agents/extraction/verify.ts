@@ -16,17 +16,30 @@
  * write gate stages, never commits.
  */
 import { EXTRACTION_ESCALATE_CONFIDENCE, EXTRACTION_VERIFIER_MAX_TOKENS } from '../../config'
-import { SpendCeilingExceededError, meteredComplete } from '../../models'
+import { SpendCeilingExceededError, type ReasoningBackend } from '../../models'
 import { extractJsonObject } from './fuzzy'
 import {
   itemKeyOf,
-  type ExtractionCloud,
   type FuzzyExtractionState,
   type FuzzyPassName,
   type ResolveState,
   type VerificationResult,
   type VerifyState
 } from './types'
+
+/**
+ * The independent verifier, transport-agnostic (phase-18): a bound completion
+ * plus the backend it runs on. The agent builds it from the router
+ * (`extraction.verify` → cloud-api or subscription) or from today's metered
+ * `deps.cloud` (backend `'cloud-api'`); null = no genuinely-different tier
+ * serves the role (keyless default resolves local). The `backend` decides the
+ * §17 self-judging guards: only a `'cloud-api'` verifier is independent enough to
+ * review a subscription-tier extraction.
+ */
+export interface ExtractionVerifier {
+  readonly backend: ReasoningBackend
+  complete(req: { readonly prompt: string; readonly system: string; readonly maxTokens: number }): Promise<{ text: string }>
+}
 
 export const VERIFIER_SYSTEM_PROMPT =
   'You are an independent verification judge for a memory-graph extraction pipeline. ' +
@@ -81,43 +94,64 @@ function verifiableItems(resolution: ResolveState): VerifiableItem[] {
 }
 
 export interface VerifyOptions {
-  readonly cloud: (ExtractionCloud & { readonly taskId: string }) | null
+  /**
+   * The independent verifier (phase-18) — bound completion + backend. null = no
+   * genuinely-different tier serves `extraction.verify` (keyless default). The
+   * agent builds it from the router or today's `deps.cloud`.
+   */
+  readonly verifier: ExtractionVerifier | null
   readonly extraction: FuzzyExtractionState
   readonly resolution: ResolveState
+}
+
+/** Every verifiable item marked 'unavailable' (a guard fired — items go to review). */
+function allUnavailable(
+  items: readonly VerifiableItem[],
+  mode: VerifyState['mode'],
+  note: string,
+  warnings: readonly string[] = []
+): VerifyState {
+  return {
+    mode,
+    results: items.map((item) => ({ itemKey: item.key, verdict: 'unavailable', confidence: null, note })),
+    warnings
+  }
 }
 
 export async function runVerification(options: VerifyOptions): Promise<VerifyState> {
   const items = verifiableItems(options.resolution)
   if (items.length === 0) return { mode: 'none-needed', results: [], warnings: [] }
 
-  if (options.extraction.tier === 'cloud') {
+  const tier = options.extraction.tier
+  const verifier = options.verifier
+
+  if (tier === 'cloud') {
     // The cloud already extracted (and thereby reviewed) this session; a
     // second pass by the same model would be self-judging (§15 principle).
-    return {
-      mode: 'skipped-cloud-extractor',
-      results: items.map((item) => ({
-        itemKey: item.key,
-        verdict: 'unavailable',
-        confidence: null,
-        note: 'cloud escalation already reviewed this session — persistent uncertainty goes to human review'
-      })),
-      warnings: []
-    }
+    return allUnavailable(
+      items,
+      'skipped-cloud-extractor',
+      'cloud escalation already reviewed this session — persistent uncertainty goes to human review'
+    )
   }
-  if (options.cloud === null) {
-    return {
-      mode: 'skipped-no-cloud',
-      results: items.map((item) => ({
-        itemKey: item.key,
-        verdict: 'unavailable',
-        confidence: null,
-        note: 'no cloud tier configured — low-confidence item goes to human review'
-      })),
-      warnings: ['no cloud tier configured — low-confidence items were staged unverified']
-    }
+  if (tier === 'subscription' && (verifier === null || verifier.backend !== 'cloud-api')) {
+    // §17 self-judging guard for the subscription tier: the subscription
+    // extracted, so verifying with the same subscription tier (or with no
+    // independent tier at all) would be self-judging — mirror the cloud guard
+    // and send below-gate items to the human queue. Only a genuinely
+    // independent cloud-api verifier (a configured API key) may review it.
+    return allUnavailable(
+      items,
+      'skipped-subscription-extractor',
+      'subscription tier extracted this session — no independent cloud verifier; persistent uncertainty goes to human review'
+    )
+  }
+  if (verifier === null) {
+    return allUnavailable(items, 'skipped-no-cloud', 'no cloud tier configured — low-confidence item goes to human review', [
+      'no cloud tier configured — low-confidence items were staged unverified'
+    ])
   }
 
-  const cloud = options.cloud
   const warnings: string[] = []
   const results: VerificationResult[] = []
   let budgetHalted = false
@@ -135,13 +169,11 @@ export async function runVerification(options: VerifyOptions): Promise<VerifySta
       (item.kind === 'correction' ? ' (for corrections: the user must have explicitly stated it)' : '') +
       '.\nReply with exactly: {"verdict": "confirm" | "reject", "confidence": <0..1>, "note": "<one short sentence>"}'
     try {
-      const completion = await meteredComplete(
-        cloud.brain,
-        cloud.meter,
-        cloud.taskId,
-        [{ role: 'user', content: prompt }],
-        { system: VERIFIER_SYSTEM_PROMPT, maxTokens: EXTRACTION_VERIFIER_MAX_TOKENS }
-      )
+      const completion = await verifier.complete({
+        prompt,
+        system: VERIFIER_SYSTEM_PROMPT,
+        maxTokens: EXTRACTION_VERIFIER_MAX_TOKENS
+      })
       const parsed = extractJsonObject(completion.text)
       const verdictRaw = parsed?.['verdict']
       const verdict = verdictRaw === 'confirm' ? 'confirm' : verdictRaw === 'reject' ? 'reject' : null

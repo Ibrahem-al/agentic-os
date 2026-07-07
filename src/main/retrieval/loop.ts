@@ -12,6 +12,10 @@
  * consumed elsewhere.
  */
 import { LOOP_MAX_ITERATIONS, RETRIEVAL_CRITIC_PASS_SCORE } from '../config'
+// TYPE-ONLY (phase 16b): the router is passed in at runtime by boot; we never
+// construct it here, so the import is erased and cannot form a runtime cycle
+// (models/* imports nothing from retrieval/*).
+import type { ProviderRouter } from '../models/provider'
 import { rewriteQuery, scoreBundle } from './critic'
 import { runReadPath, type PassOptions, type RetrievalDeps } from './pipeline'
 import type {
@@ -26,6 +30,16 @@ import type {
 export interface RetrieverDeps extends RetrievalDeps {
   /** The LOCAL small LLM (§15: critic tier ≠ generation tier, never cloud). */
   readonly llm: SmallLlm
+  /**
+   * Phase-16b: optional ReasoningProvider router. When present, the loop binds
+   * the §11.4 `retrieval.critic` / `retrieval.rewrite` roles through it PER
+   * retrieve() call instead of using `llm`. Both roles are §11.4 HARD-local, so
+   * they ALWAYS resolve to local-qwen3 — behavior is identical to `llm`; the
+   * router only future-proofs the seam and threads the run's taskId for span
+   * correlation. Absent → today's injected `llm`, unchanged (every existing
+   * fake-injecting test keeps injecting `llm`; only boot passes a router).
+   */
+  readonly router?: ProviderRouter
 }
 
 export interface RetrieveOptions {
@@ -62,16 +76,30 @@ export function createRetriever(deps: RetrieverDeps): Retriever {
     if (options.spendMeter && options.taskId === undefined) {
       throw new Error('retrieve: options.taskId is required when a spendMeter is provided')
     }
-    const maxIterations = options.maxIterations ?? LOOP_MAX_ITERATIONS
-    if (!Number.isSafeInteger(maxIterations) || maxIterations < 1) {
-      throw new Error(`retrieve: maxIterations must be a positive integer, got ${maxIterations}`)
+    const requestedMax = options.maxIterations ?? LOOP_MAX_ITERATIONS
+    if (!Number.isSafeInteger(requestedMax) || requestedMax < 1) {
+      throw new Error(`retrieve: maxIterations must be a positive integer, got ${requestedMax}`)
     }
+    // §10.4: a deliberate subscription override on retrieval.critic/rewrite forces
+    // a SINGLE critic pass (no rewrite loop) so a live get_context can't fan out to
+    // ~9 subscription spawns and trip the client MCP timeout. Both roles are §11.4
+    // HARD-local by default, so this only bites the explicit override.
+    const maxIterations = deps.router?.retrievalForcesSingleIteration() === true ? 1 : requestedMax
     const passScore = options.passScore ?? RETRIEVAL_CRITIC_PASS_SCORE
     const passOptions: PassOptions = {
       tags,
       ...(options.tokenBudget !== undefined ? { tokenBudget: options.tokenBudget } : {}),
       ...(options.tokenCounter !== undefined ? { tokenCounter: options.tokenCounter } : {})
     }
+
+    // Phase-16b: bind the two §11.4 retrieval roles for THIS run. Both are
+    // HARD-local, so with a router they still resolve to local-qwen3 — identical
+    // behavior to the injected `llm`; this only routes through the seam and
+    // threads the live taskId (already 'live:<sessionId>' from phase-15's budget
+    // wiring; span-correlation only for a free local role). No router → `llm`.
+    const roleTaskId = options.taskId ?? 'live:unknown'
+    const critic: SmallLlm = deps.router ? deps.router.forRole('retrieval.critic', roleTaskId) : deps.llm
+    const rewriter: SmallLlm = deps.router ? deps.router.forRole('retrieval.rewrite', roleTaskId) : deps.llm
 
     const queriesTried: string[] = []
     let best: AssembledBundle | null = null
@@ -124,7 +152,7 @@ export function createRetriever(deps: RetrieverDeps): Retriever {
       let verdictScore: number
       let verdictFeedback: string
       try {
-        const verdict = await scoreBundle(deps.llm, task, bundle)
+        const verdict = await scoreBundle(critic, task, bundle)
         verdictScore = verdict.score
         verdictFeedback = verdict.feedback
       } catch {
@@ -157,7 +185,7 @@ export function createRetriever(deps: RetrieverDeps): Retriever {
 
       let next: string | null
       try {
-        next = await rewriteQuery(deps.llm, task, verdictFeedback, queriesTried)
+        next = await rewriteQuery(rewriter, task, verdictFeedback, queriesTried)
       } catch {
         haltReason = 'loop-error'
         break

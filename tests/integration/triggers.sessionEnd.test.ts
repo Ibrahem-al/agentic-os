@@ -113,6 +113,7 @@ beforeAll(async () => {
   const retriever: Retriever = createRetriever({ ...retrieval, llm: stubLlm })
   server = new AgenticOsMcpServer({
     bearerToken: 'unrelated-mcp-token',
+    runnerToken: 'unrelated-runner-token',
     engine: store.engine,
     retriever,
     retrieval,

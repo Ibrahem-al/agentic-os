@@ -18,8 +18,10 @@
  */
 import { randomUUID } from 'node:crypto'
 import type { JsonObject, WorkflowStep } from '../../kernel'
+import { meteredComplete } from '../../models'
+import type { RoleKey } from '../../models'
 import { runBenchmark } from './benchmark'
-import { generateCandidate } from './candidate'
+import { generateCandidate, useProvidedCandidate, type ProvidedCandidate } from './candidate'
 import { planImprovementRun } from './gate'
 import {
   adoptSkillVersion,
@@ -50,8 +52,10 @@ import {
   type SkillAgentDeps,
   type SkillBenchmark,
   type SkillCandidate,
+  type SkillCloudCall,
   type SkillImprovementResult,
   type SkillImprovementRunResult,
+  type SkillLlm,
   type SkillTestSet,
   type SkillWorkItem,
   type TestsetState
@@ -62,11 +66,25 @@ export { SKILL_IMPROVEMENT_AGENT_ID }
 
 export const CLOUD_UNAVAILABLE_ERROR = 'cloud tier unavailable — configure an API key in settings to generate candidates'
 
+/**
+ * P1.8: the role whose resolved model id is recorded as "the model that produced
+ * this adoption". `skills.rewrite` authors the candidate and rides the
+ * subscription tier when the runner is on (so it mirrors runner_runs.model);
+ * on a keyed default it is the cloud model; keyless it falls back to local.
+ */
+const MODEL_BOOKKEEPING_ROLE: RoleKey = 'skills.rewrite'
+
 export interface RunImprovementOptions {
   /** Improve one skill (the manual trigger); omitted = the nightly event gate. */
   readonly skillId?: string
   /** Caller-supplied job id (the queue handler); defaults to a random UUID. */
   readonly jobId?: string
+  /**
+   * A client-provided SKILL.md revision (propose_skill_revision, phase-18): the
+   * candidate step validates + uses it instead of the cloud rewrite LLM. It
+   * still rides the full benchmark + §17 gate — never auto-adopted from here.
+   */
+  readonly providedCandidate?: ProvidedCandidate
 }
 
 export interface SkillImprovementAgent {
@@ -77,6 +95,8 @@ export interface SkillImprovementAgent {
 interface ImprovementInput {
   readonly mode: 'nightly' | 'manual'
   readonly skillId: string | null
+  /** phase-18: a client-provided candidate for `skillId` (else the cloud rewrite runs). */
+  readonly providedCandidate?: ProvidedCandidate | null
 }
 
 /**
@@ -115,11 +135,18 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
       name: 'plan',
       async run(state): Promise<JsonObject> {
         const input = state as unknown as ImprovementInput
+        // P1.8: resolve the run's reasoning model ONCE (skills.rewrite — the role
+        // that authors the candidate, and the one that rides the subscription
+        // when the runner is on, mirroring runner_runs.model). Stamped into every
+        // benchmark_json below AND used as the drift window's END-point model.
+        // No router (today / every fake-injecting test) → null → no bookkeeping.
+        const resolvedModel = deps.router?.resolve(MODEL_BOOKKEEPING_ROLE).model ?? null
         const plan = await planImprovementRun({
           engine: deps.engine,
           db: deps.db,
           mode: input.mode,
-          skillId: input.skillId
+          skillId: input.skillId,
+          currentModel: resolvedModel
         })
         return { plan } as unknown as JsonObject
       }
@@ -128,15 +155,13 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
       name: 'testset',
       async run(state, ctx): Promise<JsonObject> {
         const plan = state['plan'] as PlanState
+        // Bind the cloud role for THIS run (ctx.jobId is the budget/trace key).
+        const cloud = cloudCallFor(deps, 'skills.testset', ctx.jobId)
         const testsets: SkillTestSet[] = []
         const warnings: string[] = []
         for (const item of plan.work) {
           const baseline = baselineSkillMdOf(item)
-          const testset = await buildTestSet({
-            item,
-            skillMd: baseline.md,
-            cloud: deps.cloud ? { ...deps.cloud, taskId: ctx.jobId } : null
-          })
+          const testset = await buildTestSet({ item, skillMd: baseline.md, cloud })
           testsets.push(testset)
           warnings.push(...testset.warnings)
         }
@@ -147,10 +172,25 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
       name: 'candidate',
       async run(state, ctx): Promise<JsonObject> {
         const plan = state['plan'] as PlanState
+        const provided = (state['providedCandidate'] ?? null) as ProvidedCandidate | null
+        const cloud = cloudCallFor(deps, 'skills.rewrite', ctx.jobId)
         const candidates: SkillCandidate[] = []
         const warnings: string[] = []
         for (const item of plan.work) {
-          if (!deps.cloud) {
+          const baseline = baselineSkillMdOf(item)
+          // A client-provided revision (propose_skill_revision) bypasses the
+          // rewrite LLM entirely — validated + version-id recomputed here, BEFORE
+          // the no-cloud guard (a provided candidate needs no cloud tier). It
+          // still runs the full benchmark + §17 gate below; never self-certifies.
+          if (provided !== null && provided.skillId === item.skillId) {
+            const candidate = useProvidedCandidate({ item, skillMd: baseline.md, expectedName: baseline.name, provided })
+            if (candidate.error !== null) warnings.push(`${item.skillId}: ${candidate.error}`)
+            candidates.push(candidate)
+            continue
+          }
+          if (cloud === null) {
+            // No cloud/subscription tier for the rewrite (keyless default resolves
+            // local) → skip, exactly as today. DEFAULT == TODAY.
             candidates.push({
               skillId: item.skillId,
               candidateVersionId: '',
@@ -159,12 +199,11 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
             })
             continue
           }
-          const baseline = baselineSkillMdOf(item)
           const candidate = await generateCandidate({
             item,
             skillMd: baseline.md,
             expectedName: baseline.name,
-            cloud: { ...deps.cloud, taskId: ctx.jobId }
+            cloud
           })
           if (candidate.error !== null) warnings.push(`${item.skillId}: ${candidate.error}`)
           candidates.push(candidate)
@@ -178,6 +217,11 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
         const plan = state['plan'] as PlanState
         const testsetState = state['testsets'] as TestsetState
         const candidateState = state['candidates'] as CandidateState
+        // executor/grader are §11.4 HARD-local (forRole resolves local anyway);
+        // comparator is a different tier (or null = unavailable).
+        const executor = localReasonerFor(deps, 'skills.executor', ctx.jobId)
+        const grader = localReasonerFor(deps, 'skills.grader', ctx.jobId)
+        const comparator = cloudCallFor(deps, 'skills.comparator', ctx.jobId)
         const benchmarks: (SkillBenchmark | null)[] = []
         const warnings: string[] = []
         for (const [index, item] of plan.work.entries()) {
@@ -188,8 +232,9 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
             continue
           }
           const benchmark = await runBenchmark({
-            llm: deps.llm,
-            cloud: deps.cloud ? { ...deps.cloud, taskId: ctx.jobId } : null,
+            executor,
+            grader,
+            comparator,
             kind: item.mode,
             testset,
             candidateInstructions: candidate.instructions,
@@ -244,7 +289,8 @@ export function createSkillImprovementAgent(deps: SkillAgentDeps): SkillImprovem
       const jobId = options.jobId ?? randomUUID()
       const input: ImprovementInput = {
         mode: options.skillId !== undefined && options.skillId !== '' ? 'manual' : 'nightly',
-        skillId: options.skillId ?? null
+        skillId: options.skillId ?? null,
+        providedCandidate: options.providedCandidate ?? null
       }
       await deps.runner.run(SKILL_IMPROVEMENT_WORKFLOW, input as unknown as JsonObject, {
         jobId,
@@ -359,7 +405,8 @@ async function performWrite(options: WriteOptions): Promise<SkillImprovementResu
           benchmark: benchmarkJson,
           reason: `net-positive on held-out (${(summary.heldoutScore?.candidate ?? 0).toFixed(2)} vs ${(summary.heldoutScore?.active ?? 0).toFixed(2)}) with zero regressions`,
           jobId: options.jobId,
-          adoptedAtIso: new Date().toISOString()
+          adoptedAtIso: new Date().toISOString(),
+          model: plan.resolvedModel
         })
         processed.push({
           skillId: item.skillId,
@@ -392,7 +439,8 @@ async function performWrite(options: WriteOptions): Promise<SkillImprovementResu
           benchmark: benchmarkJson,
           reason,
           jobId: options.jobId,
-          adoptedAtIso: null
+          adoptedAtIso: null,
+          model: plan.resolvedModel
         })
         processed.push({
           skillId: item.skillId,
@@ -437,7 +485,8 @@ async function performWrite(options: WriteOptions): Promise<SkillImprovementResu
         benchmark: benchmarkJson,
         reason: 'awaiting review-queue approval',
         jobId: options.jobId,
-        adoptedAtIso: null
+        adoptedAtIso: null,
+        model: plan.resolvedModel
       })
       processed.push({
         skillId: item.skillId,
@@ -468,10 +517,21 @@ async function performWrite(options: WriteOptions): Promise<SkillImprovementResu
         newRate: finding.newRate,
         predecessorRate: finding.predecessorRate,
         usesObserved: finding.usesObserved,
-        correctionsObserved: finding.correctionsObserved
+        correctionsObserved: finding.correctionsObserved,
+        // P1.8: stamp the drift window's endpoint models so the flag is auditable.
+        ...(finding.benchmarkModel !== null ? { benchmarkModel: finding.benchmarkModel } : {}),
+        ...(finding.currentModel !== null ? { currentModel: finding.currentModel } : {}),
+        ...(finding.modelChangedMidWindow ? { modelChangedMidWindow: true } : {})
       }
     })
-    if (finding.autoRevert) {
+    // P1.8: a global model bump mid-window confounds the drift signal — FLAG only,
+    // never auto-revert, regardless of the per-skill autoRevert setting.
+    if (finding.modelChangedMidWindow && finding.autoRevert) {
+      warnings.push(
+        `${finding.skillId}: drift auto-revert suppressed — reasoning model changed mid-window (${finding.benchmarkModel ?? '?'} → ${finding.currentModel ?? '?'}); a global model bump must not auto-revert a skill; flag stands`
+      )
+    }
+    if (finding.autoRevert && !finding.modelChangedMidWindow) {
       // Resume safety: the revert must target EXACTLY the flagged adoption.
       // If it was already rolled back (a re-run write step) or a newer
       // adoption has superseded it, rolling back "the latest standing
@@ -512,4 +572,57 @@ async function performWrite(options: WriteOptions): Promise<SkillImprovementResu
 const winRateOf = (c: { candidateWins: number; activeWins: number; ties: number }): number => {
   const total = c.candidateWins + c.activeWins + c.ties
   return total === 0 ? 0 : c.candidateWins / total
+}
+
+// ── per-run §11.4 role binding (phase-16b) ───────────────────────────────────
+
+/**
+ * A role-bound cloud completion for a §17 cloud-tier role (`skills.testset` /
+ * `skills.rewrite` / `skills.comparator`).
+ *
+ *  - Router present → route through it, but ONLY when the role resolves to a
+ *    genuinely non-local tier (cloud-api or subscription). The keyless default
+ *    resolves local, so these roles then return `null` and behave as today's
+ *    "no cloud tier": DEFAULT == TODAY, and §17's blind comparator never runs on
+ *    the same local tier as the executor.
+ *  - Router absent → today's metered cloud via `deps.cloud` (or `null`).
+ *
+ * The router's cloud adapter rides `meteredComplete`, so the §14 $0.50 ceiling
+ * wraps every cloud call on both paths automatically.
+ */
+function cloudCallFor(deps: SkillAgentDeps, role: RoleKey, jobId: string): SkillCloudCall | null {
+  const router = deps.router
+  if (router !== undefined) {
+    if (router.resolve(role).backend === 'local-qwen3') return null
+    return async (req) => {
+      const res = await router.complete(role, {
+        prompt: req.prompt,
+        ...(req.system !== undefined ? { system: req.system } : {}),
+        ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),
+        taskId: jobId
+      })
+      return { text: res.text }
+    }
+  }
+  const cloud = deps.cloud
+  if (cloud) {
+    return async (req) => {
+      const completion = await meteredComplete(cloud.brain, cloud.meter, jobId, [{ role: 'user', content: req.prompt }], {
+        ...(req.system !== undefined ? { system: req.system } : {}),
+        ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {})
+      })
+      return { text: completion.text }
+    }
+  }
+  return null
+}
+
+/**
+ * The local `SkillLlm` for a §17 HARD-local role (`skills.executor` /
+ * `skills.grader`). Router present → `forRole` (resolves local anyway per §11.4,
+ * but honors per-role model overrides + span correlation, and preserves the §7
+ * local-×3 volume rule); router absent → today's `deps.llm`.
+ */
+function localReasonerFor(deps: SkillAgentDeps, role: RoleKey, jobId: string): SkillLlm {
+  return deps.router !== undefined ? deps.router.forRole(role, jobId) : deps.llm
 }

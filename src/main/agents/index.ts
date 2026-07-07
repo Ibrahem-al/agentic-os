@@ -5,10 +5,16 @@
  */
 export {
   EXTRACTION_AGENT_ID,
+  EXTRACTION_AGENT_WORKFLOW,
+  EXTRACTION_DELEGATE_WORKFLOW,
   EXTRACTION_WORKFLOW,
   createExtractionAgent,
   sessionNodeIdOf,
   type ExtractionAgent,
+  type RunAgentExtractionInput,
+  type RunAgentExtractionOptions,
+  type RunDelegateExtractionInput,
+  type RunDelegateExtractionOptions,
   type RunExtractionOptions
 } from './extraction/agent'
 export { planDeterministic } from './extraction/deterministic'
@@ -16,19 +22,28 @@ export {
   FUZZY_PASS_SCHEMAS,
   FUZZY_SYSTEM_PROMPTS,
   chunkTranscript,
+  componentFromSubmission,
+  correctionFromSubmission,
   extractItemsReply,
   extractJsonArray,
   extractJsonObject,
+  normalizeComponent,
+  normalizeCorrection,
+  normalizePreference,
+  preferenceFromSubmission,
   runFuzzyExtraction,
+  type ExtractionMode,
   type FuzzyExtractionOptions
 } from './extraction/fuzzy'
 export { TIEBREAK_SYSTEM_PROMPT, resolveEntities, type ResolveOptions } from './extraction/resolve'
 export { parseTranscriptContent, parseTranscriptFile } from './extraction/transcript'
 export {
   ExtractionError,
+  ExtractionUnavailableError,
   extractionProvenance,
   itemKeyOf,
   normalizeItemText,
+  type AgentModeRunner,
   type CollectedCall,
   type CollectedState,
   type DeterministicPlan,
@@ -36,6 +51,7 @@ export {
   type ExtractedCorrection,
   type ExtractedPreference,
   type ExtractionAgentDeps,
+  type ExtractionAgentModeDeps,
   type ExtractionCloud,
   type ExtractionEmbedder,
   type ExtractionErrorCode,
@@ -53,11 +69,12 @@ export {
   type ResolvedComponent,
   type ResolvedCorrection,
   type ResolvedPreference,
+  type RunnerTemplateController,
   type TranscriptDigest,
   type VerificationResult,
   type VerifyState
 } from './extraction/types'
-export { VERIFIER_SYSTEM_PROMPT, WRITE_GATE_CONFIDENCE, runVerification } from './extraction/verify'
+export { VERIFIER_SYSTEM_PROMPT, WRITE_GATE_CONFIDENCE, runVerification, type ExtractionVerifier } from './extraction/verify'
 export { performGatedWrite, type GatedWriteOptions } from './extraction/write'
 
 // ── skill-improvement agent (phase 12) ───────────────────────────────────────
@@ -90,7 +107,7 @@ export {
   REWRITE_SYSTEM_PROMPT,
   type GenerateCandidateOptions
 } from './skills/candidate'
-export { planImprovementRun, type PlanOptions } from './skills/gate'
+export { collectSignal, hasPendingReview, planImprovementRun, scanDrift, type PlanOptions } from './skills/gate'
 export {
   enqueueManualImprovement,
   registerSkillImprovementHandler,
@@ -168,6 +185,7 @@ export {
   type SkillBenchmark,
   type SkillCandidate,
   type SkillCloud,
+  type SkillCloudCall,
   type SkillEmbedder,
   type SkillImprovementResult,
   type SkillImprovementRunResult,

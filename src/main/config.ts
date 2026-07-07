@@ -83,6 +83,45 @@ export function appDataPaths(userDataDir: string): {
   }
 }
 
+// ── Install / update data-safety lifecycle (§3 "Updates & migration") ─────────
+/**
+ * The names below are NOT §20 values — they are conservative rule-12 picks for
+ * the data-safe install/update/uninstall lifecycle, declared once here (the
+ * single config home) and MIRRORED verbatim in build/installer.nsh. The
+ * mirror is enforced by tests/unit/installer.invariants.test.ts: a future NSIS
+ * edit that drifts from these literals fails CI. See docs/DATA-MIGRATION.md.
+ */
+/**
+ * Sentinel the INTERACTIVE "reinstall from scratch" installer branch writes to
+ * the userData top level to RECORD INTENT only — the installer never deletes
+ * data. The app, on its next boot (storage boot, before any store opens),
+ * reads this marker and performs a recoverable, backed-up, integrity-checked
+ * reset, then removes the marker. A silent (`/S`, electron-updater) run never
+ * writes it, so a silent auto-update can never trigger a reset.
+ */
+export const RESET_MARKER_FILENAME = 'reset-data-requested.json'
+/**
+ * Top-level machine-readable record of the data assets + schema versions,
+ * (re)written atomically on every successful storage boot. The human-readable
+ * companion is docs/DATA-MIGRATION.md.
+ */
+export const DATA_MANIFEST_FILENAME = 'data-manifest.json'
+/**
+ * Label suffix for the pre-reset snapshot directory
+ * (`backups/<stamp>-pre-reset/`), sibling to the existing
+ * `<stamp>-pre-migration-v<N>` (graph) and `<stamp>-pre-appdata-v<N>` (SQLite)
+ * snapshots. No new §20 path — it lives in the existing backups/ dir.
+ */
+export const PRE_RESET_BACKUP_LABEL = 'pre-reset'
+/**
+ * Where the UNINSTALLER's "remove my data" choice MOVES (never deletes)
+ * `%APPDATA%\agentic-os` — a per-user roaming sibling that survives removal of
+ * userData itself and needs no elevation (same volume ⇒ atomic Rename). The
+ * literal is duplicated in build/installer.nsh (uninstaller macro); the sync
+ * is test-enforced.
+ */
+export const UNINSTALL_BACKUP_DIRNAME = 'agentic-os-backups'
+
 // ── Models ───────────────────────────────────────────────────────────────────
 /** The only embedding model, everywhere (Ollama). */
 export const EMBEDDING_MODEL = 'bge-m3'
@@ -411,6 +450,52 @@ export const AUTO_INGEST_TRUST_TAG = 'auto-ingested'
 // ── Spend ────────────────────────────────────────────────────────────────────
 /** Per-task spend ceiling (USD); per-task override allowed; live total in dashboard. */
 export const SPEND_CEILING_USD_DEFAULT = 0.5
+
+// ── Runner / subscription reasoner ───────────────────────────────────────────
+/**
+ * Headless Claude Code runner + subscription-reasoner foundation (feature
+ * spec: website/MCP-COVERAGE.md — §3 runner, §9.3 call budget, §10.1 token
+ * hygiene; the P0 items of §11.1). None of these values are in §20 — every
+ * one is a rule-12 pick, recorded in the phase-14 report.
+ */
+/** Default model alias handed to `claude -p --model` (not §20 — rule-12 pick, recorded in phase-14 report). */
+export const RUNNER_MODEL_DEFAULT = 'sonnet'
+/** Wall-clock kill deadline for one completion-mode (`-p`, no tools) run. */
+export const RUNNER_COMPLETION_TIMEOUT_MS = 120_000
+/** Wall-clock kill deadline for one agent-mode (tool-using) run. */
+export const RUNNER_AGENT_TIMEOUT_MS = 900_000
+/** `--max-turns` cap for agent-mode runs. */
+export const RUNNER_MAX_TURNS_AGENT = 40
+/** Server-side tool-call ceiling per runner MCP session (enforced in dispatch, not the client). */
+export const RUNNER_SESSION_MAX_TOOL_CALLS = 60
+/** Default per-task runner-call ceiling — the CallBudget analogue of the §20 $0.50 spend ceiling. */
+export const RUNNER_TASK_MAX_CALLS = 40
+/** Runner auth/health probe results are trusted for this long before re-probing. */
+export const RUNNER_HEALTH_TTL_MS = 900_000
+/** Agent-mode child processes running at once (across both lanes). */
+export const RUNNER_CONCURRENCY = 1
+/** Spawn lanes: live (user-facing) + background; background yields to live (§9.8/P0.9). */
+export const RUNNER_LANES = 2
+/** Completion-mode calls in flight at once (the cloud-lane discipline applied to the CLI). */
+export const RUNNER_COMPLETION_CONCURRENCY = 1
+/** Tool-call ceiling for live-path budgets (`taskId 'live:<sid>'`, §9.3 #3). */
+export const RUNNER_LIVE_SESSION_MAX_CALLS = 20
+/** Assumed tokens available per subscription window (quota self-throttle, P0.8). */
+export const RUNNER_WINDOW_TOKEN_BUDGET = 300_000
+/** Fraction of the window budget the app lets itself consume (§9.1: quota is SHARED with the user's own sessions). */
+export const RUNNER_QUOTA_FRACTION = 0.5
+/** 5-hour rolling window the subscription quota is metered over (rule-12). */
+export const RUNNER_WINDOW_MS = 5 * 60 * 60 * 1000
+/** Minimum Claude Code CLI version the runner accepts; pin — refine at FP-3 against the installed CLI. */
+export const RUNNER_MIN_CLI_VERSION = '1.0.0'
+/** Transcript tokens per subscription-tier fuzzy-pass call (no schema constraint ⇒ bigger, fewer calls — §10.3/P1.4). */
+export const EXTRACTION_SUBSCRIPTION_CHUNK_TOKENS = 30_000
+/** Output cap for one subscription-tier fuzzy-pass reply. */
+export const EXTRACTION_SUBSCRIPTION_PASS_MAX_TOKENS = 2_000
+/** HTTP header binding a runner MCP session to its spawning task (honored ONLY on runner-token sessions, P0.6 #3). */
+export const RUNNER_TASK_HEADER = 'X-Agentic-Os-Runner-Task'
+/** Env var the spawned child's .mcp.json header expansion reads the runner token from (§10.5: never plaintext in the file). */
+export const RUNNER_TOKEN_ENV = 'AGENTIC_OS_RUNNER_TOKEN'
 
 // ── Chunking ─────────────────────────────────────────────────────────────────
 /** Split on headings/code fences; target ~512 tokens with 64 overlap. */

@@ -29,24 +29,69 @@ import {
   MCP_MAX_BODY_BYTES,
   MCP_PORT,
   MCP_SERVER_NAME,
-  MCP_SERVER_VERSION
+  MCP_SERVER_VERSION,
+  RUNNER_SESSION_MAX_TOOL_CALLS,
+  RUNNER_TASK_HEADER
 } from '../config'
 import type { ProjectSummarizer } from '../ingest'
+import type { ProviderRouter } from '../models'
 import { KernelPermissionError, type ActionExecutor } from '../kernel'
-import type { RetrievalDeps, Retriever } from '../retrieval'
-import type { AuditLog, InjectionScanner } from '../security'
+import type { BudgetGuard, RetrievalDeps, Retriever } from '../retrieval'
+import { READ_TOOLS, STAGING_TOOLS, type AuditLog, type InjectionScanner } from '../security'
 import type { StorageEngine } from '../storage'
 import { McpCallLog } from './callLog'
-import { MCP_TOOLS, ToolError, type ToolContext } from './tools'
+import { MCP_TOOLS, ToolError, type McpReadContext, type ToolContext } from './tools'
+
+/**
+ * Runner MCP sessions are scoped SERVER-SIDE to READ + STAGING tools (§14b B3),
+ * independent of the client's `--allowedTools`: even a tampered runner client
+ * cannot widen its own surface. Mirrors the `mcp-runner:` permission profile so
+ * the dispatch allowlist and the §13 engine agree by construction. Agent-mode
+ * runs narrow this FURTHER per bound task via `registerRunnerTaskTemplate` (§3.2,
+ * FP-5) — a tighter subset enforced below.
+ */
+const RUNNER_SESSION_ALLOWLIST: ReadonlySet<string> = new Set<string>([...READ_TOOLS, ...STAGING_TOOLS])
+
+/**
+ * The agent-mode extraction template (§3.2/FP-5): the ONLY tools an agent-mode
+ * extraction child may call — read its inputs (`read_session`,
+ * `get_pending_work`) and stage its outputs (`submit_extraction_items`). A
+ * strict subset of READ+STAGING, matching `RUNNER_AGENT_ALLOWED_TOOLS` in
+ * `runner/agent.ts` (bare names here; that list carries the `mcp__<server>__`
+ * prefix). Registered per bound task while a run is live; a call outside it is
+ * PERMISSION_DENIED server-side even if `--allowedTools` was tampered.
+ */
+export const RUNNER_EXTRACTION_TEMPLATE_TOOLS: readonly string[] = [
+  'read_session',
+  'get_pending_work',
+  'submit_extraction_items'
+]
+
+/** Node lowercases incoming header names; match RUNNER_TASK_HEADER accordingly. */
+const RUNNER_TASK_HEADER_LC = RUNNER_TASK_HEADER.toLowerCase()
 
 export interface AgenticOsMcpServerDeps {
-  /** The keychain-held token (§14); every request must present it. */
+  /** The keychain-held interactive token (§14); every request presents a bearer. */
   readonly bearerToken: string
+  /**
+   * The keychain-held RUNNER token (§10.1/P0.3, phase-14) — the SECOND accepted
+   * bearer. Headless subscription-runner MCP sessions present this instead of
+   * the interactive one; whichever token authed a session's `initialize` fixes
+   * that session's kind for life. Boot rotates it each launch so a zombie
+   * runner's leaked token is already dead.
+   */
+  readonly runnerToken: string
   readonly engine: StorageEngine
   readonly retriever: Retriever
   readonly retrieval: RetrievalDeps
   /** The shared LOCAL small LLM (ingest_codebase README summaries). */
   readonly llm: ProjectSummarizer
+  /**
+   * Phase-16b: the ReasoningProvider router. When present, ingest_codebase's
+   * README → Project summary binds `forRole('ingest.projectSummary', …)` off it
+   * (local-by-default ⇒ identical to `llm`); absent ⇒ today's `llm`.
+   */
+  readonly router?: ProviderRouter
   /** appdata.db — mcp_calls + staged_writes. */
   readonly db: BetterSqlite3.Database
   /** The kernel chokepoint (§9/§13); every tool call runs through it. */
@@ -55,14 +100,37 @@ export interface AgenticOsMcpServerDeps {
   readonly scanner?: InjectionScanner
   /** §13 audit log — ingest lane jobs record reversible deltas (phase 09). */
   readonly audit?: AuditLog
+  /**
+   * P0.2 — the durable call/spend guard threaded into every tool's ToolContext
+   * (the live read-path budget). Optional: rigs and boots predating the runner
+   * path omit it, and every tool then runs without a ceiling exactly as before;
+   * the read-path consumer wiring lands at FP-1.
+   */
+  readonly spendMeter?: BudgetGuard
   readonly host?: string
   /** Default MCP_PORT; tests pass 0 for an ephemeral port. */
   readonly port?: number
 }
 
+type McpSessionKind = 'interactive' | 'runner'
+
 interface McpSession {
   readonly transport: StreamableHTTPServerTransport
   readonly server: Server
+  /**
+   * Which bearer authed this session's `initialize`, fixed for its life. Every
+   * later request addressing this session id must re-present the token whose
+   * kind matches (closes the token-blind gap — a runner token must not ride a
+   * user session, nor vice-versa); it also selects the agent-id family
+   * (`mcp:` | `mcp-runner:`) and, for runners, the server-side READ+STAGING
+   * allowlist.
+   */
+  readonly kind: McpSessionKind
+  /**
+   * Runner sessions only: the task id from X-Agentic-Os-Runner-Task at
+   * initialize (§14b P0.6 #3). Stored now; the runner module (FP-3) consumes it.
+   */
+  readonly boundTaskId?: string
 }
 
 /**
@@ -124,11 +192,31 @@ export class AgenticOsMcpServer {
   private readonly sessions = new Map<string, McpSession>()
   private http: HttpServer | null = null
   private sessionEndHook: SessionEndHook | null = null
-  private inflight = 0
+  // The §4 read tools' late-bound deps (permissions/runner/triggers/watched
+  // folders/ollama/keychain/app-status). Empty until bootIpc calls
+  // setReadContext; spread into every ToolContext so an un-wired server keeps
+  // today's exact behavior and the read tools that need a dep degrade cleanly.
+  private readContext: McpReadContext = {}
+  // Gauge split (§3.6a/P0.9): interactive calls drive the §8 yield; runner calls
+  // are observed but never stall live work.
+  private inflightInteractive = 0
+  private inflightRunner = 0
+  private readonly runnerSessionCalls: BetterSqlite3.Statement
+  // Agent-mode per-task templates (§3.2/FP-5): a bound task id → the exact tool
+  // set its runner session may call, tighter than RUNNER_SESSION_ALLOWLIST.
+  // Registered when an agent-mode run starts, released (+ session reaped) when it
+  // ends. Empty on a default install / completion mode — no narrowing applies.
+  private readonly runnerTaskTemplates = new Map<string, ReadonlySet<string>>()
 
   constructor(deps: AgenticOsMcpServerDeps) {
     this.deps = deps
     this.callLog = new McpCallLog(deps.db)
+    // Per-session runner tool-call ceiling (§14b B3): count THIS session's own
+    // already-logged runner calls (dispatch writes the mcp_calls row in its
+    // finally, so the current call is not yet counted when the guard reads).
+    this.runnerSessionCalls = deps.db.prepare(
+      "SELECT count(*) AS c FROM mcp_calls WHERE session_id = ? AND session_kind = 'runner'"
+    )
   }
 
   /** Arm the session-end hook endpoint (phase-11 boot, after the queue exists). */
@@ -136,9 +224,68 @@ export class AgenticOsMcpServer {
     this.sessionEndHook = hook
   }
 
-  /** Live tool calls in flight — the §8 queue yields while this is > 0. */
+  /**
+   * Supply the §4 read tools' late-bound dependencies. Called once from bootIpc
+   * — the last boot step, where every subsystem singleton exists and the
+   * subsystem snapshot is accurate. Mirrors setSessionEndHook: purely additive.
+   * Until it runs, read tools needing a missing dep return a clean structured
+   * error, so an un-wired server behaves exactly as before.
+   */
+  setReadContext(readContext: McpReadContext): void {
+    this.readContext = readContext
+  }
+
+  /**
+   * Register a NARROWED per-task tool template for an agent-mode run (§3.2/FP-5).
+   * While registered, a runner session bound to `taskId` (via
+   * X-Agentic-Os-Runner-Task at initialize) may call ONLY `tools` — enforced in
+   * dispatch, independent of the client's `--allowedTools`, so a tampered runner
+   * child cannot widen its own surface. Defaults to the extraction template
+   * (read + submit). Called BEFORE the child spawns, so the template is in place
+   * by the time the child connects back.
+   */
+  registerRunnerTaskTemplate(taskId: string, tools: readonly string[] = RUNNER_EXTRACTION_TEMPLATE_TOOLS): void {
+    this.runnerTaskTemplates.set(taskId, new Set(tools))
+  }
+
+  /**
+   * Release a per-task template AND reap the runner transport session bound to
+   * `taskId` (§10.15 session reaper) — called when the agent-mode run completes.
+   * Dropping the template first means any late call from a lingering child faces
+   * the default allowlist (never a widened surface); closing its session frees
+   * the SDK server so a late call 404s and must re-initialize.
+   */
+  releaseRunnerTaskTemplate(taskId: string): void {
+    this.runnerTaskTemplates.delete(taskId)
+    for (const [sid, session] of [...this.sessions]) {
+      if (session.kind === 'runner' && session.boundTaskId === taskId) {
+        this.sessions.delete(sid)
+        void session.server.close().catch(() => undefined)
+      }
+    }
+  }
+
+  /**
+   * INTERACTIVE tool calls in flight — THE §8 queue/workflow yield signal
+   * (P0.9). A headless runner's calls deliberately do not count here so a
+   * background subscription run never stalls live interactive work.
+   */
+  get inflightInteractiveCalls(): number {
+    return this.inflightInteractive
+  }
+
+  /** Runner tool calls in flight — observability only (never drives a yield). */
+  get inflightRunnerCalls(): number {
+    return this.inflightRunner
+  }
+
+  /**
+   * Combined in-flight gauge (interactive + runner), kept for back-compat with
+   * callers predating the P0.9 split. Boot's yield now reads
+   * `inflightInteractiveCalls`; this stays so nothing silently breaks.
+   */
   get inflightCalls(): number {
-    return this.inflight
+    return this.inflightInteractive + this.inflightRunner
   }
 
   /** The bound port (useful when constructed with port 0). */
@@ -198,17 +345,32 @@ export class AgenticOsMcpServer {
       return
     }
 
-    // Bearer auth gates EVERY request, initialize included. The token never
-    // appears in logs or errors (§21 rule 7).
+    // Bearer auth gates EVERY request, initialize included (§21 rule 7 — the
+    // token never appears in logs or errors). TWO tokens are accepted: the
+    // interactive bearer and the headless RUNNER token (§14b). Both are compared
+    // timing-safe; whichever matches fixes this request's kind.
     const auth = req.headers.authorization ?? ''
     const token = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : ''
-    if (token === '' || !tokenMatches(token, this.deps.bearerToken)) {
+    let presentedKind: McpSessionKind | null = null
+    if (token !== '') {
+      if (tokenMatches(token, this.deps.bearerToken)) presentedKind = 'interactive'
+      else if (tokenMatches(token, this.deps.runnerToken)) presentedKind = 'runner'
+    }
+    if (presentedKind === null) {
       unauthorized(res)
       return
     }
 
     const sessionId = req.headers['mcp-session-id']
     const existing = typeof sessionId === 'string' ? this.sessions.get(sessionId) : undefined
+    // Per-request kind re-check (§14b, closes the token-blind gap): a request
+    // addressing an existing session must present the token whose kind that
+    // session was initialized with. A runner token may not ride an interactive
+    // session, nor vice-versa — same 401 as a bad token (no information leak).
+    if (existing !== undefined && existing.kind !== presentedKind) {
+      unauthorized(res)
+      return
+    }
 
     if (req.method === 'POST') {
       let body: unknown
@@ -232,7 +394,18 @@ export class AgenticOsMcpServer {
         jsonRpcHttpError(res, 400, -32000, 'Bad request: no session id and not an initialize request')
         return
       }
-      const session = await this.createSession()
+      // X-Agentic-Os-Runner-Task binds a runner session to its spawning task
+      // (§14b P0.6 #3). Honored ONLY when a runner token authed this initialize;
+      // an interactive initialize carrying it is a misconfigured client → 400 (a
+      // default interactive client never sends this header, so today's behavior
+      // is untouched).
+      const taskHeader = req.headers[RUNNER_TASK_HEADER_LC]
+      const boundTaskId = typeof taskHeader === 'string' && taskHeader !== '' ? taskHeader : undefined
+      if (boundTaskId !== undefined && presentedKind !== 'runner') {
+        jsonRpcHttpError(res, 400, -32000, `${RUNNER_TASK_HEADER} is only valid on a runner-token session`)
+        return
+      }
+      const session = await this.createSession(presentedKind, boundTaskId)
       await session.transport.handleRequest(req, res, body)
       return
     }
@@ -289,7 +462,7 @@ export class AgenticOsMcpServer {
     respond(result.status, result.body)
   }
 
-  private async createSession(): Promise<McpSession> {
+  private async createSession(kind: McpSessionKind, boundTaskId?: string): Promise<McpSession> {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid) => {
@@ -300,7 +473,12 @@ export class AgenticOsMcpServer {
       }
     })
     const server = this.buildSessionServer(() => transport.sessionId ?? 'uninitialized')
-    const session: McpSession = { transport, server }
+    const session: McpSession = {
+      transport,
+      server,
+      kind,
+      ...(boundTaskId !== undefined ? { boundTaskId } : {})
+    }
     transport.onclose = (): void => {
       if (transport.sessionId) this.sessions.delete(transport.sessionId)
     }
@@ -332,14 +510,55 @@ export class AgenticOsMcpServer {
     name: string,
     args: unknown
   ): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
+    // The session's kind (fixed at initialize) selects the agent-id family, the
+    // gauge, and the runner-only guards. An unknown session ⇒ interactive: the
+    // only way to reach dispatch is a live, mapped session, so this is a
+    // defensive default that preserves the exact pre-14b interactive path.
+    const session = this.sessions.get(sessionId)
+    const isRunner = session?.kind === 'runner'
+    const agentId = isRunner ? `mcp-runner:${sessionId}` : `mcp:${sessionId}`
+
     const startedUnixMs = Date.now()
     const t0 = performance.now()
     let resultStatus: 'ok' | 'error' = 'ok'
     let errorText: string | undefined
-    this.inflight += 1
+    if (isRunner) this.inflightRunner += 1
+    else this.inflightInteractive += 1
     try {
+      // Runner sessions face two server-side guards BEFORE the kernel runs the
+      // tool — enforced here, not by the client's --allowedTools, so a tampered
+      // runner client cannot widen its own surface. Both throw inside the try,
+      // so the finally still writes the mcp_calls row: the refusal is audited
+      // and counts toward the session's own call budget.
+      if (isRunner) {
+        // (1) Server-side allowlist — READ + STAGING by default, NARROWED to the
+        // bound task's template when an agent-mode run registered one (§3.2/FP-5:
+        // read + submit only). Independent of the §13 engine (which also blocks
+        // it via the mcp-runner profile) and of the client's `--allowedTools` —
+        // layered defense, one source of truth.
+        const template = session?.boundTaskId !== undefined ? this.runnerTaskTemplates.get(session.boundTaskId) : undefined
+        const allowlist = template ?? RUNNER_SESSION_ALLOWLIST
+        if (!allowlist.has(name)) {
+          throw new ToolError(
+            'PERMISSION_DENIED',
+            template !== undefined
+              ? `tool '${name}' is not in the per-task runner template for '${session?.boundTaskId ?? ''}' (agent-mode extraction: read + submit only)`
+              : `tool '${name}' is not permitted for a runner MCP session (server-side allowlist: read + staging only)`
+          )
+        }
+        // (2) Per-session tool-call ceiling (RUNNER_SESSION_MAX_TOOL_CALLS). The
+        // count excludes the current call (logged in the finally), so used >=
+        // ceiling refuses the (ceiling+1)th call onward.
+        const used = (this.runnerSessionCalls.get(sessionId) as { c: number }).c
+        if (used >= RUNNER_SESSION_MAX_TOOL_CALLS) {
+          throw new ToolError(
+            'INVALID_STATE',
+            `runner MCP session ${sessionId} has reached its ${RUNNER_SESSION_MAX_TOOL_CALLS}-call ceiling (§14b) — halting`
+          )
+        }
+      }
       const result = await this.deps.executor.execute(
-        `mcp:${sessionId}`,
+        agentId,
         { kind: 'mcp-call', name, attributes: { 'mcp.session_id': sessionId } },
         async () => {
           const tool = MCP_TOOLS.find((t) => t.name === name)
@@ -354,10 +573,17 @@ export class AgenticOsMcpServer {
             retriever: this.deps.retriever,
             retrieval: this.deps.retrieval,
             llm: this.deps.llm,
+            ...(this.deps.router !== undefined ? { router: this.deps.router } : {}),
             db: this.deps.db,
             sessionId,
             ...(this.deps.scanner !== undefined ? { scanner: this.deps.scanner } : {}),
-            ...(this.deps.audit !== undefined ? { audit: this.deps.audit } : {})
+            ...(this.deps.audit !== undefined ? { audit: this.deps.audit } : {}),
+            ...(this.deps.spendMeter !== undefined ? { spendMeter: this.deps.spendMeter } : {}),
+            // §4 read tools' late-bound deps (empty on an un-wired server).
+            ...this.readContext,
+            // Runner sessions carry their spawning task id (§14b P0.6 #3):
+            // submit_extraction_items keys its rows to it instead of a continuation.
+            ...(session?.boundTaskId !== undefined ? { boundTaskId: session.boundTaskId } : {})
           }
           return tool.handle(args, ctx)
         }
@@ -376,7 +602,8 @@ export class AgenticOsMcpServer {
         isError: true
       }
     } finally {
-      this.inflight -= 1
+      if (isRunner) this.inflightRunner -= 1
+      else this.inflightInteractive -= 1
       this.callLog.record({
         sessionId,
         tool: name,
@@ -384,7 +611,10 @@ export class AgenticOsMcpServer {
         resultStatus,
         ...(errorText !== undefined ? { error: errorText } : {}),
         startedUnixMs,
-        durationMs: performance.now() - t0
+        durationMs: performance.now() - t0,
+        // 'runner' rows let the §6 inactivity sweep skip a headless runner's own
+        // session; interactive rows stay NULL exactly as before (A3/P0.5).
+        sessionKind: isRunner ? 'runner' : null
       })
     }
   }

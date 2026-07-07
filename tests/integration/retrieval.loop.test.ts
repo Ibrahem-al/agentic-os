@@ -9,9 +9,10 @@
  * deterministic; the retrieval passes underneath run for real against the
  * fixture graph.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { LOOP_MAX_ITERATIONS } from '../../src/main/config'
-import { createRetriever, type BudgetGuard, type RetrieverDeps } from '../../src/main/retrieval'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { LOOP_MAX_ITERATIONS, RUNNER_MODEL_DEFAULT, SMALL_LLM_MODEL } from '../../src/main/config'
+import { ProviderRouter, defaultModelSettings, type ProviderRouterDeps } from '../../src/main/models'
+import { createRetriever, type BudgetGuard, type RetrieverDeps, type SmallLlm } from '../../src/main/retrieval'
 import { seedFixtureGraph } from '../fixtures/graph-seed'
 import { FakeEmbedder, FakeReranker, ScriptedLlm, type ScriptedLlmStep } from '../fixtures/retrieval-fakes'
 import { openTestStore, type TestStore } from './helpers'
@@ -198,5 +199,142 @@ describe('spend budget (§14/§15: consulted every iteration)', () => {
     await expect(
       retriever.retrieve('anything', [], { spendMeter: new CountingGuard() })
     ).rejects.toThrow(/taskId/)
+  })
+})
+
+/**
+ * Phase-16b: with a ProviderRouter injected, the loop binds the two §11.4
+ * HARD-local retrieval roles (`retrieval.critic` / `retrieval.rewrite`) through
+ * it per retrieve() call instead of using `deps.llm`. Because both roles are
+ * HARD-local, they ALWAYS resolve to local-qwen3 — behavior must be byte-for-
+ * byte identical to injecting the fake as `llm`. The router-ABSENT path (every
+ * describe above) is unchanged; those tests inject `llm` with no router.
+ */
+describe('router-injected critic/rewrite (phase-16b, §11.4 HARD-local)', () => {
+  const rewritten = 'deploy the aurora storefront to vercel and verify the checkout flow'
+
+  /**
+   * Build a retriever whose critic/rewrite ride a REAL ProviderRouter. The
+   * router's local backend is the same scripted fake (system-prompt discrimination
+   * still applies); `makeCloud` throws and `deps.llm` is poisoned, so any escape
+   * from the local seam — or any use of the non-router path — fails loudly.
+   */
+  function routerRetrieverWith(steps: ScriptedLlmStep[], routerOverrides: Partial<ProviderRouterDeps> = {}) {
+    const local = new ScriptedLlm(steps)
+    const router = new ProviderRouter({
+      loadSnapshot: () => defaultModelSettings(),
+      ollama: local,
+      makeCloud: () => {
+        throw new Error('retrieval critic/rewrite must never reach the cloud tier')
+      },
+      ...routerOverrides
+    })
+    const forRoleSpy = vi.spyOn(router, 'forRole')
+    const poisoned: SmallLlm = {
+      generate: () => {
+        throw new Error('router present → deps.llm must not be used')
+      }
+    }
+    const deps: RetrieverDeps = {
+      engine: store.engine,
+      embedder: new FakeEmbedder(),
+      reranker: new FakeReranker(),
+      llm: poisoned,
+      router
+    }
+    return { retriever: createRetriever(deps), local, router, forRoleSpy }
+  }
+
+  it('resolves both retrieval roles to local-qwen3 on a default install', () => {
+    const { router } = routerRetrieverWith([])
+    for (const role of ['retrieval.critic', 'retrieval.rewrite'] as const) {
+      expect(router.resolve(role).backend, role).toBe('local-qwen3')
+      expect(router.resolve(role).model, role).toBe(SMALL_LLM_MODEL)
+    }
+  })
+
+  it('drives the loop through the router identically to the injected llm, deps.llm untouched', async () => {
+    const { retriever, local, forRoleSpy } = routerRetrieverWith([
+      { criticReply: score(2, 'no deployment skill or project context'), rewriteReply: rewritten },
+      { criticReply: score(9) }
+    ])
+    const bundle = await retriever.retrieve('make the shop pages go live', [], { taskId: 'live:sess-1' })
+
+    // Same outcome as the non-router "bad first query improves" DoD case.
+    expect(bundle.iterations).toBeLessThanOrEqual(3)
+    expect(bundle.confidence).toBe('high')
+    expect(bundle.haltReason).toBe('passed')
+    expect(bundle.query).toBe(rewritten)
+    expect(bundle.queriesTried).toEqual(['make the shop pages go live', rewritten])
+    const ids = [...bundle.items, ...bundle.globalPreferences].map((i) => i.id)
+    expect(ids).toContain('s-deploy')
+    expect(ids).toContain('p-aurora')
+
+    // Both roles were bound through the router with phase-15's live taskId…
+    expect(forRoleSpy).toHaveBeenCalledWith('retrieval.critic', 'live:sess-1')
+    expect(forRoleSpy).toHaveBeenCalledWith('retrieval.rewrite', 'live:sess-1')
+    // …and both actually ran on the LOCAL backend (critic ×2, rewrite ×1).
+    expect(local.criticCalls).toHaveLength(2)
+    expect(local.rewriteCalls).toHaveLength(1)
+  })
+
+  it('falls back to a stable live:unknown taskId when retrieve() is given none', async () => {
+    const { retriever, forRoleSpy } = routerRetrieverWith([{ criticReply: score(9) }])
+    const bundle = await retriever.retrieve('render accessible telemetry charts')
+    expect(bundle.haltReason).toBe('passed')
+    expect(forRoleSpy).toHaveBeenCalledWith('retrieval.critic', 'live:unknown')
+    expect(forRoleSpy).toHaveBeenCalledWith('retrieval.rewrite', 'live:unknown')
+  })
+
+  it('stays local even when the subscription tier is globally enabled and healthy', async () => {
+    const { retriever, local, router } = routerRetrieverWith([{ criticReply: score(9) }], {
+      loadSnapshot: () => ({
+        ...defaultModelSettings(),
+        reasoning: { backend: 'subscription-claude' },
+        runner: { enabled: true, model: RUNNER_MODEL_DEFAULT, stageAll: true, mode: 'completion', injectionPolicy: 'downgrade' }
+      }),
+      subscriptionComplete: async () => {
+        throw new Error('HARD-local retrieval roles must never reach the subscription tier')
+      },
+      runnerHealthy: () => true
+    })
+    // The §11.4 clamp holds at the retrieval layer, not just in the router unit test.
+    expect(router.resolve('retrieval.critic').backend).toBe('local-qwen3')
+    expect(router.resolve('retrieval.rewrite').backend).toBe('local-qwen3')
+    const bundle = await retriever.retrieve('deploy the aurora storefront', [], { taskId: 'live:sess-9' })
+    expect(bundle.haltReason).toBe('passed')
+    expect(local.criticCalls).toHaveLength(1) // ran on local despite subscription ON
+  })
+
+  it('§10.4: a deliberate subscription OVERRIDE on the retrieval roles clamps to one critic pass', async () => {
+    // Explicit per-role override (not the global toggle) → honored → subscription.
+    // A low critic score would normally rewrite and loop to LOOP_MAX_ITERATIONS;
+    // the §10.4 clamp forces a SINGLE critic pass so a live get_context can't fan
+    // out to ~9 subscription spawns and trip the client MCP timeout.
+    let subCalls = 0
+    const { retriever, local } = routerRetrieverWith([], {
+      loadSnapshot: () => ({
+        ...defaultModelSettings(),
+        reasoning: {
+          backend: 'local-qwen3',
+          overrides: { 'retrieval.critic': 'subscription-claude', 'retrieval.rewrite': 'subscription-claude' }
+        },
+        runner: { enabled: true, model: RUNNER_MODEL_DEFAULT, stageAll: true, mode: 'completion', injectionPolicy: 'downgrade' }
+      }),
+      makeCloud: () => null, // roles go to subscription, not cloud; avoid the throwing default
+      subscriptionComplete: async () => {
+        subCalls += 1
+        return { text: score(2, 'thin bundle') } // low → would rewrite+loop WITHOUT the clamp
+      },
+      runnerHealthy: () => true
+    })
+
+    const bundle = await retriever.retrieve('deploy the aurora storefront', [], { taskId: 'live:sess-clamp' })
+
+    expect(bundle.iterations).toBe(1)
+    expect(bundle.haltReason).toBe('max-iterations')
+    expect(subCalls).toBe(1) // exactly one critic call; the rewrite loop never started
+    expect(local.criticCalls).toHaveLength(0) // critic ran on subscription, not local
+    expect(local.rewriteCalls).toHaveLength(0)
   })
 })

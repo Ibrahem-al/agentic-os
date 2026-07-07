@@ -39,9 +39,9 @@ import {
   type SkillLlm,
   type SkillTestSet
 } from '../../src/main/agents'
-import { SKILL_IMPROVEMENT_PROVENANCE } from '../../src/main/config'
+import { CLOUD_DEFAULT_MODELS, SKILL_IMPROVEMENT_PROVENANCE, SMALL_LLM_MODEL } from '../../src/main/config'
 import { LangGraphRunner } from '../../src/main/kernel'
-import { OllamaClient, SpendMeter } from '../../src/main/models'
+import { defaultModelSettings, OllamaClient, ProviderRouter, SpendMeter } from '../../src/main/models'
 import {
   approveStagedWrite,
   AuditLog,
@@ -731,6 +731,192 @@ describe('queue handler (the 02:00 slot + "improve now")', () => {
       await queue.stop(0)
     }
   }, 90_000)
+})
+
+// ── phase-16b: ProviderRouter injection (roles route through the router) ─────
+
+describe('phase-16b — ProviderRouter injection (DEFAULT == TODAY; router wins over llm/cloud)', () => {
+  it('router present: executor/grader via forRole, testset/rewrite via complete; deps.llm/cloud bypassed', async () => {
+    const srV0 = 'Deploy the service and move on.'
+    const srCand = skillMdOf('deploy-guard', 'Deploy safely.', 'Run the healthcheck and ROUTEMARK before declaring done.')
+    await seedSkill({
+      id: 'sr',
+      name: 'deploy-guard',
+      instructions: srV0,
+      activeVersion: { id: 'sv-sr-v0', instructions: srV0 },
+      corrections: [{ id: 'corr-r1', content: 'always ROUTEMARK after deploying' }]
+    })
+    setSkillSettings(stack.appData.db, 'sr', { mode: 'verifiable' })
+    await sleep(10)
+
+    // The router's LOCAL tier (a scripted qwen3, structurally an OllamaLike) and
+    // its CLOUD tier (the fake brain + a REAL SpendMeter, so §14 metering runs).
+    const grade = (expectation: string, output: string): boolean =>
+      expectation.includes('ROUTEMARK') ? output.includes('ROUTEMARK') : false
+    const routerLocal = new ScriptedSkillLlm({ grade })
+    const routerBrain = new FakeSkillCloudBrain({
+      rewriteByName: { 'deploy-guard': srCand },
+      casesByName: { 'deploy-guard': '[]' }
+    })
+    const router = new ProviderRouter({
+      loadSnapshot: () => defaultModelSettings(),
+      ollama: routerLocal,
+      makeCloud: () => ({ brain: routerBrain, meter: new SpendMeter({ db: stack.appData.db }) })
+    })
+
+    // deps.llm is DEAD and deps.cloud is null: if the router did not win, the
+    // executor would throw and no cloud call could land → the run would not adopt.
+    const deadLlm = new ScriptedSkillLlm({ failExecute: true })
+    const runner = new LangGraphRunner({ db: stack.appData.db, telemetry: stack.telemetry, executor: stack.kernel })
+    const agent = createSkillImprovementAgent({
+      engine: store.engine,
+      db: stack.appData.db,
+      runner,
+      embedder: new FakeExtractionEmbedder(),
+      llm: deadLlm,
+      cloud: null,
+      router,
+      audit
+    })
+
+    const result = await agent.runImprovement({ skillId: 'sr', jobId: 'job-sr16b-1' })
+
+    expect(result.processed[0]!.outcome).toBe('adopted')
+    // Cloud roles (testset synthesis + rewrite) routed through the ROUTER's cloud.
+    expect(routerBrain.calls.map((c) => c.kind).sort()).toEqual(['cases', 'rewrite'])
+    // Local roles (executor + grader) routed through the ROUTER's local tier.
+    expect(routerLocal.executorCalls).toBeGreaterThan(0)
+    expect(routerLocal.graderCalls).toBeGreaterThan(0)
+    // The today path (deps.llm) was never touched — proof the router won.
+    expect(deadLlm.executorCalls).toBe(0)
+    // §14: the router's cloud adapter still meters every call against the job id.
+    const spend = stack.appData.db.prepare(`SELECT count(*) AS c FROM spend WHERE task_id = 'job-sr16b-1'`).get() as { c: number }
+    expect(spend.c).toBe(2) // cases + rewrite
+    expect(await versionStatus(result.processed[0]!.candidateVersionId!)).toBe('active')
+  }, 60_000)
+
+  it('router present but KEYLESS (makeCloud → null): skills.rewrite resolves local → skipped-no-cloud, zero spend', async () => {
+    const ssV0 = 'Answer questions concisely.'
+    await seedSkill({
+      id: 'ss',
+      name: 'concise-answers',
+      instructions: ssV0,
+      corrections: [{ id: 'corr-s1', content: 'always cite a source' }]
+    })
+    await sleep(10)
+
+    const router = new ProviderRouter({
+      loadSnapshot: () => defaultModelSettings(),
+      ollama: new ScriptedSkillLlm({}),
+      makeCloud: () => null // keyless → the cloud roles resolve local → treated as no cloud tier
+    })
+    const runner = new LangGraphRunner({ db: stack.appData.db, telemetry: stack.telemetry, executor: stack.kernel })
+    const agent = createSkillImprovementAgent({
+      engine: store.engine,
+      db: stack.appData.db,
+      runner,
+      embedder: new FakeExtractionEmbedder(),
+      llm: new ScriptedSkillLlm({}),
+      cloud: null,
+      router,
+      audit
+    })
+
+    const result = await agent.runImprovement({ skillId: 'ss', jobId: 'job-ss16b-1' })
+
+    expect(result.processed[0]!.outcome).toBe('skipped-no-cloud') // DEFAULT == TODAY (keyless)
+    expect((await skillRow('ss')).instructions).toBe(ssV0) // skill untouched
+    const spend = stack.appData.db.prepare(`SELECT count(*) AS c FROM spend WHERE task_id = 'job-ss16b-1'`).get() as { c: number }
+    expect(spend.c).toBe(0) // no non-local tier was ever called
+  }, 60_000)
+})
+
+// ── P1.8: model-version bookkeeping — drift is FLAG-ONLY across a model bump ──
+
+describe('P1.8 — drift flag-only when the reasoning model changed mid-window (even with autoRevert ON)', () => {
+  it('stamps the run model into benchmark_json and suppresses auto-revert when it changed since adoption', async () => {
+    const name = 'ratelimit-guard'
+    const v0 = `Handle ${name} tasks carefully.`
+    await seedSkill({
+      id: 'sx',
+      name,
+      instructions: v0,
+      activeVersion: { id: 'sv-sx-v0', instructions: v0 },
+      corrections: [{ id: 'corr-x1', content: `always double-check ${name} MARKPHRASE` }]
+    })
+    // Auto-revert is ON — the ONLY thing that keeps this flag-only is the model change.
+    setSkillSettings(stack.appData.db, 'sx', { mode: 'verifiable', autoRevert: true })
+    await seedUse('sx') // predecessor tenure: 1 correction / 2 uses = 0.5
+    await seedUse('sx')
+    await sleep(10)
+
+    const grade = (expectation: string, output: string): boolean =>
+      expectation.includes('MARKPHRASE') ? output.includes('MARKPHRASE first') : false
+    const cand = skillMdOf(name, `Handle ${name} tasks.`, `Always double-check ${name} MARKPHRASE first.`)
+
+    // Adoption under a KEYED router → skills.rewrite resolves to the cloud model,
+    // which gets stamped into benchmark_json.
+    const keyedBrain = new FakeSkillCloudBrain({ rewriteByName: { [name]: cand }, casesByName: { [name]: '[]' } })
+    const keyedRouter = new ProviderRouter({
+      loadSnapshot: () => defaultModelSettings(),
+      ollama: new ScriptedSkillLlm({ grade }),
+      makeCloud: () => ({ brain: keyedBrain, meter: new SpendMeter({ db: stack.appData.db }) })
+    })
+    const adoptAgent = createSkillImprovementAgent({
+      engine: store.engine,
+      db: stack.appData.db,
+      runner: new LangGraphRunner({ db: stack.appData.db, telemetry: stack.telemetry, executor: stack.kernel }),
+      embedder: new FakeExtractionEmbedder(),
+      llm: new ScriptedSkillLlm({ failExecute: true }), // dead — the router must win
+      cloud: null,
+      router: keyedRouter,
+      audit
+    })
+    const adopt = await adoptAgent.runImprovement({ skillId: 'sx', jobId: 'job-sx-adopt' })
+    expect(adopt.processed[0]!.outcome).toBe('adopted')
+    const sxCandidate = adopt.processed[0]!.candidateVersionId!
+    expect(listImprovements(stack.appData.db, 'sx')[0]!.benchmark['model']).toBe(CLOUD_DEFAULT_MODELS.anthropic)
+
+    // A worse-than-predecessor drift stream (3 corrections / 3 uses = 1.0 > 0.5).
+    for (let i = 0; i < 3; i++) {
+      await seedUse('sx')
+      await seedCorrection('sx', { id: `corr-sx-drift-${i}`, content: `post-adoption complaint ${i}` })
+    }
+    await sleep(10)
+
+    // Nightly under a KEYLESS router → skills.rewrite now resolves LOCAL
+    // (qwen3), a DIFFERENT model than the stamped cloud one → mid-window bump.
+    const keylessRouter = new ProviderRouter({
+      loadSnapshot: () => defaultModelSettings(),
+      ollama: new ScriptedSkillLlm({}),
+      makeCloud: () => null
+    })
+    const driftAgent = createSkillImprovementAgent({
+      engine: store.engine,
+      db: stack.appData.db,
+      runner: new LangGraphRunner({ db: stack.appData.db, telemetry: stack.telemetry, executor: stack.kernel }),
+      embedder: new FakeExtractionEmbedder(),
+      llm: new ScriptedSkillLlm({}),
+      cloud: null,
+      router: keylessRouter,
+      audit
+    })
+    const nightly = await driftAgent.runImprovement({ jobId: 'job-sx-drift' })
+
+    const finding = nightly.drift.find((d) => d.skillId === 'sx')
+    expect(finding).toMatchObject({ verdict: 'worse', action: 'flagged', versionId: sxCandidate })
+    expect(finding!.modelChangedMidWindow).toBe(true)
+    expect(finding!.benchmarkModel).toBe(CLOUD_DEFAULT_MODELS.anthropic)
+    expect(finding!.currentModel).toBe(SMALL_LLM_MODEL)
+    // A global model bump must NOT auto-revert: the adopted version stays active.
+    expect(await versionStatus(sxCandidate)).toBe('active')
+    expect(await versionStatus('sv-sx-v0')).toBe('retired')
+    const ledger = listImprovements(stack.appData.db, 'sx')[0]!
+    expect(ledger.driftFlaggedAt).not.toBeNull()
+    expect(ledger.rolledBackAt).toBeNull() // NOT reverted
+    expect(ledger.drift?.['modelChangedMidWindow']).toBe(true)
+    expect(nightly.warnings.some((w) => w.includes('sx') && w.includes('model changed mid-window'))).toBe(true)
+  }, 60_000)
 })
 
 // ── live gate: the real local tier executes + grades through the real prompts ─

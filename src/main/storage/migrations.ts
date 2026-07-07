@@ -160,17 +160,31 @@ export function graphDirHasData(graphDir: string): boolean {
 }
 
 /**
+ * Timestamped, closed-file recursive copy of `srcDir` into
+ * `<backupsDir>/<stamp>-<label>/` (a `-2`, `-3`, … suffix is appended on the
+ * astronomically-unlikely same-second collision). Must be called while the
+ * source db is CLOSED (open db files cannot be copied on Windows). Returns the
+ * created backup directory. This is the single closed-file-copy primitive
+ * shared by the pre-migration graph backup (below) and the pre-reset snapshot
+ * (storage/reset.ts).
+ */
+export function snapshotDir(srcDir: string, backupsDir: string, label: string): string {
+  mkdirSync(backupsDir, { recursive: true })
+  const stamp = new Date().toISOString().replaceAll(':', '-').replace(/\.\d+Z$/, 'Z')
+  const base = join(backupsDir, `${stamp}-${label}`)
+  let dest = base
+  for (let n = 2; existsSync(dest); n++) dest = `${base}-${n}`
+  cpSync(srcDir, dest, { recursive: true })
+  return dest
+}
+
+/**
  * File-copies the whole graph directory into
  * `<backupsDir>/<stamp>-pre-migration-v<targetVersion>/`. Must be called
  * BEFORE the database is opened (open db files cannot be copied on Windows).
- * Returns the created backup directory.
+ * Returns the created backup directory. Behavior-identical thin wrapper over
+ * snapshotDir (the extraction preserves the exact naming + collision logic).
  */
 export function backupGraphDir(graphDir: string, backupsDir: string, targetVersion: number): string {
-  mkdirSync(backupsDir, { recursive: true })
-  const stamp = new Date().toISOString().replaceAll(':', '-').replace(/\.\d+Z$/, 'Z')
-  const base = join(backupsDir, `${stamp}-pre-migration-v${targetVersion}`)
-  let dest = base
-  for (let n = 2; existsSync(dest); n++) dest = `${base}-${n}`
-  cpSync(graphDir, dest, { recursive: true })
-  return dest
+  return snapshotDir(graphDir, backupsDir, `pre-migration-v${targetVersion}`)
 }

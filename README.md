@@ -1,6 +1,6 @@
 # Agentic OS
 
-A local-first Electron desktop app that is a **memory-and-tool backend for AI agents**. Claude (Claude Code or any MCP client) stays the orchestrator and does the work; Agentic OS serves relevant context on demand, learns from finished sessions, and runs background agents that get better over time — all on your machine, in one embedded graph store.
+A local-first Electron desktop app that is a **memory-and-tool backend for AI agents**. Claude (Claude Code or any MCP client) stays the orchestrator and does the work; Agentic OS serves relevant context on demand, learns from finished sessions, and runs background agents that get better over time — on your machine by default, in one embedded graph store. What stays local and what can optionally leave: see [Privacy](#privacy--what-leaves-your-machine).
 
 ```
 Claude (external orchestrator)
@@ -31,12 +31,17 @@ Full design: [`docs/spec.md`](docs/spec.md). Build history: [`docs/PROGRESS.md`]
 - **Runs your automations safely** — user rules (`~/.agentic-os/rules/*.rule.json`) watch files, URLs, or schedules; their code runs **only** in a Deno permission sandbox (or Docker for other languages) under the rule's declared capabilities, with side effects gated behind dashboard approvals.
 - **Shows you everything** — a dashboard cockpit: memory browser, review queue, audit log with working undo, spend monitor, task/watcher manager, trace waterfall, skill analytics, ingestion, settings.
 
+## Privacy — what leaves your machine
+
+**Your memory graph, embeddings, and search index never leave your machine.** With the subscription runner enabled (optional, off by default — see [Subscription runner](#subscription-runner-optional-off-by-default) below), the text being reasoned about — session transcripts, skill feedback, and, if you opt those roles in, retrieved memory snippets — is sent to Anthropic under your Claude account, the same vendor your Claude Code sessions already go to. A default install turns none of this on: with the runner off and no cloud API key set, nothing is sent anywhere.
+
 ## Requirements
 
 - **[Ollama](https://ollama.com/download)** with two models: `bge-m3` (embeddings) and `qwen3:4b` (small local LLM). The app detects a missing daemon or missing models at launch and the Settings panel offers the installer link and one-click pulls.
 - **Disk**: the in-process reranker (int8 ONNX of bge-reranker-v2-m3, ~570 MB) downloads to the app's data directory on first retrieval, checksum-verified and resumable.
 - **Optional — Docker**: only needed if you write rules in languages other than JS/TS (they run in a deny-by-default Linux container). The Docker daemon must be in Linux-containers mode.
 - **Optional — a cloud API key** (Anthropic / OpenAI / Gemini / OpenRouter): powers fuzzy-extraction escalation, independent verification, and skill rewrites. Everything else works fully offline. Keys are stored via the OS keychain (`safeStorage`), never in plaintext; spend is metered with a $0.50-per-task ceiling and a live dashboard total.
+- **Optional — the `claude` CLI + a Claude subscription**: only needed if you enable the off-by-default [subscription runner](#subscription-runner-optional-off-by-default), which routes background reasoning through your Claude account instead of a cloud API key. Nothing here runs `claude` unless you opt in.
 
 ## Install
 
@@ -55,7 +60,7 @@ npm run rebuild:native   # REQUIRED on Windows (ryugraph Electron build, ~30-60 
 npm run dev              # Electron app with HMR
 ```
 
-> **Windows note:** the npm-prebuilt RyuGraph binding crashes Electron; `rebuild:native` replaces it with an Electron-safe source build (needs VS 2022 Build Tools C++) and stamps a marker the app checks at boot.
+> **Windows note:** the npm-prebuilt RyuGraph binding crashes Electron; `rebuild:native` replaces it with an Electron-safe source build (needs VS 2022 Build Tools C++) and stamps a marker the app checks at boot. Re-run `npm run rebuild:native` after **any** later `npm install`/`npm ci` too — ryugraph's install script silently restores the prebuilt binding and leaves the marker stale, which hard-crashes the dev and packaged app; a warm rebuild is seconds.
 
 ## Connect Claude Code
 
@@ -70,6 +75,17 @@ npm run dev              # Electron app with HMR
 2. **Session-end hook** — Settings panel → "session-end hook" → *install hook*. This safely deep-merges a `SessionEnd` entry into `~/.claude/settings.json` (existing hooks preserved verbatim, backup written, diff shown). When a Claude Code session ends, the hook POSTs to the app so extraction can learn from the session; if the app isn't running, the payload spools to `~/.agentic-os/pending-sessions/` and drains on next launch — no session is lost.
 
 3. **Cloud key (optional)** — Settings panel → provider + *set key*. **Restart the app afterwards** — background agents arm their cloud tier at launch.
+
+## Subscription runner (optional, off by default)
+
+Background reasoning — extraction over finished sessions, nightly skill improvement, the retrieval critic/rewrite loop, and a few ingestion/summarization passes — runs on your **local** `qwen3` (via Ollama) by default, escalating to a bring-your-own cloud API key only where the design calls for it. The **subscription runner** is an opt-in alternative that routes those reasoning calls through the `claude` CLI under your existing **Claude subscription** — the same account and vendor Claude Code already uses — instead of a metered API key.
+
+- **Off by default.** A fresh install never spawns `claude`: `runner.enabled = false` and `runner.mode = 'completion'`. You turn it on in the **Settings** panel.
+- **One-time consent.** The first time you enable it, a dialog states in plain words exactly what leaves your machine (the [Privacy](#privacy--what-leaves-your-machine) statement above); the toggle only persists after you acknowledge it.
+- **Ollama is still required.** The runner does not replace the local models — `bge-m3` embeddings and the local `qwen3` reasoning fallback still run through Ollama. If `claude` isn't installed, is too old, or a run trips its per-task call budget or self-throttles against your shared subscription quota, the router **silently falls back** — to your cloud API key if one is set, otherwise to local — so reasoning never hard-fails because the runner is unavailable.
+- **Agent mode (opt-in atop the opt-in).** `runner.mode = 'agent'` lets the scheduler launch a headless `claude -p` that connects back over MCP and stages what it finds. Like every write path, its output lands in the human review queue — never straight into memory.
+
+Everything the runner sends rides your Claude account's usage and quota; the app self-throttles to leave headroom for your own interactive Claude Code. Before this feature's off-by-default posture is ever changed, see the recorded Terms-of-Service gate: [`docs/subscription-runner-tos.md`](docs/subscription-runner-tos.md).
 
 ## Updates & your data
 

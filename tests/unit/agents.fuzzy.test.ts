@@ -11,14 +11,24 @@ import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
   chunkTranscript,
+  componentFromSubmission,
+  correctionFromSubmission,
+  ExtractionError,
+  ExtractionUnavailableError,
   extractItemsReply,
   extractJsonArray,
   extractJsonObject,
+  preferenceFromSubmission,
   runFuzzyExtraction,
   type ExtractionLlm,
   type TranscriptDigest
 } from '../../src/main/agents'
-import { EXTRACTION_MAX_ITEMS_PER_PASS } from '../../src/main/config'
+import {
+  EXTRACTION_LOCAL_CHUNK_TOKENS,
+  EXTRACTION_MAX_ITEMS_PER_PASS,
+  EXTRACTION_SUBSCRIPTION_CHUNK_TOKENS,
+  EXTRACTION_SUBSCRIPTION_PASS_MAX_TOKENS
+} from '../../src/main/config'
 import { SpendMeter } from '../../src/main/models'
 import { estimatingTokenCounter } from '../../src/main/retrieval'
 import { openAppData } from '../../src/main/storage'
@@ -282,5 +292,201 @@ describe('runFuzzyExtraction — §20 escalation gates', () => {
     expect(result.escalated).toBe(false)
     expect(result.components[0]?.name).toBe('kept local unit')
     expect(result.warnings.some((w) => w.includes('cloud escalation failed on every call'))).toBe(true)
+  })
+})
+
+describe('runFuzzyExtraction — P0.1: all-calls-failed is LOUD (MCP-COVERAGE §9.5, phase 14)', () => {
+  /** Every model call rejects — the "Ollama daemon died / auth expired" shape. */
+  const deadLlm: ExtractionLlm = {
+    generate: () => Promise.reject(new Error('ollama daemon unreachable'))
+  }
+
+  it('throws ExtractionUnavailableError when every local call fails and no cloud tier exists', async () => {
+    await expect(runFuzzyExtraction({ llm: deadLlm, transcript: digestOf('User: hello') })).rejects.toThrow(
+      ExtractionUnavailableError
+    )
+    await expect(runFuzzyExtraction({ llm: deadLlm, transcript: digestOf('User: hello') })).rejects.toThrow(
+      /all 3 local fuzzy-pass calls failed and no cloud tier is configured/
+    )
+  })
+
+  it('throws when the cloud escalation ALSO fails on every call (both tiers down)', async () => {
+    const cloud = new FakeCloudBrain({}, { failAll: true })
+    const promise = runFuzzyExtraction({
+      llm: deadLlm,
+      cloud: { brain: cloud, meter, taskId: 'task-p01-both-down' },
+      transcript: digestOf('User: everything is down')
+    })
+    await expect(promise).rejects.toThrow(ExtractionUnavailableError)
+    await expect(
+      runFuzzyExtraction({
+        llm: deadLlm,
+        cloud: { brain: new FakeCloudBrain({}, { failAll: true }), meter, taskId: 'task-p01-both-down' },
+        transcript: digestOf('User: everything is down')
+      })
+    ).rejects.toThrow(/cloud escalation failed on every call/)
+  })
+
+  it('does NOT throw when the cloud rescue works — the throw sits AFTER gate B (placement guard)', async () => {
+    const cloud = new FakeCloudBrain({
+      components: '[{"name": "rescued unit", "type": "module", "confidence": 0.9}]',
+      preferences: '[]',
+      corrections: '[]'
+    })
+    const result = await runFuzzyExtraction({
+      llm: deadLlm,
+      cloud: { brain: cloud, meter, taskId: 'task-p01-rescued' },
+      transcript: digestOf('User: local model is down, cloud is fine')
+    })
+    expect(result.tier).toBe('cloud')
+    expect(result.escalated).toBe(true)
+    expect(result.escalationReason).toBe('low-local-confidence')
+    expect(result.components[0]?.name).toBe('rescued unit')
+  })
+
+  it('an empty transcript still skips quietly — totalCalls === 0 means nothing was asked of a model', async () => {
+    const blank = await runFuzzyExtraction({ llm: deadLlm, transcript: digestOf('   ') })
+    expect(blank.tier).toBe('none')
+    const missing = await runFuzzyExtraction({ llm: deadLlm, transcript: null })
+    expect(missing.tier).toBe('none')
+  })
+
+  it('partial local success never throws: some calls surviving means the run learned something', async () => {
+    let call = 0
+    const flaky: ExtractionLlm = {
+      generate: (_prompt, options) => {
+        call += 1
+        // The components pass succeeds; preferences/corrections passes die.
+        if ((options?.system ?? '').includes('extract software components')) {
+          return Promise.resolve({ text: '[{"name": "survivor", "type": "module", "confidence": 0.9}]' })
+        }
+        return Promise.reject(new Error(`daemon flaked on call ${call}`))
+      }
+    }
+    const result = await runFuzzyExtraction({ llm: flaky, transcript: digestOf('User: partial outage') })
+    expect(result.tier).toBe('local')
+    expect(result.components[0]?.name).toBe('survivor')
+    expect(result.warnings.length).toBeGreaterThan(0)
+  })
+
+  it('is an ExtractionError subclass whose name/code can NEVER match the NOT_FOUND quiet path', async () => {
+    // isNothingToExtract (triggers/sessionEnd.ts) swallows only
+    // name === 'ExtractionError' && code === 'NOT_FOUND' — both differ here,
+    // so the session-end handler rethrows and the queue retries.
+    const err: unknown = await runFuzzyExtraction({ llm: deadLlm, transcript: digestOf('User: hi') }).catch(
+      (e: unknown) => e
+    )
+    expect(err).toBeInstanceOf(ExtractionUnavailableError)
+    expect(err).toBeInstanceOf(ExtractionError)
+    expect((err as ExtractionUnavailableError).name).toBe('ExtractionUnavailableError')
+    expect((err as ExtractionUnavailableError).code).toBe('UNAVAILABLE')
+  })
+})
+
+// ── Subscription single tier (phase-18, §2.2) ────────────────────────────────
+
+/** A subscription-tier fake: dispatches on the pass markers, records maxTokens. */
+function subscriptionLlm(replies: Partial<Record<'components' | 'preferences' | 'corrections', string>>): ExtractionLlm & {
+  calls: Record<'components' | 'preferences' | 'corrections', number>
+  maxTokensSeen: (number | undefined)[]
+} {
+  const calls = { components: 0, preferences: 0, corrections: 0 }
+  const maxTokensSeen: (number | undefined)[] = []
+  return {
+    calls,
+    maxTokensSeen,
+    async generate(_prompt: string, options?: { system?: string; maxTokens?: number }): Promise<{ text: string }> {
+      const system = options?.system ?? ''
+      const pass = system.includes('extract software components')
+        ? ('components' as const)
+        : system.includes('extract user preferences')
+          ? ('preferences' as const)
+          : system.includes('extract explicit user corrections')
+            ? ('corrections' as const)
+            : null
+      if (pass === null) throw new Error(`unexpected system prompt: ${system.slice(0, 60)}`)
+      maxTokensSeen.push(options?.maxTokens)
+      calls[pass] += 1
+      return { text: replies[pass] ?? '{"items": []}' }
+    }
+  }
+}
+
+describe('runFuzzyExtraction — subscription single tier (phase-18, §2.2)', () => {
+  it('runs ONE tier with the 2k cap and NO Gate A/B, even when the transcript is oversized', async () => {
+    const llm = subscriptionLlm({
+      components: '{"items": [{"name": "gateway", "type": "service", "confidence": 0.9}]}'
+    })
+    // Gate A would fire in two-tier mode (70k > 60k); the cloud must NEVER be called.
+    const cloud = new FakeCloudBrain({}, { failAll: true })
+    const result = await runFuzzyExtraction({
+      llm,
+      cloud: { brain: cloud, meter, taskId: 'sub-oversized' },
+      transcript: digestOf('User: short text standing in for a 70k session', 70_000),
+      mode: 'subscription'
+    })
+    expect(result.tier).toBe('subscription')
+    expect(result.escalated).toBe(false)
+    expect(result.escalationReason).toBeNull()
+    expect(cloud.calls).toHaveLength(0)
+    expect(result.components.map((c) => c.name)).toEqual(['gateway'])
+    expect(llm.maxTokensSeen.length).toBeGreaterThan(0)
+    expect(llm.maxTokensSeen.every((m) => m === EXTRACTION_SUBSCRIPTION_PASS_MAX_TOKENS)).toBe(true)
+  })
+
+  it('chunks at EXTRACTION_SUBSCRIPTION_CHUNK_TOKENS (30k), NOT the 2048 local size', async () => {
+    const text = Array.from(
+      { length: 4000 },
+      (_, i) => `User: line ${i} ${'greenhouse pump valve schedule sensor '.repeat(4)}`
+    ).join('\n')
+    const counter = estimatingTokenCounter()
+    const subChunks = chunkTranscript(text, EXTRACTION_SUBSCRIPTION_CHUNK_TOKENS, counter).length
+    const localChunks = chunkTranscript(text, EXTRACTION_LOCAL_CHUNK_TOKENS, counter).length
+    expect(subChunks).toBeGreaterThanOrEqual(2)
+    expect(localChunks).toBeGreaterThan(subChunks) // 30k packs far fewer chunks than 2048
+    const llm = subscriptionLlm({})
+    const result = await runFuzzyExtraction({ llm, transcript: digestOf(text), mode: 'subscription' })
+    expect(result.tier).toBe('subscription')
+    // One call per pass per 30k chunk — proves the subscription chunk size is used.
+    expect(llm.calls.components).toBe(subChunks)
+    expect(llm.calls.preferences).toBe(subChunks)
+    expect(llm.calls.corrections).toBe(subChunks)
+  })
+
+  it('P0.1: every subscription call failing throws ExtractionUnavailableError (never a silent empty)', async () => {
+    const deadSub: ExtractionLlm = { generate: () => Promise.reject(new Error('runner unreachable')) }
+    await expect(
+      runFuzzyExtraction({ llm: deadSub, transcript: digestOf('User: hello'), mode: 'subscription' })
+    ).rejects.toThrow(ExtractionUnavailableError)
+  })
+
+  it("mode defaults to 'two-tier' — omitting it is byte-identical to today (DEFAULT == TODAY)", async () => {
+    const llm = queueLlm({ components: ['[{"name": "unit", "type": "module", "confidence": 0.9}]'] })
+    const result = await runFuzzyExtraction({ llm, transcript: digestOf('User: hi') })
+    expect(result.tier).toBe('local')
+  })
+})
+
+// ── Submission read-back coercers (phase-18: runner_submissions → typed items) ─
+
+describe('submission read-back coercers', () => {
+  it('rebuild normalized ExtractedComponent/Preference/Correction from stored payloads', () => {
+    expect(
+      componentFromSubmission({ name: 'Cart', type: 'Service', dependsOn: ['db'], confidence: 0.8, evidence: 'e', chunk: 2 })
+    ).toEqual({ name: 'Cart', type: 'service', dependsOn: ['db'], confidence: 0.8, evidence: 'e', chunk: 2 })
+    expect(
+      preferenceFromSubmission({ statement: 'use pnpm', tags: ['Tooling'], derivedFrom: null, confidence: 1.5, evidence: '', chunk: 0 })
+    ).toEqual({ statement: 'use pnpm', tags: ['tooling'], derivedFrom: null, confidence: 1, evidence: '', chunk: 0 })
+    expect(
+      correctionFromSubmission({ content: 'stop x', skill: 's', confidence: 0.4, evidence: 'no', chunk: 1 })
+    ).toEqual({ content: 'stop x', skill: 's', confidence: 0.4, evidence: 'no', chunk: 1 })
+  })
+
+  it('drop garbage rows instead of crashing: missing required field → null, bad chunk → 0', () => {
+    expect(componentFromSubmission({ type: 'x' })).toBeNull() // no name
+    expect(preferenceFromSubmission('not an object')).toBeNull()
+    expect(correctionFromSubmission({})).toBeNull() // no content
+    expect(correctionFromSubmission({ content: 'ok', chunk: -3 })?.chunk).toBe(0)
+    expect(componentFromSubmission({ name: 'x' })?.confidence).toBe(0.5) // missing confidence → borderline
   })
 })

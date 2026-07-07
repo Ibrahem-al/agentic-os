@@ -13,7 +13,7 @@
 import type BetterSqlite3 from 'better-sqlite3'
 import { EXTRACTION_PROVENANCE } from '../../config'
 import type { WorkflowRunner } from '../../kernel'
-import type { CloudBrain, SpendMeter } from '../../models'
+import type { CloudBrain, ProviderRouter, SpendMeter } from '../../models'
 import type { AuditLog } from '../../security'
 import type { StorageEngine } from '../../storage'
 
@@ -52,6 +52,53 @@ export interface ExtractionCloud {
   readonly meter: SpendMeter
 }
 
+/**
+ * The runner facade's agent-mode spawn, viewed structurally (phase-19; §3.2/§8
+ * Phase 5). The phase-17 `Runner` satisfies it — `runAgentMode` writes the
+ * per-task `.mcp.json`, spawns the headless `claude -p` that connects back to the
+ * loopback MCP + submits via `submit_extraction_items`, and returns the child's
+ * session id + envelope. Structural (not a runner-module import) so the agent
+ * stays decoupled and test rigs can inject a fake.
+ */
+export interface AgentModeRunner {
+  runAgentMode(task: {
+    readonly taskId: string
+    readonly brief: string
+    readonly runnerToken: string
+    readonly sessionId?: string
+    readonly model?: string
+    readonly mcpUrl?: string
+  }): Promise<{ readonly claudeSessionId: string; readonly envelope: { readonly isError: boolean } | null }>
+}
+
+/**
+ * The server-side per-task template control + session reaper (§3.2/§10.15,
+ * FP-5). The phase-05 MCP server satisfies it: register a narrowed tool template
+ * for the bound task before the child connects, release it (and reap the bound
+ * transport session) after the child exits. Optional — absent ⇒ the child rides
+ * the server's default READ+STAGING runner allowlist (still contained).
+ */
+export interface RunnerTemplateController {
+  registerRunnerTaskTemplate(taskId: string, tools?: readonly string[]): void
+  releaseRunnerTaskTemplate(taskId: string): void
+}
+
+/**
+ * Agent-mode spawn dependencies (phase-19). Present ONLY when the runner booted
+ * and the MCP server is up (boot wires it); absent ⇒ `runAgentExtraction` is
+ * unreachable and DEFAULT == TODAY. The token getter reads the CURRENT keychain
+ * runner token live (it rotates per boot), so the child always authenticates.
+ */
+export interface ExtractionAgentModeDeps {
+  readonly runner: AgentModeRunner
+  /** The live keychain runner token (rotated per boot); null ⇒ spawn refused. */
+  readonly runnerToken: () => string | null
+  /** Server-side template + reaper; absent ⇒ default runner allowlist applies. */
+  readonly server?: RunnerTemplateController
+  /** Loopback MCP URL the child connects back to; default = the config MCP_URL. */
+  readonly mcpUrl?: string
+}
+
 export interface ExtractionAgentDeps {
   readonly engine: StorageEngine
   /** appdata.db — mcp_calls reads + staged_writes inserts (SQLite, not the graph). */
@@ -62,16 +109,33 @@ export interface ExtractionAgentDeps {
   /** Absent = no API key configured; escalation/verification degrade to staging. */
   readonly cloud?: ExtractionCloud | null
   /**
+   * Phase-19 agent-mode spawn deps. When present, the delegate's `spawn-agent`
+   * step writes a per-task `.mcp.json` + spawns a headless `claude -p` that
+   * connects back and stages via `submit_extraction_items` (§8 Phase 5). Only
+   * boot injects it (over the real runner + MCP server); every existing rig
+   * omits it ⇒ agent mode is unreachable ⇒ DEFAULT == TODAY.
+   */
+  readonly agentMode?: ExtractionAgentModeDeps
+  /**
    * §13 audit log (phase 09): when present, the write step's ONE lane job
    * records a reversible delta. Optional so pre-phase-09 rigs stay valid;
    * boot always wires it.
    */
   readonly audit?: AuditLog
+  /**
+   * §11.4 provider router (phase-18). When present it OWNS role→backend
+   * resolution PER RUN for the three extraction roles (`extraction.fuzzy`
+   * decides the two-tier-vs-subscription mode; `extraction.tiebreak`;
+   * `extraction.verify`) and WINS over `llm`/`cloud`; when absent the agent uses
+   * today's `llm`/`cloud` unchanged (DEFAULT == TODAY). Only boot injects it, so
+   * every existing fake-injecting test rig (no router) keeps its exact behavior.
+   */
+  readonly router?: ProviderRouter
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
-export type ExtractionErrorCode = 'INVALID_INPUT' | 'NOT_FOUND'
+export type ExtractionErrorCode = 'INVALID_INPUT' | 'NOT_FOUND' | 'UNAVAILABLE'
 
 export class ExtractionError extends Error {
   readonly code: ExtractionErrorCode
@@ -83,9 +147,34 @@ export class ExtractionError extends Error {
   }
 }
 
+/**
+ * Every model tier failed on every fuzzy-pass call (phase 14; MCP-COVERAGE
+ * §9.5 / P0.1): the run learned NOTHING, and returning an empty state would
+ * let the workflow commit an empty plan and flip the exactly-once
+ * `extract-<sessionId>` task to 'done' — silently tombstoning the session as
+ * "extracted" forever. This is an ORDINARY retryable error (deliberately NOT
+ * a TaskFatalError): the queue runs its §20 1m/5m/25m round and then defers,
+ * and the next launch — or a manual retry — resumes the checkpointed
+ * workflow at the failed step without re-buying earlier passes. Its name AND
+ * code both differ from ExtractionError/'NOT_FOUND' so the session-end
+ * handler's "nothing to extract" quiet path can never swallow it.
+ */
+export class ExtractionUnavailableError extends ExtractionError {
+  constructor(message: string) {
+    super('UNAVAILABLE', message)
+    this.name = 'ExtractionUnavailableError'
+  }
+}
+
 // ── Provenance (§18 v3.1: `extraction@<version>/<pass>`) ─────────────────────
 
-export type ExtractionPass = 'deterministic' | 'llm-local' | 'llm-cloud' | 'llm-local+verified'
+export type ExtractionPass =
+  | 'deterministic'
+  | 'llm-local'
+  | 'llm-cloud'
+  | 'llm-local+verified'
+  /** §2.2 single-tier subscription-Claude extraction (phase-18; the runner tier). */
+  | 'llm-subscription'
 
 export function extractionProvenance(pass: ExtractionPass): string {
   return `${EXTRACTION_PROVENANCE}/${pass}`
@@ -197,7 +286,7 @@ export interface ExtractedCorrection {
   readonly chunk: number
 }
 
-export type ExtractionTier = 'local' | 'cloud' | 'none'
+export type ExtractionTier = 'local' | 'cloud' | 'none' | 'subscription'
 
 export interface FuzzyExtractionState {
   readonly tier: ExtractionTier
@@ -277,7 +366,18 @@ export interface VerificationResult {
 }
 
 export interface VerifyState {
-  readonly mode: 'cloud' | 'none-needed' | 'skipped-no-cloud' | 'skipped-cloud-extractor'
+  readonly mode:
+    | 'cloud'
+    | 'none-needed'
+    | 'skipped-no-cloud'
+    | 'skipped-cloud-extractor'
+    /**
+     * §17 self-judging guard for the subscription tier (phase-18): the
+     * subscription extracted, so verifying with the same subscription tier would
+     * be self-judging — mirror `skipped-cloud-extractor` (below-gate items → the
+     * human queue) UNLESS an independent cloud-api verifier is configured.
+     */
+    | 'skipped-subscription-extractor'
   readonly results: readonly VerificationResult[]
   readonly warnings: readonly string[]
 }

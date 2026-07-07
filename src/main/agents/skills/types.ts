@@ -12,7 +12,7 @@
  */
 import type BetterSqlite3 from 'better-sqlite3'
 import type { WorkflowRunner } from '../../kernel'
-import type { CloudBrain, SpendMeter } from '../../models'
+import type { CloudBrain, ProviderRouter, SpendMeter } from '../../models'
 import type { AuditLog } from '../../security/audit'
 import type { StorageEngine } from '../../storage'
 
@@ -49,6 +49,20 @@ export interface SkillCloud {
   readonly meter: SpendMeter
 }
 
+/**
+ * A role-bound cloud completion for the §17 cloud-tier roles (testset / rewrite
+ * / comparator): either the phase-16b router's cloud/subscription tier or
+ * today's metered `meteredComplete`. The caller holds `null` when NO genuinely
+ * different (non-local) tier serves the role — reproducing today's "no cloud
+ * tier" behavior exactly (the keyless default) and keeping §17's blind
+ * comparator on a different tier from the local executor. Only `.text` is used.
+ */
+export type SkillCloudCall = (req: {
+  readonly prompt: string
+  readonly system?: string
+  readonly maxTokens?: number
+}) => Promise<{ text: string }>
+
 export interface SkillAgentDeps {
   readonly engine: StorageEngine
   /** appdata.db — skill_settings/skill_improvements + staged_writes (SQLite). */
@@ -58,6 +72,13 @@ export interface SkillAgentDeps {
   readonly llm: SkillLlm
   /** Absent = no API key configured; gated skills skip with a warning. */
   readonly cloud?: SkillCloud | null
+  /**
+   * §11.4 provider router (phase-16b). When present it OWNS role→backend
+   * resolution PER RUN and WINS over `llm`/`cloud`; when absent the agent uses
+   * today's `llm`/`cloud` unchanged (DEFAULT == TODAY). Only boot injects it, so
+   * every existing fake-injecting test rig (no router) keeps its exact behavior.
+   */
+  readonly router?: ProviderRouter
   /**
    * §13 audit log — REQUIRED: every version flip records a reversible delta
    * (§21 rule 11), and rollback rides those recorded inverses.
@@ -134,6 +155,17 @@ export interface DriftFinding {
   readonly verdict: 'worse' | 'cleared'
   /** Whether the per-skill setting asks for auto-revert on a worse verdict. */
   readonly autoRevert: boolean
+  /**
+   * P1.8 model-version bookkeeping. `benchmarkModel` is the reasoning model
+   * stamped into this adoption's benchmark_json (skills.rewrite at adoption
+   * time); `currentModel` is what that role resolves to NOW (drift-scan time).
+   * When both are known and differ, `modelChangedMidWindow` is set: the drift is
+   * treated as FLAG-ONLY regardless of `autoRevert` — a global model bump must
+   * never auto-revert a skill (the drift signal is confounded).
+   */
+  readonly benchmarkModel: string | null
+  readonly currentModel: string | null
+  readonly modelChangedMidWindow: boolean
 }
 
 export interface PlanState {
@@ -144,6 +176,12 @@ export interface PlanState {
   readonly skipped: readonly SkillSkipNote[]
   readonly drift: readonly DriftFinding[]
   readonly warnings: readonly string[]
+  /**
+   * P1.8: the reasoning model (skills.rewrite) resolved for THIS run, or null
+   * when no router is injected. Stamped into every benchmark_json the write step
+   * records, and passed to scanDrift as the drift window's END-point model.
+   */
+  readonly resolvedModel: string | null
 }
 
 // ── testset step ─────────────────────────────────────────────────────────────

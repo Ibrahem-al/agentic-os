@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="tile" x1="512" y1="10" x2="512" y2="1014" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#26262F"/>
+      <stop offset="1" stop-color="#0E0E13"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="400" cy="640" r="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7393EE" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#7393EE" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="#303039"/>
+  <rect x="10" y="10" width="1004" height="1004" rx="214" fill="url(#tile)"/>
+  <circle cx="400" cy="640" r="360" fill="url(#glow)"/>
+  <line x1="400" y1="640" x2="712" y2="344" stroke="#6273D6" stroke-width="100" stroke-linecap="round"/>
+  <line x1="400" y1="640" x2="296" y2="300" stroke="#6273D6" stroke-width="100" stroke-linecap="round"/>
+  <circle cx="296" cy="300" r="88" fill="#F2F5FC"/>
+  <circle cx="712" cy="344" r="118" fill="#7393EE"/>
+  <circle cx="400" cy="640" r="168" fill="#7393EE"/>
+  <circle cx="400" cy="640" r="64" fill="#F2F5FC"/>
+</svg>

@@ -27,6 +27,7 @@ import {
 // tokens.ts is dependency-free (config only) — imported directly so the
 // kernel does not drag the full retrieval pipeline into plain-node tests.
 import { estimatingTokenCounter, type TokenCounter } from '../retrieval/tokens'
+import type { ProviderRouter } from '../models'
 import type { Telemetry } from '../telemetry'
 import type { SummarizerLlm } from './types'
 
@@ -49,6 +50,14 @@ export interface AssemblePromptRequest {
   readonly tokenBudget?: number
   /** Tokens reserved for the model's reply. Default CLOUD_MAX_TOKENS_DEFAULT. */
   readonly reserveOutputTokens?: number
+  /**
+   * Span/budget id for the summarizer's reasoning role (phase-16b) — the
+   * enclosing op's id ('live:'+sessionId on the live path, else the workflow
+   * jobId). Only consulted when a `router` is wired; context.summarize is
+   * local-by-default so this is span-correlation only unless a user overrides
+   * the role to the cloud tier.
+   */
+  readonly taskId?: string
 }
 
 export interface SummarizedSectionInfo {
@@ -69,6 +78,12 @@ export interface AssembledPrompt {
 export interface ContextManagerDeps {
   /** The LOCAL summarizer tier (§10) — satisfied by OllamaClient. */
   llm: SummarizerLlm
+  /**
+   * Reasoning router (phase-16b). When present, the summarizer is resolved PER
+   * assemble() via `forRole('context.summarize', taskId)` (default local qwen3
+   * — DEFAULT == TODAY); when absent the injected `llm` is used unchanged.
+   */
+  router?: ProviderRouter
   telemetry?: Telemetry
 }
 
@@ -118,10 +133,12 @@ function splitIntoChunks(text: string, chunkTokens: number, counter: TokenCounte
 
 export class ContextManager {
   private readonly llm: SummarizerLlm
+  private readonly router: ProviderRouter | undefined
   private readonly telemetry: Telemetry | undefined
 
   constructor(deps: ContextManagerDeps) {
     this.llm = deps.llm
+    this.router = deps.router
     this.telemetry = deps.telemetry
   }
 
@@ -205,9 +222,17 @@ export class ContextManager {
           `budget leaves only ${target} tokens per oversized section (min ${CONTEXT_MIN_SUMMARY_TOKENS}) — an honest summary cannot fit; raise the budget or drop sections`
         )
       }
+      // Resolve the summarizer once for this assemble op: the router (phase-16b:
+      // context.summarize, local-by-default) bound to this op's taskId when
+      // wired, else today's injected llm. Not touched for within-budget
+      // assemblies (no unresolved sections ⇒ no model call, unchanged).
+      const summarizer: SummarizerLlm =
+        this.router !== undefined
+          ? this.router.forRole('context.summarize', request.taskId ?? 'context:summarize')
+          : this.llm
       for (const entry of unresolved) {
         const section = sections[entry.index]!
-        const summary = await this.summarize(section.name, section.content, target, counter)
+        const summary = await this.summarize(section.name, section.content, target, counter, summarizer)
         summaries.set(entry.index, summary)
         summarizedSections.push({ name: section.name, originalTokens: entry.tokens, finalTokens: counter.count(summary) })
       }
@@ -235,7 +260,13 @@ export class ContextManager {
    * the target. The caps make the result's ESTIMATE land under target even
    * though the estimator overestimates real tokens.
    */
-  private async summarize(name: string, content: string, targetTokens: number, counter: TokenCounter): Promise<string> {
+  private async summarize(
+    name: string,
+    content: string,
+    targetTokens: number,
+    counter: TokenCounter,
+    llm: SummarizerLlm
+  ): Promise<string> {
     let current = content
     for (let round = 1; round <= CONTEXT_SUMMARIZE_MAX_ROUNDS; round++) {
       if (counter.count(current) <= targetTokens) return current
@@ -243,7 +274,7 @@ export class ContextManager {
       const perChunkCap = Math.max(16, Math.floor((targetTokens * CONTEXT_SUMMARY_OUTPUT_FRACTION) / chunks.length))
       const parts: string[] = []
       for (const [chunkIndex, chunk] of chunks.entries()) {
-        parts.push(await this.summarizeChunk(name, chunk, perChunkCap, round, chunkIndex, chunks.length))
+        parts.push(await this.summarizeChunk(name, chunk, perChunkCap, round, chunkIndex, chunks.length, llm))
       }
       current = parts.filter((part) => part.length > 0).join('\n')
     }
@@ -261,12 +292,13 @@ export class ContextManager {
     maxTokens: number,
     round: number,
     chunkIndex: number,
-    chunkCount: number
+    chunkCount: number,
+    llm: SummarizerLlm
   ): Promise<string> {
     const approxWords = Math.max(10, Math.floor(maxTokens * 0.75))
     const prompt = `Compress the following content from the section titled "${name}". State the concrete facts first, preserved exactly; keep the whole summary under ${approxWords} words.\n\n${chunk}`
     const call = async (): Promise<string> => {
-      const result = await this.llm.generate(prompt, { system: SUMMARIZER_SYSTEM, maxTokens, temperature: 0 })
+      const result = await llm.generate(prompt, { system: SUMMARIZER_SYSTEM, maxTokens, temperature: 0 })
       return result.text.trim()
     }
     if (this.telemetry === undefined) return call()

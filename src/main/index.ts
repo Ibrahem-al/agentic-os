@@ -1,6 +1,14 @@
-import { app, BrowserWindow, safeStorage, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, safeStorage, shell } from 'electron'
 import { join } from 'node:path'
+import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import {
+  IPC_EVENT_WINDOW_MAXIMIZE,
+  IPC_WINDOW_CLOSE,
+  IPC_WINDOW_IS_MAXIMIZED,
+  IPC_WINDOW_MINIMIZE,
+  IPC_WINDOW_TOGGLE_MAXIMIZE
+} from '../shared/ipc'
 import {
   appDataPaths,
   CLOUD_BASE_URL_OVERRIDE,
@@ -17,13 +25,25 @@ import {
   TRIGGER_STATE_FILENAME,
   WATCHED_FOLDERS_CONFIG_FILENAME
 } from './config'
-import { openAppData, openRyuGraphEngine, type AppData } from './storage'
 import {
+  APPDATA_USER_VERSION,
+  openAppData,
+  openRyuGraphEngine,
+  performPendingReset,
+  verifyDataManifest,
+  writeDataManifest,
+  type AppData,
+  type ResetResult
+} from './storage'
+import {
+  CallBudget,
   Keychain,
   keychainPath,
   loadModelSettings,
   OllamaClient,
+  ProviderRouter,
   Reranker,
+  RUNNER_TOKEN_SECRET,
   SpendMeter,
   activeCloudModel,
   createCloudBrain,
@@ -39,13 +59,16 @@ import {
   DockerLane,
   PermissionEngine,
   registerInternalAgents,
+  untrusted,
   type InjectionScanner
 } from './security'
 import { createRetriever } from './retrieval'
+import { Runner } from './runner'
 import { AgenticOsMcpServer, claudeMcpAddCommand, McpClientManager, writeSampleMcpJson } from './mcp'
 import {
   createExtractionAgent,
   createSkillImprovementAgent,
+  parseTranscriptFile,
   registerSkillImprovementHandler,
   type ExtractionAgent,
   type SkillImprovementAgent
@@ -94,6 +117,23 @@ let telemetry: Telemetry | null = null
 let kernelInstances: { kernel: Kernel; runner: LangGraphRunner; contextManager: ContextManager } | null = null
 /** Security singletons (phase 09): §13 engine + audit/undo + injection scanner. */
 let securityInstances: { permissions: PermissionEngine; audit: AuditLog; scanner: InjectionScanner } | null = null
+/**
+ * ONE ReasoningProvider router (phase-16b, §11.4) shared across the kernel/MCP/
+ * agents/IPC boots — built in bootKernel (the first consumer), like
+ * kernelInstances/securityInstances. subscriptionComplete + runnerHealthy stay
+ * UNSET until phase-17, so the subscription backend is unavailable and every
+ * role resolves to its today tier: DEFAULT == TODAY.
+ */
+let providerRouter: ProviderRouter | null = null
+/**
+ * The headless subscription runner (phase 17). Built in bootKernel over the ONE
+ * CallBudget; its `complete`/`isHealthy` are injected into the ProviderRouter so
+ * subscribable roles can route to a Claude subscription when the user opts in.
+ * SHIPS OFF: with `runner.enabled=false` (the default) `isHealthy()` is false, so
+ * the subscription backend stays unavailable and nothing here ever spawns claude.
+ * killChildren() runs FIRST in will-quit; sweepZombies() runs at boot.
+ */
+let subscriptionRunner: Runner | null = null
 /** Model-layer singletons (phase 02) — shared by the MCP server (phase 05). */
 let keychain: Keychain | null = null
 let ollama: OllamaClient | null = null
@@ -140,6 +180,35 @@ function rerankerFilesOverride(): { files: NonNullable<ConstructorParameters<typ
   }
 }
 
+/**
+ * §10.5/P0.3 boot hygiene: delete any per-task `<userData>/runner/*.mcp.json`
+ * left by a previous run. Agent mode (phase-19) writes these fresh per spawn and
+ * removes them after; a crash can strand one referencing a now-rotated runner
+ * token. Completion mode writes none, so this is a no-op on a default install
+ * (the directory usually does not exist).
+ */
+function sweepStaleRunnerMcpConfigs(userDataDir: string): void {
+  const { readdirSync, rmSync } = require('node:fs') as typeof import('node:fs')
+  const dir = join(userDataDir, 'runner')
+  let entries: string[]
+  try {
+    entries = readdirSync(dir)
+  } catch {
+    return // no runner dir yet — nothing to sweep
+  }
+  let swept = 0
+  for (const name of entries) {
+    if (!name.endsWith('.mcp.json')) continue
+    try {
+      rmSync(join(dir, name), { force: true })
+      swept += 1
+    } catch {
+      /* best effort — never fail boot over a leftover config */
+    }
+  }
+  if (swept > 0) console.log(`[runner] swept ${swept} stale runner/*.mcp.json from a previous run`)
+}
+
 /** Native-module pipeline sanity: versions logged from Electron main. */
 function logNativeModuleVersions(): void {
   const ortPkg = require('onnxruntime-node/package.json') as { version: string }
@@ -153,7 +222,34 @@ function logNativeModuleVersions(): void {
  * (backup-if-migrating → open → migrate), both under Electron userData.
  */
 async function bootStorage(): Promise<void> {
-  const { readFileSync, existsSync } = require('node:fs') as typeof import('node:fs')
+  const { readFileSync } = require('node:fs') as typeof import('node:fs')
+  const userDataDir = app.getPath('userData')
+  const paths = appDataPaths(userDataDir)
+
+  // Data-safety lifecycle, BEFORE any store opens and BEFORE the win32
+  // ryugraph gate below — so a packaged "reinstall from scratch" always runs
+  // its next-boot reset. All three are internally fail-safe and wrapped again
+  // here so a manifest/reset hiccup can never take boot down.
+  //  1. verify: compare the previous manifest's critical assets to disk and
+  //     WARN loudly on a lost graph/appdata/keychain (log-only, never blocks).
+  //  2. reset: if (and only if) the installer left a valid reset marker,
+  //     snapshot → integrity-check → record → clear (recoverable). No marker ⇒
+  //     data is never touched — the app-side silent/auto-update invariant.
+  let reset: ResetResult = { performed: false, reason: 'no-marker' }
+  try {
+    for (const finding of verifyDataManifest(userDataDir)) {
+      console.warn(`[storage] data-manifest mismatch: ${finding.path} — ${finding.detail}`)
+    }
+  } catch (err) {
+    console.warn('[storage] data-manifest verify failed (ignored)', err)
+  }
+  try {
+    reset = performPendingReset(userDataDir, (m) => console.log(m))
+  } catch (err) {
+    // performPendingReset is internally fail-safe; this guard is belt-and-braces.
+    console.error('[storage] pending-reset handling failed — user data left intact', err)
+  }
+
   // ryugraph's `exports` map hides package.json from require — read it directly.
   const ryuPkgPath = join(app.getAppPath(), 'node_modules', 'ryugraph', 'package.json')
   const ryuPkg = JSON.parse(readFileSync(ryuPkgPath, 'utf8')) as { version: string }
@@ -177,7 +273,6 @@ async function bootStorage(): Promise<void> {
     }
   }
 
-  const paths = appDataPaths(app.getPath('userData'))
   appData = openAppData(paths.appDb)
   console.log(`[storage] appdata.db open (WAL: traces, tasks, mcp_calls, staged_writes, spend) at ${appData.path}`)
   if (appData.backupCreated !== null) {
@@ -201,6 +296,21 @@ async function bootStorage(): Promise<void> {
       counts[0]?.['c'] ?? 0
     )} nodes, vector+FTS from vendored extensions${backupNote}`
   )
+
+  // Refresh the machine-readable data manifest (§3 "note") with live versions +
+  // backup pointers. Atomic tmp+rename; a manifest write failure never takes
+  // boot down (it is a derived record, not the data).
+  try {
+    writeDataManifest(userDataDir, {
+      appVersion: app.getVersion(),
+      appdataUserVersion: APPDATA_USER_VERSION,
+      graphSchemaVersion: engine.schemaVersion,
+      lastBackupAt: engine.backupCreated ?? appData.backupCreated ?? null,
+      ...(reset.performed ? { lastResetAt: new Date().toISOString(), lastResetBackupDir: reset.backupDir } : {})
+    })
+  } catch (err) {
+    console.warn('[storage] data-manifest write failed (ignored)', err)
+  }
 }
 
 /**
@@ -245,7 +355,77 @@ function bootKernel(): void {
   // Phase 09: the REAL §13 spine replaces the phase-04 stubs — capability
   // engine (default-deny, tiered gates, pending approvals in appdata) and the
   // reversible-delta audit log (graph inverses + file pre-images in backups/).
-  const paths = appDataPaths(app.getPath('userData'))
+  const userDataDir = app.getPath('userData')
+  const paths = appDataPaths(userDataDir)
+  // Phase-16b: the ONE ProviderRouter (§11.4 role → backend, resolved per call
+  // from a cached settings snapshot), built here — the first consumer boot —
+  // and shared via the module local. `loadSnapshot`/`makeCloud` re-read the
+  // settings file + the keychain LIVE per call, so a provider/model/key change
+  // takes effect on the NEXT call once an IPC mutator fires router.invalidate()
+  // (P1.1 — no app restart). Phase-17 now injects subscriptionComplete +
+  // runnerHealthy from the runner below; DEFAULT == TODAY still holds because
+  // runner.enabled=false (the default) ⇒ isHealthy() false ⇒ subscription
+  // unavailable ⇒ every role falls through to its today tier.
+  const ollamaClient = ollama ?? new OllamaClient()
+  const appDataForRouter = appData
+  // Phase-17: ONE CallBudget over runner_runs (P0.2 — durable across resume),
+  // shared by the runner's completion path AND the router's subscription guard.
+  const callBudget = new CallBudget({ db: appDataForRouter.db })
+  // Build the ONE headless runner (completion mode) over that budget, then inject
+  // its completion fn + live health into the router — the two seams phase-16 left
+  // UNSET. With runner.enabled=false (the default) isHealthy() is false, so the
+  // subscription backend stays unavailable and every role resolves to its today
+  // tier: DEFAULT == TODAY (a keyless install is byte-for-byte local and NEVER
+  // spawns claude).
+  const runnerInstance = new Runner({
+    db: appDataForRouter.db,
+    loadSettings: () => loadModelSettings(settingsPath(userDataDir)),
+    telemetry,
+    callBudget
+  })
+  subscriptionRunner = runnerInstance
+  const router = new ProviderRouter({
+    loadSnapshot: () => loadModelSettings(settingsPath(userDataDir)),
+    ollama: ollamaClient,
+    makeCloud: () => {
+      const s = loadModelSettings(settingsPath(userDataDir))
+      const apiKey = keychain?.getApiKey(s.cloudProvider)
+      return apiKey
+        ? {
+            brain: createCloudBrain(s.cloudProvider, {
+              apiKey,
+              model: activeCloudModel(s),
+              // Phase-13 test seam: the golden-path e2e fronts the cloud tier
+              // with a scripted server (unset in production).
+              ...(CLOUD_BASE_URL_OVERRIDE !== undefined ? { baseUrl: CLOUD_BASE_URL_OVERRIDE } : {})
+            }),
+            meter: new SpendMeter({ db: appDataForRouter.db })
+          }
+        : null
+    },
+    // Phase-17 (were unset): the runner's completion fn + live health probe.
+    subscriptionComplete: runnerInstance.complete,
+    runnerHealthy: () => runnerInstance.isHealthy(),
+    callBudget
+  })
+  providerRouter = router
+  // §10.1/P0.4 zombie defense: kill any runner child tree orphaned by a previous
+  // process generation (an unfinished runner_runs row whose pid still resolves to
+  // a claude image — NEVER by pid alone) and sweep stale per-task
+  // runner/*.mcp.json. Both are no-ops on a fresh/default install.
+  void runnerInstance
+    .sweepZombies()
+    .then((killed) => {
+      if (killed > 0) console.log(`[runner] boot zombie sweep killed ${killed} orphaned runner child tree(s)`)
+    })
+    .catch((err) => console.warn('[runner] boot zombie sweep failed', err))
+  sweepStaleRunnerMcpConfigs(userDataDir)
+  const runnerEnabled = loadModelSettings(settingsPath(userDataDir)).runner?.enabled === true
+  console.log(
+    `[runner] subscription runner built (completion mode) — ${
+      runnerEnabled ? 'ENABLED' : 'disabled (default)'
+    }; complete/health injected into the router`
+  )
   const permissions = new PermissionEngine({ db: appData.db })
   registerInternalAgents(permissions)
   const audit = new AuditLog({
@@ -253,20 +433,22 @@ function bootKernel(): void {
     backupsDir: paths.backupsDir,
     ...(engine !== null ? { engine } : {})
   })
-  const scanner = createInjectionScanner({ db: appData.db, ...(ollama !== null ? { llm: ollama } : {}) })
+  const scanner = createInjectionScanner({ db: appData.db, router, ...(ollama !== null ? { llm: ollama } : {}) })
   securityInstances = { permissions, audit, scanner }
   const kernel = new Kernel({ telemetry, permissions, audit })
   // §8 phase-13: cooperative yield at step boundaries — a running multi-step
-  // workflow defers to live MCP calls between steps (the queue's pre-dispatch
-  // yield covers only task starts). The closure reads mcpServer at call time;
-  // it is null until bootMcp() and that is fine (0 inflight = no wait).
+  // workflow defers to live INTERACTIVE MCP calls between steps (the queue's
+  // pre-dispatch yield covers only task starts). §14b gauge split: a runner's
+  // own MCP calls are excluded, so a background workflow never yields to itself.
+  // The closure reads mcpServer at call time; it is null until bootMcp() and
+  // that is fine (0 inflight = no wait).
   const runner = new LangGraphRunner({
     db: appData.db,
     telemetry,
     executor: kernel,
-    yieldPoint: createInflightYield(() => mcpServer?.inflightCalls ?? 0)
+    yieldPoint: createInflightYield(() => mcpServer?.inflightInteractiveCalls ?? 0)
   })
-  const contextManager = new ContextManager({ llm: ollama ?? new OllamaClient(), telemetry })
+  const contextManager = new ContextManager({ llm: ollamaClient, router, telemetry })
   kernelInstances = { kernel, runner, contextManager }
   console.log('[kernel] workflow runner ready (LangGraph + SQLite checkpointer) — spans → traces table')
   console.log(
@@ -299,15 +481,36 @@ async function bootMcp(): Promise<void> {
   const paths = appDataPaths(userDataDir)
   reranker ??= new Reranker({ modelsDir: paths.modelsDir, ...rerankerFilesOverride() })
   const retrievalDeps = { engine, embedder: ollama, reranker }
-  const retriever = createRetriever({ ...retrievalDeps, llm: ollama })
+  // Phase-16b: the loop's critic/rewrite roles bind off the router when wired
+  // (both §11.4 HARD-local ⇒ always local-qwen3 ⇒ identical to `llm`).
+  const retriever = createRetriever({
+    ...retrievalDeps,
+    llm: ollama,
+    ...(providerRouter !== null ? { router: providerRouter } : {})
+  })
+  // §10.1/P0.3 zombie defense: mint a FRESH runner token BEFORE the server binds
+  // it (below), so a runner child that outlived a previous app process holds a
+  // token that no longer authenticates — its next MCP call 401s at once. The
+  // boot-sweep of stale runner/*.mcp.json + the kill-on-boot land at FP-3.
+  const runnerToken = keychain.rotateRunnerToken()
+  // P0.2: ONE durable call/spend guard (reads runner_runs, so it survives
+  // resume) threaded into every tool's ToolContext as spendMeter. The live
+  // read-path consumer (taskId 'live:<sessionId>', RUNNER_LIVE_SESSION_MAX_CALLS)
+  // is wired when getContext is refactored at FP-1; here we only supply the dep.
+  const callBudget = new CallBudget({ db: appData.db })
   const server = new AgenticOsMcpServer({
     bearerToken: keychain.ensureMcpBearerToken(),
+    runnerToken,
     engine,
     retriever,
     retrieval: retrievalDeps,
     llm: ollama,
+    // Phase-16b: the router backs ingest_codebase's README → Project summary
+    // (ingest.projectSummary, local-by-default ⇒ identical to `llm`).
+    ...(providerRouter !== null ? { router: providerRouter } : {}),
     db: appData.db,
     executor: kernelInstances.kernel,
+    spendMeter: callBudget,
     // §13 (phase 09): ingest tools scan for embedded instructions and their
     // lane jobs record audited reversible deltas.
     ...(securityInstances !== null
@@ -381,8 +584,31 @@ function bootAgents(): void {
     embedder: ollama,
     llm: ollama,
     cloud,
+    // Phase-18: the §11.4 provider router owns the 3 extraction roles' backend
+    // resolution per run (extraction.fuzzy decides two-tier vs the subscription
+    // single tier; extraction.tiebreak; extraction.verify) and WINS over
+    // llm/cloud when present. A keyless, runner-off default resolves every role to
+    // its today tier ⇒ DEFAULT == TODAY (two-tier local + cloud escalation,
+    // byte-identical). Mirrors the skill-improvement agent below. types.ts: "Only
+    // boot injects it" — this is that injection.
+    ...(providerRouter !== null ? { router: providerRouter } : {}),
     // §13 (phase 09): the write step's lane job records a reversible delta.
-    ...(securityInstances !== null ? { audit: securityInstances.audit } : {})
+    ...(securityInstances !== null ? { audit: securityInstances.audit } : {}),
+    // Phase-19 (§8 Phase 5): agent-mode spawn deps — present ONLY when the runner
+    // booted AND the MCP server is up (the child connects back to it). SHIPS OFF:
+    // the handler routes here only when runner.enabled + mode 'agent' (default
+    // disabled + completion), so a default install never spawns a runner child.
+    // The token getter reads the CURRENT keychain runner token (rotated per boot).
+    ...(subscriptionRunner !== null && mcpServer !== null && keychain !== null
+      ? {
+          agentMode: {
+            runner: subscriptionRunner,
+            runnerToken: () => keychain?.getSecret(RUNNER_TOKEN_SECRET) ?? null,
+            server: mcpServer,
+            mcpUrl: mcpServer.url
+          }
+        }
+      : {})
   })
   console.log(
     `[agents] extraction agent ready — the phase-11 session-end triggers drive it (cloud tier: ${
@@ -399,6 +625,10 @@ function bootAgents(): void {
       embedder: ollama,
       llm: ollama,
       cloud,
+      // Phase-16b: the router wins when present (cloud roles route through it
+      // with the same §14 $0.50 ceiling; a keyless default resolves them local
+      // ⇒ skipped exactly as today). Extraction is now wired the same way (phase-18).
+      ...(providerRouter !== null ? { router: providerRouter } : {}),
       audit: securityInstances.audit
     })
     console.log(
@@ -428,12 +658,43 @@ async function bootTriggers(): Promise<void> {
   const paths = appDataPaths(userDataDir)
   const queue = new DurableTaskQueue({
     db: appData.db,
-    // §8: live MCP work is prioritized; background dispatch yields (capped).
-    shouldYield: () => (mcpServer?.inflightCalls ?? 0) > 0
+    // §8: live INTERACTIVE MCP work is prioritized; background dispatch yields
+    // (capped). §14b gauge split: a runner's own MCP calls don't count, so its
+    // background task never blocks itself.
+    shouldYield: () => (mcpServer?.inflightInteractiveCalls ?? 0) > 0
   })
 
   if (extractionAgent !== null) {
-    registerExtractionHandler(queue, { agent: extractionAgent, runner: kernelInstances.runner })
+    // Phase-19 (§8 Phase 5): agent-mode routing. Present ONLY when the runner +
+    // MCP server booted; the routing itself checks runner.enabled + healthy +
+    // mode 'agent' LIVE per session (default disabled + completion ⇒ today's
+    // path). P1.6: the transcript is scanned with the regex-only scanner
+    // (free/offline) and a flagged transcript downgrades to completion mode.
+    const runnerInjectionScanner = createInjectionScanner({ db: appData.db })
+    const scanTranscript = async (transcriptPath: string, taskId: string): Promise<boolean> => {
+      let text: string
+      try {
+        text = parseTranscriptFile(transcriptPath).text
+      } catch {
+        return false // no readable transcript → nothing to scan
+      }
+      if (text.trim() === '') return false
+      const res = await runnerInjectionScanner.scan(untrusted(text), `runner:${taskId}`)
+      return res.flagged
+    }
+    registerExtractionHandler(queue, {
+      agent: extractionAgent,
+      runner: kernelInstances.runner,
+      ...(subscriptionRunner !== null && mcpServer !== null
+        ? {
+            agentMode: {
+              loadSettings: () => loadModelSettings(settingsPath(userDataDir)),
+              runner: subscriptionRunner,
+              scanTranscript
+            }
+          }
+        : {})
+    })
   } else {
     console.warn('[triggers] extraction agent unavailable — session-end tasks will defer to a later launch')
   }
@@ -527,6 +788,22 @@ function bootIpc(): void {
     // the ONE shared reranker instance.
     reranker = new Reranker({ modelsDir: appDataPaths(userDataDir).modelsDir, ...rerankerFilesOverride() })
   }
+  const triggers =
+    triggerInstances !== null
+      ? {
+          queue: triggerInstances.queue,
+          schedules: triggerInstances.schedules,
+          watchers: triggerInstances.watchers,
+          ruleErrors: triggerInstances.rules.errors
+        }
+      : null
+  const subsystems = {
+    storage: engine !== null && appData !== null,
+    models: ollama !== null,
+    kernel: kernelInstances !== null,
+    mcp: mcpServer !== null,
+    agents: extractionAgent !== null
+  }
   registerIpcHandlers({
     engine,
     db: appData?.db ?? null,
@@ -537,36 +814,98 @@ function bootIpc(): void {
     reranker,
     keychain,
     mcpUrl: mcpServer?.url ?? null,
-    triggers:
-      triggerInstances !== null
-        ? {
-            queue: triggerInstances.queue,
-            schedules: triggerInstances.schedules,
-            watchers: triggerInstances.watchers,
-            ruleErrors: triggerInstances.rules.errors
-          }
-        : null,
+    triggers,
+    // Phase-17: the subscription runner backs runner.status / runner.testConnection.
+    runner: subscriptionRunner,
+    // Phase-21: the live router fills runner.status's effectiveBackend — where a
+    // subscription-eligible role lands while the runner is falling back.
+    router: providerRouter,
     userDataDir,
-    subsystems: {
-      storage: engine !== null && appData !== null,
-      models: ollama !== null,
-      kernel: kernelInstances !== null,
-      mcp: mcpServer !== null,
-      agents: extractionAgent !== null
-    }
+    // Phase-16b (P1.1): the settings mutators (save / setApiKey / clearApiKey)
+    // fire this after a successful change so boot drops the router's cached
+    // snapshot — provider/model/key changes take effect on the NEXT reasoning
+    // call with no app restart.
+    onSettingsChanged: () => providerRouter?.invalidate(),
+    subsystems
   })
+  // §4 read tools ride the SAME shared read functions as the IPC handlers above;
+  // supply their late-bound deps now — the last boot step, where every singleton
+  // exists and `subsystems` is accurate. Additive: a default install is
+  // unchanged, the read tools are simply newly available over MCP.
+  if (mcpServer !== null) {
+    mcpServer.setReadContext({
+      ...(securityInstances !== null ? { permissions: securityInstances.permissions } : {}),
+      ...(kernelInstances !== null ? { runner: kernelInstances.runner } : {}),
+      // Phase-17: get_runner_status reads this health source (distinct from the
+      // workflow `runner` above).
+      ...(subscriptionRunner !== null ? { runnerStatus: subscriptionRunner } : {}),
+      triggers,
+      watchedFolders: new WatchedFolderStore({ configPath: join(userDataDir, WATCHED_FOLDERS_CONFIG_FILENAME) }),
+      // Phase-18: the §8 queue backs the staged-write + control tools
+      // (run_extraction / improve_skill_now / run_maintenance / retry_task /
+      // propose_skill_revision / submit_extraction_items). Absent ⇒ those tools
+      // return a clean INVALID_STATE (triggers did not boot this launch).
+      ...(triggerInstances !== null ? { queue: triggerInstances.queue } : {}),
+      ollama,
+      keychain,
+      appStatus: {
+        version: app.getVersion(),
+        platform: process.platform,
+        userDataDir,
+        subsystems,
+        mcpUrl: mcpServer.url
+      }
+    })
+  }
   console.log('[ipc] dashboard IPC ready (typed contract, structured errors)')
 }
 
+/**
+ * GLOBAL window-chrome handlers for the frameless title bar. Registered exactly
+ * once (in whenReady, before createWindow) so macOS 'activate' re-creating the
+ * window never double-registers the ipcMain.handle channel. Each resolves the
+ * target window from the sender, so a re-created window still gets its controls.
+ * fromWebContents returns null for a destroyed sender — the optional chaining /
+ * null check keeps strict TS green and is a no-op in that race.
+ */
+function registerWindowControlIpc(): void {
+  ipcMain.on(IPC_WINDOW_MINIMIZE, (event) => {
+    BrowserWindow.fromWebContents(event.sender)?.minimize()
+  })
+  ipcMain.on(IPC_WINDOW_TOGGLE_MAXIMIZE, (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (win === null) return
+    if (win.isMaximized()) win.unmaximize()
+    else win.maximize()
+  })
+  ipcMain.on(IPC_WINDOW_CLOSE, (event) => {
+    BrowserWindow.fromWebContents(event.sender)?.close()
+  })
+  ipcMain.handle(IPC_WINDOW_IS_MAXIMIZED, (event) => BrowserWindow.fromWebContents(event.sender)?.isMaximized() ?? false)
+}
+
 function createWindow(): void {
+  // Runtime window/taskbar icon. Packaged: process.resourcesPath/icon.png
+  // (electron-builder extraResources). Dev: build/icon.png at the repo root.
+  // Guarded so a missing file never throws. On packaged Windows the taskbar
+  // uses the EXE-embedded build/icon.ico; this mainly covers dev + Linux.
+  const iconCandidate = app.isPackaged
+    ? join(process.resourcesPath, 'icon.png')
+    : join(app.getAppPath(), 'build', 'icon.png')
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
+    ...(existsSync(iconCandidate) ? { icon: iconCandidate } : {}),
     // The cockpit's dense tables need a floor; below this the master-detail
     // grids crush (audit finding, phase 10).
     minWidth: 960,
     minHeight: 600,
     title: PRODUCT_NAME,
+    // Frameless custom chrome (renderer TitleBar). 'hidden' (NOT frame:false)
+    // drops the native caption while keeping Windows resize borders + snap.
+    titleBarStyle: 'hidden',
+    // macOS keeps native traffic lights — nudge them to center in the 36px bar.
+    ...(process.platform === 'darwin' ? { trafficLightPosition: { x: 12, y: 10 } } : {}),
     webPreferences: {
       preload: join(import.meta.dirname, '../preload/index.mjs'),
       sandbox: false,
@@ -574,6 +913,14 @@ function createWindow(): void {
       nodeIntegration: false
     }
   })
+
+  // Push maximize-state changes so the TitleBar can swap its maximize/restore
+  // icon. Guarded against a destroyed window (teardown race).
+  const sendMaximizeState = (state: boolean): void => {
+    if (!win.isDestroyed()) win.webContents.send(IPC_EVENT_WINDOW_MAXIMIZE, state)
+  }
+  win.on('maximize', () => sendMaximizeState(true))
+  win.on('unmaximize', () => sendMaximizeState(false))
 
   win.webContents.setWindowOpenHandler((details) => {
     void shell.openExternal(details.url)
@@ -642,6 +989,7 @@ void app.whenReady().then(async () => {
   // first boot (§3/§21.9 — proven by scripts/smoke/packaged-smoke.mjs).
   bootUpdater()
 
+  registerWindowControlIpc()
   createWindow()
 
   app.on('activate', () => {
@@ -657,7 +1005,13 @@ app.on('will-quit', (event) => {
   if (quitting) return
   quitting = true
   event.preventDefault()
-  // MCP first: closeAllConnections() severs sockets synchronously, so no new
+  // Phase-17/P0.4: kill any in-flight runner child tree FIRST — before the MCP
+  // server and the queue tear down — so a live `claude` child is never stranded,
+  // and the queue's "task stays running, re-runs next boot" invariant stays
+  // clean. Guarded + synchronous; a default install has no children to kill.
+  subscriptionRunner?.killChildren()
+  subscriptionRunner = null
+  // MCP next: closeAllConnections() severs sockets synchronously, so no new
   // tool call can reach appdata.db after this line; the rest of stop() (SDK
   // session teardown) finishes in the background.
   void mcpServer?.stop().catch(() => undefined)
@@ -683,6 +1037,7 @@ app.on('will-quit', (event) => {
       telemetry = null
       extractionAgent = null
       skillImprovementAgent = null
+      providerRouter = null
       kernelInstances = null
       securityInstances = null
       appData?.close()

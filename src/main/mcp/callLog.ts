@@ -40,6 +40,12 @@ export interface McpCallRecord {
   readonly error?: string
   readonly startedUnixMs: number
   readonly durationMs: number
+  /**
+   * Which kind of MCP session made the call — 'runner' rows let the §6
+   * inactivity sweep skip a headless runner's own session (phase 14,
+   * MCP-COVERAGE §10.2/P0.5). Interactive callers pass nothing ⇒ NULL.
+   */
+  readonly sessionKind?: string | null
 }
 
 export class McpCallLog {
@@ -47,8 +53,8 @@ export class McpCallLog {
 
   constructor(db: BetterSqlite3.Database) {
     this.insert = db.prepare(
-      `INSERT INTO mcp_calls (session_id, tool, params_json, args_hash, result_status, error, started_unix_ms, duration_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO mcp_calls (session_id, session_kind, tool, params_json, args_hash, result_status, error, started_unix_ms, duration_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
   }
 
@@ -59,6 +65,7 @@ export class McpCallLog {
     const paramsJson = Buffer.byteLength(json, 'utf8') <= MCP_CALL_ARGS_JSON_MAX_BYTES ? json : null
     this.insert.run(
       call.sessionId,
+      call.sessionKind ?? null,
       call.tool,
       paramsJson,
       hashArgs(call.args),
