@@ -83,6 +83,45 @@ export function appDataPaths(userDataDir: string): {
   }
 }
 
+// ── Install / update data-safety lifecycle (§3 "Updates & migration") ─────────
+/**
+ * The names below are NOT §20 values — they are conservative rule-12 picks for
+ * the data-safe install/update/uninstall lifecycle, declared once here (the
+ * single config home) and MIRRORED verbatim in build/installer.nsh. The
+ * mirror is enforced by tests/unit/installer.invariants.test.ts: a future NSIS
+ * edit that drifts from these literals fails CI. See docs/DATA-MIGRATION.md.
+ */
+/**
+ * Sentinel the INTERACTIVE "reinstall from scratch" installer branch writes to
+ * the userData top level to RECORD INTENT only — the installer never deletes
+ * data. The app, on its next boot (storage boot, before any store opens),
+ * reads this marker and performs a recoverable, backed-up, integrity-checked
+ * reset, then removes the marker. A silent (`/S`, electron-updater) run never
+ * writes it, so a silent auto-update can never trigger a reset.
+ */
+export const RESET_MARKER_FILENAME = 'reset-data-requested.json'
+/**
+ * Top-level machine-readable record of the data assets + schema versions,
+ * (re)written atomically on every successful storage boot. The human-readable
+ * companion is docs/DATA-MIGRATION.md.
+ */
+export const DATA_MANIFEST_FILENAME = 'data-manifest.json'
+/**
+ * Label suffix for the pre-reset snapshot directory
+ * (`backups/<stamp>-pre-reset/`), sibling to the existing
+ * `<stamp>-pre-migration-v<N>` (graph) and `<stamp>-pre-appdata-v<N>` (SQLite)
+ * snapshots. No new §20 path — it lives in the existing backups/ dir.
+ */
+export const PRE_RESET_BACKUP_LABEL = 'pre-reset'
+/**
+ * Where the UNINSTALLER's "remove my data" choice MOVES (never deletes)
+ * `%APPDATA%\agentic-os` — a per-user roaming sibling that survives removal of
+ * userData itself and needs no elevation (same volume ⇒ atomic Rename). The
+ * literal is duplicated in build/installer.nsh (uninstaller macro); the sync
+ * is test-enforced.
+ */
+export const UNINSTALL_BACKUP_DIRNAME = 'agentic-os-backups'
+
 // ── Models ───────────────────────────────────────────────────────────────────
 /** The only embedding model, everywhere (Ollama). */
 export const EMBEDDING_MODEL = 'bge-m3'

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { openAppData } from '../../src/main/storage/appdata'
+import { appDataIntegrityOk, openAppData, snapshotAppDataDb } from '../../src/main/storage/appdata'
 
 const TABLES = [
   'traces',
@@ -351,6 +351,42 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
       expect(existsSync(join(dir, 'backups'))).toBe(false)
     } finally {
       upgraded.close()
+    }
+  })
+
+  it('snapshotAppDataDb: read-only VACUUM INTO of an OPEN-WAL db is valid + complete', () => {
+    dir = mkdtempSync(join(tmpdir(), 'appdata-'))
+    const dbPath = join(dir, 'appdata.db')
+    const live = openAppData(dbPath)
+    // Populate and DO NOT checkpoint — the -wal carries frames not yet in main.
+    live.db.prepare('INSERT INTO tasks (id, kind) VALUES (?, ?)').run('snap-1', 'probe')
+    live.db.prepare('INSERT INTO tasks (id, kind) VALUES (?, ?)').run('snap-2', 'probe')
+
+    // Snapshot while the writer connection is still OPEN (concurrent WAL reader).
+    const snap = join(dir, 'snap', 'appdata.db')
+    snapshotAppDataDb(dbPath, snap)
+
+    // The read-only snapshot did not disturb the live source (still v7, 2 rows).
+    expect(live.db.pragma('user_version', { simple: true })).toBe(7)
+    expect((live.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(2)
+    live.close()
+
+    expect(existsSync(snap)).toBe(true)
+    // The snapshot passes integrity_check and carries BOTH WAL-only rows @ v7.
+    expect(appDataIntegrityOk(snap)).toBe(true)
+    const reopened = openAppData(snap)
+    try {
+      expect((reopened.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(2)
+      expect(reopened.db.pragma('user_version', { simple: true })).toBe(7)
+    } finally {
+      reopened.close()
+    }
+    // Reopening the SOURCE still finds both rows — nothing was lost.
+    const source = openAppData(dbPath)
+    try {
+      expect((source.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(2)
+    } finally {
+      source.close()
     }
   })
 

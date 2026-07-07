@@ -254,7 +254,11 @@ const APPDATA_SCHEMA: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS idx_runner_submissions_task ON runner_submissions(task_id)`
 ]
 
-const APPDATA_USER_VERSION = 7
+/**
+ * Current SQLite schema version. Exported so the boot-time data manifest can
+ * record which schema the on-disk store carries (docs/DATA-MIGRATION.md).
+ */
+export const APPDATA_USER_VERSION = 7
 
 /**
  * Column additions to tables that predate them (CREATE IF NOT EXISTS skips an
@@ -292,24 +296,29 @@ function isAbiMismatch(err: unknown): boolean {
 
 /**
  * Open a database, trying the default binding and the Electron-ABI stash in
- * runtime-appropriate order. Non-ABI errors propagate untouched.
+ * runtime-appropriate order. Non-ABI errors propagate untouched. `options` are
+ * merged into the better-sqlite3 constructor (e.g. `{ readonly: true }` for the
+ * read-only snapshot/integrity paths); the resolved `nativeBinding` is added on
+ * top of them.
  */
 function openWithBinding(
   Database: typeof BetterSqlite3,
   dbPath: string,
-  electronStash: string
+  electronStash: string,
+  options: BetterSqlite3.Options = {}
 ): BetterSqlite3.Database {
   if (resolvedBinding !== undefined) {
     return resolvedBinding === null
-      ? new Database(dbPath)
-      : new Database(dbPath, { nativeBinding: resolvedBinding })
+      ? new Database(dbPath, options)
+      : new Database(dbPath, { ...options, nativeBinding: resolvedBinding })
   }
   // null = better-sqlite3's own default resolution.
   const candidates: (string | null)[] = process.versions.electron ? [electronStash, null] : [null, electronStash]
   let lastAbiError: unknown
   for (const candidate of candidates) {
     try {
-      const db = candidate === null ? new Database(dbPath) : new Database(dbPath, { nativeBinding: candidate })
+      const db =
+        candidate === null ? new Database(dbPath, options) : new Database(dbPath, { ...options, nativeBinding: candidate })
       resolvedBinding = candidate
       return db
     } catch (err) {
@@ -322,6 +331,51 @@ function openWithBinding(
       lastAbiError instanceof Error ? lastAbiError.message : String(lastAbiError)
     }`
   )
+}
+
+/** Resolve the better-sqlite3 class + the Electron-ABI stash path (dual-ABI). */
+function loadBetterSqlite3(): { Database: typeof BetterSqlite3; electronStash: string } {
+  const Database = require('better-sqlite3') as typeof BetterSqlite3
+  const bs3Dir = dirname(require.resolve('better-sqlite3/package.json'))
+  const electronStash = join(bs3Dir, 'build', 'Release', 'better_sqlite3-electron.node')
+  return { Database, electronStash }
+}
+
+/**
+ * Read-only snapshot of an appdata.db into `destFile` via `VACUUM INTO` —
+ * synchronous, atomic, and valid even against an open-WAL source. Opens the
+ * source READ-ONLY, applies NO pragmas and NO schema, and never checks or
+ * writes `user_version`: VACUUM INTO reads the source and writes only the
+ * destination, so the source store is never modified. That makes it safe to
+ * snapshot a store whose `user_version` is NEWER than this build understands —
+ * the downgrade guard's "never touch a newer store" promise is preserved, and
+ * openAppData's throw-on-newer stays byte-identical. `user_version` and content
+ * are carried into the snapshot unchanged. Used by the pre-reset backup.
+ */
+export function snapshotAppDataDb(dbPath: string, destFile: string): void {
+  mkdirSync(dirname(destFile), { recursive: true })
+  const { Database, electronStash } = loadBetterSqlite3()
+  const db = openWithBinding(Database, dbPath, electronStash, { readonly: true, fileMustExist: true })
+  try {
+    db.prepare('VACUUM INTO ?').run(destFile)
+  } finally {
+    db.close()
+  }
+}
+
+/**
+ * Opens `dbPath` READ-ONLY and returns whether `PRAGMA integrity_check` is
+ * 'ok'. Used to verify a pre-reset snapshot BEFORE any live data is cleared.
+ * Read-only, applies no schema — safe on any store, any version.
+ */
+export function appDataIntegrityOk(dbPath: string): boolean {
+  const { Database, electronStash } = loadBetterSqlite3()
+  const db = openWithBinding(Database, dbPath, electronStash, { readonly: true, fileMustExist: true })
+  try {
+    return (db.pragma('integrity_check', { simple: true }) as string) === 'ok'
+  } finally {
+    db.close()
+  }
 }
 
 /**
@@ -352,9 +406,7 @@ function backupAppDataDb(db: BetterSqlite3.Database, backupsDir: string): string
  */
 export function openAppData(dbPath: string, backupsDir?: string): AppData {
   mkdirSync(dirname(dbPath), { recursive: true })
-  const Database = require('better-sqlite3') as typeof BetterSqlite3
-  const bs3Dir = dirname(require.resolve('better-sqlite3/package.json'))
-  const electronStash = join(bs3Dir, 'build', 'Release', 'better_sqlite3-electron.node')
+  const { Database, electronStash } = loadBetterSqlite3()
 
   const db = openWithBinding(Database, dbPath, electronStash)
   const existingVersion = db.pragma('user_version', { simple: true }) as number

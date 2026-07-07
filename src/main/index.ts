@@ -1,6 +1,13 @@
-import { app, BrowserWindow, safeStorage, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, safeStorage, shell } from 'electron'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
+import {
+  IPC_EVENT_WINDOW_MAXIMIZE,
+  IPC_WINDOW_CLOSE,
+  IPC_WINDOW_IS_MAXIMIZED,
+  IPC_WINDOW_MINIMIZE,
+  IPC_WINDOW_TOGGLE_MAXIMIZE
+} from '../shared/ipc'
 import {
   appDataPaths,
   CLOUD_BASE_URL_OVERRIDE,
@@ -17,7 +24,16 @@ import {
   TRIGGER_STATE_FILENAME,
   WATCHED_FOLDERS_CONFIG_FILENAME
 } from './config'
-import { openAppData, openRyuGraphEngine, type AppData } from './storage'
+import {
+  APPDATA_USER_VERSION,
+  openAppData,
+  openRyuGraphEngine,
+  performPendingReset,
+  verifyDataManifest,
+  writeDataManifest,
+  type AppData,
+  type ResetResult
+} from './storage'
 import {
   CallBudget,
   Keychain,
@@ -206,6 +222,33 @@ function logNativeModuleVersions(): void {
  */
 async function bootStorage(): Promise<void> {
   const { readFileSync, existsSync } = require('node:fs') as typeof import('node:fs')
+  const userDataDir = app.getPath('userData')
+  const paths = appDataPaths(userDataDir)
+
+  // Data-safety lifecycle, BEFORE any store opens and BEFORE the win32
+  // ryugraph gate below — so a packaged "reinstall from scratch" always runs
+  // its next-boot reset. All three are internally fail-safe and wrapped again
+  // here so a manifest/reset hiccup can never take boot down.
+  //  1. verify: compare the previous manifest's critical assets to disk and
+  //     WARN loudly on a lost graph/appdata/keychain (log-only, never blocks).
+  //  2. reset: if (and only if) the installer left a valid reset marker,
+  //     snapshot → integrity-check → record → clear (recoverable). No marker ⇒
+  //     data is never touched — the app-side silent/auto-update invariant.
+  let reset: ResetResult = { performed: false, reason: 'no-marker' }
+  try {
+    for (const finding of verifyDataManifest(userDataDir)) {
+      console.warn(`[storage] data-manifest mismatch: ${finding.path} — ${finding.detail}`)
+    }
+  } catch (err) {
+    console.warn('[storage] data-manifest verify failed (ignored)', err)
+  }
+  try {
+    reset = performPendingReset(userDataDir, (m) => console.log(m))
+  } catch (err) {
+    // performPendingReset is internally fail-safe; this guard is belt-and-braces.
+    console.error('[storage] pending-reset handling failed — user data left intact', err)
+  }
+
   // ryugraph's `exports` map hides package.json from require — read it directly.
   const ryuPkgPath = join(app.getAppPath(), 'node_modules', 'ryugraph', 'package.json')
   const ryuPkg = JSON.parse(readFileSync(ryuPkgPath, 'utf8')) as { version: string }
@@ -229,7 +272,6 @@ async function bootStorage(): Promise<void> {
     }
   }
 
-  const paths = appDataPaths(app.getPath('userData'))
   appData = openAppData(paths.appDb)
   console.log(`[storage] appdata.db open (WAL: traces, tasks, mcp_calls, staged_writes, spend) at ${appData.path}`)
   if (appData.backupCreated !== null) {
@@ -253,6 +295,21 @@ async function bootStorage(): Promise<void> {
       counts[0]?.['c'] ?? 0
     )} nodes, vector+FTS from vendored extensions${backupNote}`
   )
+
+  // Refresh the machine-readable data manifest (§3 "note") with live versions +
+  // backup pointers. Atomic tmp+rename; a manifest write failure never takes
+  // boot down (it is a derived record, not the data).
+  try {
+    writeDataManifest(userDataDir, {
+      appVersion: app.getVersion(),
+      appdataUserVersion: APPDATA_USER_VERSION,
+      graphSchemaVersion: engine.schemaVersion,
+      lastBackupAt: engine.backupCreated ?? appData.backupCreated ?? null,
+      ...(reset.performed ? { lastResetAt: new Date().toISOString(), lastResetBackupDir: reset.backupDir } : {})
+    })
+  } catch (err) {
+    console.warn('[storage] data-manifest write failed (ignored)', err)
+  }
 }
 
 /**
@@ -802,6 +859,30 @@ function bootIpc(): void {
   console.log('[ipc] dashboard IPC ready (typed contract, structured errors)')
 }
 
+/**
+ * GLOBAL window-chrome handlers for the frameless title bar. Registered exactly
+ * once (in whenReady, before createWindow) so macOS 'activate' re-creating the
+ * window never double-registers the ipcMain.handle channel. Each resolves the
+ * target window from the sender, so a re-created window still gets its controls.
+ * fromWebContents returns null for a destroyed sender — the optional chaining /
+ * null check keeps strict TS green and is a no-op in that race.
+ */
+function registerWindowControlIpc(): void {
+  ipcMain.on(IPC_WINDOW_MINIMIZE, (event) => {
+    BrowserWindow.fromWebContents(event.sender)?.minimize()
+  })
+  ipcMain.on(IPC_WINDOW_TOGGLE_MAXIMIZE, (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (win === null) return
+    if (win.isMaximized()) win.unmaximize()
+    else win.maximize()
+  })
+  ipcMain.on(IPC_WINDOW_CLOSE, (event) => {
+    BrowserWindow.fromWebContents(event.sender)?.close()
+  })
+  ipcMain.handle(IPC_WINDOW_IS_MAXIMIZED, (event) => BrowserWindow.fromWebContents(event.sender)?.isMaximized() ?? false)
+}
+
 function createWindow(): void {
   const win = new BrowserWindow({
     width: 1200,
@@ -811,6 +892,11 @@ function createWindow(): void {
     minWidth: 960,
     minHeight: 600,
     title: PRODUCT_NAME,
+    // Frameless custom chrome (renderer TitleBar). 'hidden' (NOT frame:false)
+    // drops the native caption while keeping Windows resize borders + snap.
+    titleBarStyle: 'hidden',
+    // macOS keeps native traffic lights — nudge them to center in the 36px bar.
+    ...(process.platform === 'darwin' ? { trafficLightPosition: { x: 12, y: 10 } } : {}),
     webPreferences: {
       preload: join(import.meta.dirname, '../preload/index.mjs'),
       sandbox: false,
@@ -818,6 +904,14 @@ function createWindow(): void {
       nodeIntegration: false
     }
   })
+
+  // Push maximize-state changes so the TitleBar can swap its maximize/restore
+  // icon. Guarded against a destroyed window (teardown race).
+  const sendMaximizeState = (state: boolean): void => {
+    if (!win.isDestroyed()) win.webContents.send(IPC_EVENT_WINDOW_MAXIMIZE, state)
+  }
+  win.on('maximize', () => sendMaximizeState(true))
+  win.on('unmaximize', () => sendMaximizeState(false))
 
   win.webContents.setWindowOpenHandler((details) => {
     void shell.openExternal(details.url)
@@ -886,6 +980,7 @@ void app.whenReady().then(async () => {
   // first boot (§3/§21.9 — proven by scripts/smoke/packaged-smoke.mjs).
   bootUpdater()
 
+  registerWindowControlIpc()
   createWindow()
 
   app.on('activate', () => {

@@ -624,6 +624,23 @@ export const IPC_EVENT_OLLAMA_PULL = 'event.ollama.pull'
 /** Prefix every invokable channel rides under (namespacing + preload filter). */
 export const IPC_INVOKE_PREFIX = 'agentic-os:'
 
+/**
+ * Frameless title-bar window-chrome channels. These live OUTSIDE the IpcChannels
+ * map (and outside IPC_INVOKE_PREFIX / IpcResult) on purpose: they are OS window
+ * commands + chrome state, not typed DTO queries. Adding them to the map would
+ * force req/res typing and route them through the main-side handler loop, which
+ * expects IpcResult envelopes. They mirror the bespoke event channels above
+ * (IPC_EVENT_INGEST_PROGRESS) — one shared source of truth for main + preload.
+ */
+/** Fire-and-forget window commands (renderer → main via ipcRenderer.send). */
+export const IPC_WINDOW_MINIMIZE = 'window.minimize'
+export const IPC_WINDOW_TOGGLE_MAXIMIZE = 'window.toggle-maximize'
+export const IPC_WINDOW_CLOSE = 'window.close'
+/** Seed query for the maximize/restore icon — returns a bare boolean (not IpcResult). */
+export const IPC_WINDOW_IS_MAXIMIZED = 'window.is-maximized'
+/** Maximize-state push (main → renderer, boolean payload); mirrors event.ingest.progress. */
+export const IPC_EVENT_WINDOW_MAXIMIZE = 'event.window.maximize'
+
 /** Stable error codes the renderer may branch on (message is for display). */
 export type IpcErrorCode =
   | 'UNAVAILABLE' // subsystem not booted this launch

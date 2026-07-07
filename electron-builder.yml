@@ -113,10 +113,24 @@ win:
 
 # Recorded picks: oneClick per-user install (background cockpit app — no
 # elevation prompt, no install wizard).
-# Reinstall guard: build/installer.nsh (auto-included from buildResources)
-# defines a `preInit` macro that PROMPTS before replacing an existing install
-# (Yes → remove-and-reinstall, keeping user data; No → cancel). /SD IDYES keeps
-# electron-updater's silent auto-update working. See that file's header.
+#
+# DATA-SAFE INSTALL/UPDATE/UNINSTALL LIFECYCLE — build/installer.nsh (auto-
+# included from buildResources) implements it; full contract in
+# docs/DATA-MIGRATION.md:
+#   * preInit: an INTERACTIVE already-installed run offers a 3-way choice
+#     (MB_YESNOCANCEL /SD IDYES) — Update (keep data) / Reinstall-from-scratch /
+#     Cancel. The reinstall branch only WRITES AN INTENT MARKER
+#     (reset-data-requested.json); the app performs a backed-up, integrity-
+#     checked reset on next boot. /SD keeps electron-updater's SILENT (/S)
+#     auto-update on the keep-data path — a silent run can never wipe data.
+#   * customUnInit/customUnInstall: an interactive uninstall offers keep-vs-
+#     remove; "remove" MOVES %APPDATA%\agentic-os into
+#     %APPDATA%\agentic-os-backups\<stamp> (a Rename, never an RMDir). /S and
+#     --updated (the update flow) always keep data.
+#
+# deleteAppDataOnUninstall MUST STAY UNSET (default false): our customUnInstall
+# owns the data decision, and leaving it unset keeps the template's own app-data
+# RMDir block (uninstaller.nsh:216-248) inert. Do NOT set it to true.
 nsis:
   oneClick: true
   perMachine: false

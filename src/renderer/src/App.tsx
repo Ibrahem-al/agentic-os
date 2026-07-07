@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from 'react'
 import type { RunnerStatusDto } from '../../shared/ipc'
 import { call, useIpc } from './lib/ipc'
 import { Badge, Button, ToastProvider } from './ui/kit'
+import TitleBar from './ui/TitleBar'
 import MemoryPanel from './panels/MemoryPanel'
 import ReviewPanel from './panels/ReviewPanel'
 import AuditPanel from './panels/AuditPanel'
@@ -326,57 +327,56 @@ export default function App(): React.JSX.Element {
 
   return (
     <ToastProvider>
-      <div className="flex h-full">
-        <nav className="z-20 flex w-[216px] shrink-0 flex-col border-r border-line bg-surface" aria-label="panels">
-          <div className="px-4 pt-4 pb-3">
-            <div className="text-[14px] font-semibold tracking-tight">agentic-os</div>
-            <div className="font-mono text-[11px] text-ink-faint">operations console</div>
-          </div>
-          <ul className="flex-1 overflow-y-auto px-2">
-            {PANELS.map((panel) => {
-              const isActive = panel.key === active
-              return (
-                <li key={panel.key}>
-                  <button
-                    type="button"
-                    data-testid={`nav-${panel.key}`}
-                    aria-current={isActive ? 'page' : undefined}
-                    onClick={() => setActive(panel.key)}
-                    className={`flex w-full cursor-pointer items-center justify-between rounded-md px-2.5 py-[7px] text-left text-[13px] transition-colors duration-120 ${
-                      isActive ? 'bg-raised text-ink shadow-[inset_2px_0_0_var(--color-accent)]' : 'text-ink-mute hover:bg-raised hover:text-ink'
-                    }`}
-                  >
-                    <span>{panel.label}</span>
-                    {panel.key === 'review' && pending > 0 && (
-                      <span className="rounded-full bg-warn/15 px-1.5 font-mono text-[11px] text-warn" data-testid="review-pending-count">
-                        {pending}
-                      </span>
-                    )}
-                    {panel.key === 'skills' && drift > 0 && (
-                      <span className="rounded-full bg-warn/15 px-1.5 font-mono text-[11px] text-warn" data-testid="drift-flagged-count">
-                        {drift}
-                        <span className="sr-only"> drift-flagged skill versions</span>
-                      </span>
-                    )}
-                  </button>
-                </li>
-              )
-            })}
-          </ul>
-          <div className="border-t border-line px-4 py-2.5">
-            <div className="font-mono text-[11px] text-ink-faint" data-testid="review-week-counter">
-              this week{' '}
-              <span className={week.staged > week.decided ? 'text-warn' : 'text-ink-mute'}>staged {week.staged}</span>{' '}
-              · <span className="text-ink-mute">decided {week.decided}</span>
+      <div className="flex h-full flex-col">
+        <TitleBar />
+        <div className="flex min-h-0 flex-1">
+          <nav className="z-20 flex w-[216px] shrink-0 flex-col border-r border-line bg-surface" aria-label="panels">
+            <ul className="flex-1 overflow-y-auto px-2 pt-3">
+              {PANELS.map((panel) => {
+                const isActive = panel.key === active
+                return (
+                  <li key={panel.key}>
+                    <button
+                      type="button"
+                      data-testid={`nav-${panel.key}`}
+                      aria-current={isActive ? 'page' : undefined}
+                      onClick={() => setActive(panel.key)}
+                      className={`flex w-full cursor-pointer items-center justify-between rounded-md px-2.5 py-[7px] text-left text-[13px] transition-colors duration-120 ${
+                        isActive ? 'bg-raised text-ink shadow-[inset_2px_0_0_var(--color-accent)]' : 'text-ink-mute hover:bg-raised hover:text-ink'
+                      }`}
+                    >
+                      <span>{panel.label}</span>
+                      {panel.key === 'review' && pending > 0 && (
+                        <span className="rounded-full bg-warn/15 px-1.5 font-mono text-[11px] text-warn" data-testid="review-pending-count">
+                          {pending}
+                        </span>
+                      )}
+                      {panel.key === 'skills' && drift > 0 && (
+                        <span className="rounded-full bg-warn/15 px-1.5 font-mono text-[11px] text-warn" data-testid="drift-flagged-count">
+                          {drift}
+                          <span className="sr-only"> drift-flagged skill versions</span>
+                        </span>
+                      )}
+                    </button>
+                  </li>
+                )
+              })}
+            </ul>
+            <div className="border-t border-line px-4 py-2.5">
+              <div className="font-mono text-[11px] text-ink-faint" data-testid="review-week-counter">
+                this week{' '}
+                <span className={week.staged > week.decided ? 'text-warn' : 'text-ink-mute'}>staged {week.staged}</span>{' '}
+                · <span className="text-ink-mute">decided {week.decided}</span>
+              </div>
             </div>
-          </div>
-          {runnerFallbackChip}
-          <SubsystemStatus />
-        </nav>
-        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          {runnerBanner}
-          <ActivePanel />
-        </main>
+            {runnerFallbackChip}
+            <SubsystemStatus />
+          </nav>
+          <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+            {runnerBanner}
+            <ActivePanel />
+          </main>
+        </div>
       </div>
     </ToastProvider>
   )

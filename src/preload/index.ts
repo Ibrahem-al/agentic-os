@@ -2,7 +2,12 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import {
   IPC_EVENT_INGEST_PROGRESS,
   IPC_EVENT_OLLAMA_PULL,
+  IPC_EVENT_WINDOW_MAXIMIZE,
   IPC_INVOKE_PREFIX,
+  IPC_WINDOW_CLOSE,
+  IPC_WINDOW_IS_MAXIMIZED,
+  IPC_WINDOW_MINIMIZE,
+  IPC_WINDOW_TOGGLE_MAXIMIZE,
   type IngestProgressEventDto,
   type IpcChannel,
   type IpcRequest,
@@ -38,7 +43,20 @@ const api = {
   /** Subscribe to codebase-ingest progress pushes; returns unsubscribe. */
   onIngestProgress: subscribe<IngestProgressEventDto>(IPC_EVENT_INGEST_PROGRESS),
   /** Subscribe to Ollama model-pull progress pushes; returns unsubscribe. */
-  onOllamaPull: subscribe<OllamaPullProgressDto>(IPC_EVENT_OLLAMA_PULL)
+  onOllamaPull: subscribe<OllamaPullProgressDto>(IPC_EVENT_OLLAMA_PULL),
+  /**
+   * Window-chrome commands for the frameless title bar. Bespoke channels (not
+   * the IpcChannels invoke map): OS window commands + chrome state, not DTOs.
+   */
+  window: {
+    minimize: (): void => ipcRenderer.send(IPC_WINDOW_MINIMIZE),
+    toggleMaximize: (): void => ipcRenderer.send(IPC_WINDOW_TOGGLE_MAXIMIZE),
+    close: (): void => ipcRenderer.send(IPC_WINDOW_CLOSE),
+    /** Current maximize state (seed for the restore icon). */
+    isMaximized: (): Promise<boolean> => ipcRenderer.invoke(IPC_WINDOW_IS_MAXIMIZED) as Promise<boolean>,
+    /** Subscribe to maximize-state pushes; returns unsubscribe. */
+    onMaximizeChange: subscribe<boolean>(IPC_EVENT_WINDOW_MAXIMIZE)
+  }
 } as const
 
 export type PreloadApi = typeof api
