@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain, safeStorage, shell } from 'electron'
 import { join } from 'node:path'
+import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import {
   IPC_EVENT_WINDOW_MAXIMIZE,
@@ -221,7 +222,7 @@ function logNativeModuleVersions(): void {
  * (backup-if-migrating → open → migrate), both under Electron userData.
  */
 async function bootStorage(): Promise<void> {
-  const { readFileSync, existsSync } = require('node:fs') as typeof import('node:fs')
+  const { readFileSync } = require('node:fs') as typeof import('node:fs')
   const userDataDir = app.getPath('userData')
   const paths = appDataPaths(userDataDir)
 
@@ -884,9 +885,17 @@ function registerWindowControlIpc(): void {
 }
 
 function createWindow(): void {
+  // Runtime window/taskbar icon. Packaged: process.resourcesPath/icon.png
+  // (electron-builder extraResources). Dev: build/icon.png at the repo root.
+  // Guarded so a missing file never throws. On packaged Windows the taskbar
+  // uses the EXE-embedded build/icon.ico; this mainly covers dev + Linux.
+  const iconCandidate = app.isPackaged
+    ? join(process.resourcesPath, 'icon.png')
+    : join(app.getAppPath(), 'build', 'icon.png')
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
+    ...(existsSync(iconCandidate) ? { icon: iconCandidate } : {}),
     // The cockpit's dense tables need a floor; below this the master-detail
     // grids crush (audit finding, phase 10).
     minWidth: 960,

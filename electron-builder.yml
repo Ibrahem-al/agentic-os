@@ -88,6 +88,10 @@ extraResources:
     to: extensions/v25.9.0
   - from: scripts/hooks
     to: hooks
+  # Runtime window/taskbar icon (dev falls back to build/icon.png; packaged
+  # lands at process.resourcesPath/icon.png). See src/main/index.ts createWindow.
+  - from: resources/icon.png
+    to: icon.png
 
 artifactName: "${productName}-${version}-${os}-${arch}.${ext}"
 
@@ -103,6 +107,7 @@ artifactName: "${productName}-${version}-${os}-${arch}.${ext}"
 # `package.json` positive (already shipped by the top-level list) anchors each
 # platform matcher so only the negatives take effect.
 win:
+  icon: build/icon.ico
   target:
     - nsis
   files:
@@ -134,11 +139,15 @@ win:
 nsis:
   oneClick: true
   perMachine: false
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
 
 # identity: null — unsigned mac build (no Apple Developer identity available;
 # recorded). Both arches as required; dmg + zip (zip additionally feeds
 # electron-updater's mac feed).
 mac:
+  icon: build/icon.icns
   identity: null
   category: public.app-category.developer-tools
   target:
@@ -152,6 +161,7 @@ mac:
     - "!node_modules/onnxruntime-node/bin/napi-v6/win32/**"
 
 linux:
+  icon: build/icon.png
   category: Utility
   target:
     - AppImage

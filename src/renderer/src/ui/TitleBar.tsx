@@ -102,7 +102,15 @@ export default function TitleBar(): React.JSX.Element {
       className="z-20 flex h-[30px] shrink-0 select-none items-center justify-between border-b border-line bg-surface"
     >
       <div className={isMac ? 'flex items-center gap-1.5 pl-[72px]' : 'flex items-center gap-1.5 pl-2.5'}>
-        <span aria-hidden="true" className="size-1.5 rounded-[2px] bg-accent" />
+        <svg width="15" height="15" viewBox="0 0 1024 1024" aria-hidden="true" className="shrink-0">
+          <rect x="0" y="0" width="1024" height="1024" rx="224" fill="var(--color-bg)" />
+          <line x1="400" y1="640" x2="712" y2="344" stroke="var(--color-accent)" strokeOpacity="0.75" strokeWidth="100" strokeLinecap="round" />
+          <line x1="400" y1="640" x2="296" y2="300" stroke="var(--color-accent)" strokeOpacity="0.75" strokeWidth="100" strokeLinecap="round" />
+          <circle cx="296" cy="300" r="88" fill="var(--color-accent-ink)" />
+          <circle cx="712" cy="344" r="118" fill="var(--color-accent)" />
+          <circle cx="400" cy="640" r="168" fill="var(--color-accent)" />
+          <circle cx="400" cy="640" r="64" fill="var(--color-accent-ink)" />
+        </svg>
         <span className="text-[11px] font-semibold tracking-tight text-ink">agentic-os</span>
         <span className="font-mono text-[10px] text-ink-faint">operations console</span>
       </div>

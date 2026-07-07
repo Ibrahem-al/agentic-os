@@ -16,6 +16,7 @@
     "test:e2e": "playwright test",
     "seed:demo": "esbuild tests/fixtures/dashboard-seed.ts --bundle --platform=node --format=esm --outfile=out/smoke/dashboard-seed.mjs --log-level=warning && node out/smoke/dashboard-seed.mjs",
     "rebuild:native": "node scripts/native/rebuild-native.cjs",
+    "icons": "node scripts/build/generate-icons.mjs",
     "package": "electron-builder --publish never",
     "package:dir": "electron-builder --dir --publish never",
     "smoke:boot": "node scripts/smoke/boot-smoke.mjs",
