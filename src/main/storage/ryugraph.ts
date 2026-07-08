@@ -20,7 +20,7 @@
  *   connections — the app's quit path; durability via WAL replay is proven.
  * - `CAST($p AS ...)` is illegal as a CALL argument; bare `$p` binds fine.
  */
-import { existsSync, mkdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, renameSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type {
@@ -29,7 +29,7 @@ import type {
   QueryResult as RyuQueryResult,
   RyuValue
 } from 'ryugraph'
-import { EMBEDDING_DIM } from '../config'
+import { EMBEDDING_DIM, GRAPH_CHECKPOINT_INTERVAL_MS } from '../config'
 import type {
   CypherParams,
   EdgeProps,
@@ -88,6 +88,46 @@ export function isMutatingCypher(query: string): boolean {
   return MUTATING_STATEMENT.test(query)
 }
 
+/**
+ * RyuGraph 25.9.1 replays `<graphDir>/graph.ryugraph.wal` on open. The app
+ * deliberately leaks the Database handle at quit (closeSync() poisons native
+ * teardown — see close()), so a hard kill or crash mid-write can leave a torn
+ * WAL. The next open then throws with NO built-in recovery, which disables
+ * storage and — through the boot cascade — the whole app. These two helpers let
+ * open() detect that SPECIFIC failure and recover to the last checkpoint. Both
+ * observed messages match: RyuGraph's "Corrupted wal file. Read out invalid WAL
+ * record type." and "Checksum verification failed, the WAL file is corrupted."
+ */
+function isCorruptWalError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return /\bwal\b/i.test(message) && /(corrupt|invalid|malformed|checksum|truncat)/i.test(message)
+}
+
+/**
+ * Move every `graph.ryugraph.wal*` file out of the graph dir into
+ * `<backupsDir>/<stamp>-corrupt-wal/` — preserved for forensics, NEVER deleted
+ * (the same move-don't-destroy discipline as the pre-migration backups). A
+ * rename within the userData volume is atomic and cheap. Returns the created
+ * quarantine dir, or null when there was no WAL file to move (so open() knows
+ * the corrupt-WAL diagnosis was wrong and re-throws the original error).
+ */
+function quarantineGraphWal(graphDir: string, backupsDir: string): string | null {
+  let walFiles: string[]
+  try {
+    walFiles = readdirSync(graphDir).filter((name) => name.startsWith(`${GRAPH_DB_FILENAME}.wal`))
+  } catch {
+    return null
+  }
+  if (walFiles.length === 0) return null
+  mkdirSync(backupsDir, { recursive: true })
+  const stamp = new Date().toISOString().replaceAll(':', '-').replace(/\.\d+Z$/, 'Z')
+  let dest = join(backupsDir, `${stamp}-corrupt-wal`)
+  for (let n = 2; existsSync(dest); n++) dest = join(backupsDir, `${stamp}-corrupt-wal-${n}`)
+  mkdirSync(dest, { recursive: true })
+  for (const name of walFiles) renameSync(join(graphDir, name), join(dest, name))
+  return dest
+}
+
 interface RyuModule {
   Database: typeof RyuDatabase
   Connection: typeof RyuConnection
@@ -109,6 +149,12 @@ export interface RyuGraphEngineOptions {
   migrations?: readonly Migration[]
   /** Write-lane journal capacity override (tests). */
   laneJournalCapacity?: number
+  /**
+   * Periodic WAL→db checkpoint cadence in ms; defaults to
+   * GRAPH_CHECKPOINT_INTERVAL_MS. 0 (or negative) disables the timer — used by
+   * tests that don't want a background checkpoint, or to override the cadence.
+   */
+  checkpointIntervalMs?: number
 }
 
 /** RyuGraph's platform directory name for this process. */
@@ -282,10 +328,22 @@ export class RyuGraphEngine implements StorageEngine {
   private readonly graphDir: string
   private schemaVersionValue = 0
   private closed = false
+  /** Periodic WAL→db checkpoint (started on open, cleared on close); unref'd. */
+  private checkpointTimer: ReturnType<typeof setInterval> | null = null
+  /** Set by any write; gates the periodic checkpoint so an idle app never flushes. */
+  private dirtySinceCheckpoint = false
+  /** Count of periodic checkpoints that actually ran (test observability). */
+  private periodicCheckpointCount = 0
   /** In-flight vector-index rebuilds, per label (searches await these). */
   private readonly vectorRebuilds = new Map<RetrievableLabel, Promise<void>>()
   /** Backup taken by this open (null when none was needed). */
   readonly backupCreated: string | null
+  /**
+   * Quarantine dir for a corrupt WAL this open recovered from (null on a clean
+   * open). Boot surfaces it as a loud WARN — the store reopened at its last
+   * checkpoint, so writes since that checkpoint were lost.
+   */
+  readonly walQuarantined: string | null
 
   private constructor(
     db: RyuDatabase,
@@ -293,6 +351,7 @@ export class RyuGraphEngine implements StorageEngine {
     readConn: RyuConnection,
     graphDir: string,
     backupCreated: string | null,
+    walQuarantined: string | null,
     laneJournalCapacity?: number
   ) {
     this.db = db
@@ -300,11 +359,17 @@ export class RyuGraphEngine implements StorageEngine {
     this.readConn = readConn
     this.graphDir = graphDir
     this.backupCreated = backupCreated
+    this.walQuarantined = walQuarantined
     this.lane = new WriteLane(laneJournalCapacity)
   }
 
   get schemaVersion(): number {
     return this.schemaVersionValue
+  }
+
+  /** Periodic checkpoints that have run since open (test observability). */
+  get periodicCheckpoints(): number {
+    return this.periodicCheckpointCount
   }
 
   /** Open (creating/migrating as needed). The only way to construct an engine. */
@@ -338,37 +403,70 @@ export class RyuGraphEngine implements StorageEngine {
     }
 
     mkdirSync(options.graphDir, { recursive: true })
-    const ryu = require('ryugraph') as RyuModule
-    const db = new ryu.Database(join(options.graphDir, GRAPH_DB_FILENAME))
-    const writeConn = new ryu.Connection(db)
-    const readConn = new ryu.Connection(db)
 
-    const engine = new RyuGraphEngine(
-      db,
-      writeConn,
-      readConn,
-      options.graphDir,
-      backupCreated,
-      options.laneJournalCapacity
-    )
     try {
+      return await RyuGraphEngine.build(options, migrations, backupCreated, null)
+    } catch (err) {
+      // §3 data-safety: a torn WAL from an unclean shutdown (the app leaks the
+      // Database handle at quit — see close()) must not brick storage and, via
+      // the boot cascade, the whole app. Quarantine the WAL (preserved, never
+      // deleted) and retry the open ONCE — RyuGraph then recovers to the last
+      // checkpoint. Only THIS specific failure recovers; a schema-newer refusal,
+      // a lock, a missing extension, or a corrupt main db propagates untouched
+      // (quarantineGraphWal returns null when there is no WAL, and the retry
+      // re-throws when the WAL was not the real problem).
+      if (!isCorruptWalError(err)) throw err
+      const walQuarantined = quarantineGraphWal(options.graphDir, options.backupsDir)
+      if (walQuarantined === null) throw err
+      return await RyuGraphEngine.build(options, migrations, backupCreated, walQuarantined)
+    }
+  }
+
+  /**
+   * Construct the db + connections and initialise (extensions + migrations).
+   * Any failure closes whatever native handles were created before rethrowing:
+   * the downgrade guard's layer 2 fires after the db is open, callers and test
+   * teardown need the file locks released, and open()'s corrupt-WAL retry must
+   * be able to MOVE the WAL out of the graph dir (Windows keeps it locked
+   * otherwise). Nothing is written on the failing path, so closing suffices.
+   */
+  private static async build(
+    options: RyuGraphEngineOptions,
+    migrations: readonly Migration[],
+    backupCreated: string | null,
+    walQuarantined: string | null
+  ): Promise<RyuGraphEngine> {
+    const ryu = require('ryugraph') as RyuModule
+    let db: RyuDatabase | undefined
+    let writeConn: RyuConnection | undefined
+    let readConn: RyuConnection | undefined
+    try {
+      db = new ryu.Database(join(options.graphDir, GRAPH_DB_FILENAME))
+      writeConn = new ryu.Connection(db)
+      readConn = new ryu.Connection(db)
+      const engine = new RyuGraphEngine(
+        db,
+        writeConn,
+        readConn,
+        options.graphDir,
+        backupCreated,
+        walQuarantined,
+        options.laneJournalCapacity
+      )
       await engine.loadExtensions(options.extensionsDir)
       await engine.migrate(migrations)
+      engine.startCheckpointTimer(options.checkpointIntervalMs ?? GRAPH_CHECKPOINT_INTERVAL_MS)
+      return engine
     } catch (err) {
-      // A refused/failed open must not leak native handles (the downgrade
-      // guard's layer 2 fires after the db is open; callers — and test
-      // teardown — need the file locks released). Nothing was written, so a
-      // plain close of the handles suffices.
       try {
-        readConn.closeSync()
-        writeConn.closeSync()
-        db.closeSync()
+        readConn?.closeSync()
+        writeConn?.closeSync()
+        db?.closeSync()
       } catch {
         // Best-effort: the original error is the one that matters.
       }
       throw err
     }
-    return engine
   }
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
@@ -433,6 +531,33 @@ export class RyuGraphEngine implements StorageEngine {
       if (/does not exist/i.test(err instanceof Error ? err.message : String(err))) return 0
       throw err
     }
+  }
+
+  /**
+   * Start the periodic WAL→db checkpoint. Dirty-gated (an idle app never
+   * flushes) and lane-serialized (never races a write or a vector-index
+   * rebuild). unref'd so it can never hold the process open, and cleared in
+   * close(). A failed checkpoint is non-fatal — WAL replay still recovers on the
+   * next open — so it re-marks dirty and retries on the next tick. This keeps the
+   * WAL small so a hard kill loses at most one interval of writes, and reduces
+   * the torn-WAL exposure the open-time recovery guards against.
+   */
+  private startCheckpointTimer(intervalMs: number): void {
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) return
+    this.checkpointTimer = setInterval(() => {
+      if (this.closed || !this.dirtySinceCheckpoint) return
+      this.dirtySinceCheckpoint = false
+      void this.lane
+        .enqueue('checkpoint:periodic', () => this.run(this.writeConn, 'CHECKPOINT'))
+        .then(() => {
+          this.periodicCheckpointCount += 1
+        })
+        .catch((err) => {
+          this.dirtySinceCheckpoint = true // retry next tick rather than drop the flush
+          console.warn('[storage] periodic checkpoint failed (will retry next tick)', err)
+        })
+    }, intervalMs)
+    this.checkpointTimer.unref()
   }
 
   // ── Query plumbing ─────────────────────────────────────────────────────────
@@ -510,6 +635,7 @@ export class RyuGraphEngine implements StorageEngine {
     this.assertAllowed(query)
     if (MUTATING_STATEMENT.test(query)) {
       // §21 rule 1: mutations ride the lane, whoever wrote the query.
+      this.dirtySinceCheckpoint = true
       return this.lane.enqueue('cypher', () => this.run(this.writeConn, query, params))
     }
     return this.run(this.readConn, query, params)
@@ -563,17 +689,20 @@ export class RyuGraphEngine implements StorageEngine {
   async upsertNode(label: NodeLabel, props: NodeProps): Promise<UpsertResult> {
     this.assertOpen()
     const id = this.validateNodeProps(label, props)
+    this.dirtySinceCheckpoint = true
     return this.lane.enqueue(`upsertNode:${label}`, () => this.upsertNodeInLane(label, id, props))
   }
 
   async createEdge(type: EdgeType, from: NodeRef, to: NodeRef, props?: EdgeProps): Promise<void> {
     this.assertOpen()
     this.validateEdge(type, from, to, props)
+    this.dirtySinceCheckpoint = true
     return this.lane.enqueue(`createEdge:${type}`, () => this.createEdgeInLane(type, from, to, props))
   }
 
   async withWrite<T>(fn: (tx: WriteTx) => Promise<T>): Promise<T> {
     this.assertOpen()
+    this.dirtySinceCheckpoint = true
     const tx: WriteTx = {
       cypher: (query, params) => {
         this.assertAllowed(query)
@@ -599,6 +728,10 @@ export class RyuGraphEngine implements StorageEngine {
   async close(options?: { skipDatabaseClose?: boolean }): Promise<void> {
     if (this.closed) return
     this.closed = true
+    if (this.checkpointTimer !== null) {
+      clearInterval(this.checkpointTimer)
+      this.checkpointTimer = null
+    }
     await this.lane.onIdle()
     try {
       await this.run(this.writeConn, 'CHECKPOINT')

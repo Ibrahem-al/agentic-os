@@ -136,6 +136,12 @@ export interface IpcDeps {
   readonly userDataDir: string
   readonly subsystems: AppStatusDto['subsystems']
   /**
+   * Per-subsystem boot outcome + human-readable reason (App.tsx's subsystem
+   * strip renders the reason for any non-ok entry). Optional: test rigs omit it
+   * and `app.status` returns []; boot always supplies the computed list.
+   */
+  readonly diagnostics?: AppStatusDto['diagnostics']
+  /**
    * Phase-16b (P1.1): fired by the settings mutators (save / setApiKey /
    * clearApiKey) AFTER a successful mutation so boot can drop the ProviderRouter's
    * cached snapshot (router.invalidate()); a provider/key/role change then takes
@@ -262,7 +268,8 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     platform: process.platform,
     userDataDir: deps.userDataDir,
     subsystems: deps.subsystems,
-    mcpUrl: deps.mcpUrl
+    mcpUrl: deps.mcpUrl,
+    diagnostics: deps.diagnostics ?? []
   }))
 
   // ── memory browser ─────────────────────────────────────────────────────────

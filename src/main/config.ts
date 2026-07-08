@@ -627,6 +627,18 @@ export const INJECTION_SCAN_LLM_MAX_TOKENS = 128
  */
 export const RYUGRAPH_VERSION_PIN = '25.9.1'
 /**
+ * Periodic graph-checkpoint cadence. RyuGraph accumulates writes in
+ * `graph.ryugraph.wal` and only auto-checkpoints on its own size threshold or a
+ * clean close; the app leaks the Database handle at quit (closeSync poisons
+ * native teardown — see engine.close()), so a hard kill can strand a large
+ * un-checkpointed WAL, which BOTH risks a torn/corrupt WAL on the next open AND
+ * loses everything written since the last checkpoint. A modest interval flushes
+ * the WAL into the main db so the on-disk store stays current and worst-case
+ * loss is bounded to one interval. Dirty-gated (an idle app never checkpoints).
+ * Not a §20 value — a rule-12 pick. `checkpointIntervalMs: 0` disables (tests).
+ */
+export const GRAPH_CHECKPOINT_INTERVAL_MS = 2 * 60 * 1000
+/**
  * Vendored extension directory name under resources/extensions/. Matches the
  * engine's compiled-in RYU_EXTENSION_VERSION (25.9.0 for ryugraph 25.9.1).
  */

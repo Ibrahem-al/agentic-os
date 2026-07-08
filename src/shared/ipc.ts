@@ -43,6 +43,19 @@ export type IpcCloudProvider = (typeof IPC_CLOUD_PROVIDERS)[number]
 
 // ── app ───────────────────────────────────────────────────────────────────────
 
+/**
+ * One subsystem's boot outcome + a human-readable reason. `error` = the
+ * subsystem did not come up (the detail is why — e.g. a corrupt WAL, a decrypt
+ * failure, a port in use); `warn` = up but degraded (e.g. recovered from a
+ * corrupt WAL, triggers off); `ok` = healthy. Surfaced in the dashboard so a
+ * failed connection shows its cause instead of just a red dot.
+ */
+export interface BootDiagnosticDto {
+  readonly subsystem: string
+  readonly level: 'ok' | 'warn' | 'error'
+  readonly detail: string
+}
+
 export interface AppStatusDto {
   readonly version: string
   readonly platform: string
@@ -57,6 +70,12 @@ export interface AppStatusDto {
   }
   /** MCP server URL when it is listening (null: disabled this launch). */
   readonly mcpUrl: string | null
+  /**
+   * Per-subsystem boot outcome + reason. Always set in production; optional so
+   * test rigs that build an AppStatusDto directly can omit it (consumers treat
+   * absent as []).
+   */
+  readonly diagnostics?: readonly BootDiagnosticDto[]
 }
 
 // ── memory browser ────────────────────────────────────────────────────────────
