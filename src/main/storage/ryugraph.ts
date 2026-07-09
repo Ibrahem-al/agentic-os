@@ -416,8 +416,19 @@ export class RyuGraphEngine implements StorageEngine {
       // (quarantineGraphWal returns null when there is no WAL, and the retry
       // re-throws when the WAL was not the real problem).
       if (!isCorruptWalError(err)) throw err
-      const walQuarantined = quarantineGraphWal(options.graphDir, options.backupsDir)
+      let walQuarantined: string | null
+      try {
+        walQuarantined = quarantineGraphWal(options.graphDir, options.backupsDir)
+      } catch (quarantineErr) {
+        // A quarantine fs failure (AV lock, ENOSPC) must not mask the real
+        // diagnosis: surface the corrupt-WAL error, not the rename error.
+        console.warn('[storage] corrupt-WAL quarantine failed — surfacing the original open error', quarantineErr)
+        throw err
+      }
       if (walQuarantined === null) throw err
+      // Logged HERE, not just on the engine: if the retry below also fails,
+      // this launch's log is the only record that a WAL was moved aside.
+      console.warn(`[storage] corrupt graph WAL quarantined to ${walQuarantined} — retrying the open at the last checkpoint`)
       return await RyuGraphEngine.build(options, migrations, backupCreated, walQuarantined)
     }
   }
@@ -516,6 +527,11 @@ export class RyuGraphEngine implements StorageEngine {
       writeSchemaSidecar(this.graphDir, applied)
     }
     this.schemaVersionValue = applied
+    // Migration writes ride the lane above but never pass through the public
+    // write methods, so mark the store dirty ourselves — otherwise an idle
+    // post-migration session never flushes the boot burst and the config.ts
+    // "loss bounded to one interval" promise would not hold for it.
+    if (pending.length > 0) this.dirtySinceCheckpoint = true
     if (pending.length === 0 && readSchemaSidecar(this.graphDir) !== applied) {
       writeSchemaSidecar(this.graphDir, applied)
     }
@@ -536,11 +552,15 @@ export class RyuGraphEngine implements StorageEngine {
   /**
    * Start the periodic WAL→db checkpoint. Dirty-gated (an idle app never
    * flushes) and lane-serialized (never races a write or a vector-index
-   * rebuild). unref'd so it can never hold the process open, and cleared in
-   * close(). A failed checkpoint is non-fatal — WAL replay still recovers on the
-   * next open — so it re-marks dirty and retries on the next tick. This keeps the
-   * WAL small so a hard kill loses at most one interval of writes, and reduces
-   * the torn-WAL exposure the open-time recovery guards against.
+   * rebuild; reads on readConn DO proceed concurrently — probe-verified safe on
+   * 25.9.1: CHECKPOINT succeeds alongside in-flight reads, provided a
+   * QueryResult is never held unmaterialized across it, which run() guarantees
+   * by calling getAll() in the same microtask chain). unref'd so it can never
+   * hold the process open, and cleared in close(). A failed checkpoint is
+   * non-fatal — WAL replay still recovers on the next open — so it re-marks
+   * dirty and retries on the next tick. This keeps the WAL small so a hard kill
+   * loses at most one interval of writes, and reduces the torn-WAL exposure the
+   * open-time recovery guards against.
    */
   private startCheckpointTimer(intervalMs: number): void {
     if (!Number.isFinite(intervalMs) || intervalMs <= 0) return
