@@ -67,6 +67,11 @@ export const statusColor: Readonly<Record<string, keyof typeof color>> = {
   'quota-exhausted': 'warn',
   // runner fallback (phase 21) — subscription down, reasoning degraded-but-working (NOT err)
   fallback: 'warn',
+  // app updater (Settings "Updates") — 'idle'/'disabled' stay unmapped (neutral)
+  checking: 'accent',
+  'up-to-date': 'ok',
+  downloading: 'accent',
+  downloaded: 'ok',
   // skill versions
   active: 'ok',
   candidate: 'warn',

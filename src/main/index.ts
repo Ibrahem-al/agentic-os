@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import {
+  IPC_EVENT_UPDATER_STATUS,
   IPC_EVENT_WINDOW_MAXIMIZE,
   IPC_WINDOW_CLOSE,
   IPC_WINDOW_IS_MAXIMIZED,
@@ -91,7 +92,7 @@ import {
   type RuleLoadResult
 } from './triggers'
 import { registerIpcHandlers } from './ipc'
-import { bootUpdater } from './updater'
+import { bootUpdater, type UpdaterController } from './updater'
 import { computeBootDiagnostics } from './bootDiagnostics'
 
 // Native modules are CJS; load them through require so the bundler leaves them
@@ -149,6 +150,13 @@ void mcpClientManager
 let extractionAgent: ExtractionAgent | null = null
 /** Skill-improvement agent (phase 12) — the 02:00 slot + "improve now" drive it. */
 let skillImprovementAgent: SkillImprovementAgent | null = null
+/**
+ * Auto-updater controller (phase 13, extended). Built by bootUpdater() before
+ * bootIpc so the `updater.*` IPC channels can read its snapshot; its
+ * onStatusChange is forwarded to the window(s) over IPC_EVENT_UPDATER_STATUS.
+ * 'disabled' (no-op) in dev builds.
+ */
+let updaterController: UpdaterController | null = null
 /** Trigger runtime (phase 11): queue + schedules + watchers + session-end. */
 let triggerInstances: {
   queue: DurableTaskQueue
@@ -863,6 +871,10 @@ function bootIpc(): void {
     // Phase-21: the live router fills runner.status's effectiveBackend — where a
     // subscription-eligible role lands while the runner is falling back.
     router: providerRouter,
+    // Settings "Updates" section: the auto-updater controller backs
+    // updater.status / updater.check / updater.install. Built just before this in
+    // whenReady; null in dev where it reports the disabled snapshot.
+    updater: updaterController,
     userDataDir,
     // Phase-16b (P1.1): the settings mutators (save / setApiKey / clearApiKey)
     // fire this after a successful change so boot drops the router's cached
@@ -1031,15 +1043,29 @@ void app.whenReady().then(async () => {
     recordBootError('triggers', err)
     console.error('[triggers] triggers boot FAILED', err)
   }
+  // Phase 13: background auto-update (log-only; no-op in dev builds). An
+  // installed update runs migrations WITH the pre-migration backup at its
+  // first boot (§3/§21.9 — proven by scripts/smoke/packaged-smoke.mjs). Built
+  // BEFORE bootIpc so the updater.* channels read its snapshot; onStatusChange
+  // is forwarded to the window(s) for the Settings "Updates" section (mirrors
+  // how ingest/ollama progress is pushed). bootUpdater never throws — the guard
+  // is belt-and-braces. Pushes before a window exists are simply dropped; the
+  // renderer seeds itself from updater.status on mount, then rides the pushes.
+  try {
+    updaterController = bootUpdater()
+    updaterController.onStatusChange((status) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) win.webContents.send(IPC_EVENT_UPDATER_STATUS, status)
+      }
+    })
+  } catch (err) {
+    console.error('[updater] updater boot FAILED', err)
+  }
   try {
     bootIpc()
   } catch (err) {
     console.error('[ipc] dashboard IPC boot FAILED', err)
   }
-  // Phase 13: background auto-update (log-only; no-op in dev builds). An
-  // installed update runs migrations WITH the pre-migration backup at its
-  // first boot (§3/§21.9 — proven by scripts/smoke/packaged-smoke.mjs).
-  bootUpdater()
 
   registerWindowControlIpc()
   createWindow()

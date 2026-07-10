@@ -506,6 +506,42 @@ export interface RunnerTestConnectionDto {
   readonly message: string
 }
 
+// ── app updater (Settings "Updates" section) ──────────────────────────────────
+
+/**
+ * Auto-updater lifecycle state. 'disabled' covers dev builds (not packaged) and
+ * an unavailable updater — the reason rides in `detail`. 'error' carries the
+ * operator-readable failure in `error`. The download states carry live progress.
+ */
+export type UpdaterStateDto =
+  | 'disabled'
+  | 'idle'
+  | 'checking'
+  | 'up-to-date'
+  | 'downloading'
+  | 'downloaded'
+  | 'error'
+
+/**
+ * A snapshot of the auto-updater (src/main/updater.ts controller). Returned by
+ * the `updater.*` channels and pushed over IPC_EVENT_UPDATER_STATUS on every
+ * state transition (download-progress ticks throttled to ~4/second).
+ */
+export interface UpdaterStatusDto {
+  readonly state: UpdaterStateDto
+  /** The available/downloaded/installed version when known. */
+  readonly version?: string
+  /** Download progress 0–100. */
+  readonly percent?: number
+  readonly bytesPerSecond?: number
+  readonly transferred?: number
+  readonly total?: number
+  /** Operator-readable failure message for state 'error'. */
+  readonly error?: string
+  /** Why the updater is 'disabled' (dev build / unavailable). */
+  readonly detail?: string
+}
+
 // ── triggers & automation (phase 11) ─────────────────────────────────────────
 
 export interface ScheduleStatusDto {
@@ -630,6 +666,13 @@ export interface IpcChannels {
   'runner.status': { req: void; res: RunnerStatusDto }
   /** Manual 1-turn canary — user-triggered only, NEVER scheduled (§3.7). */
   'runner.testConnection': { req: void; res: RunnerTestConnectionDto }
+
+  /** Current auto-updater snapshot (Settings "Updates" section). */
+  'updater.status': { req: void; res: UpdaterStatusDto }
+  /** Trigger a manual update check (no-op while already checking/downloading). */
+  'updater.check': { req: void; res: UpdaterStatusDto }
+  /** Restart-to-install a downloaded update (user-confirmed in the UI first). */
+  'updater.install': { req: void; res: UpdaterStatusDto }
 }
 
 export type IpcChannel = keyof IpcChannels
@@ -639,6 +682,8 @@ export type IpcResponse<C extends IpcChannel> = IpcChannels[C]['res']
 /** Fire-and-forget events pushed main → renderer (webContents.send). */
 export const IPC_EVENT_INGEST_PROGRESS = 'event.ingest.progress'
 export const IPC_EVENT_OLLAMA_PULL = 'event.ollama.pull'
+/** Auto-updater snapshot pushes (main → renderer) — mirrors the ingest/ollama events. */
+export const IPC_EVENT_UPDATER_STATUS = 'event.updater.status'
 
 /** Prefix every invokable channel rides under (namespacing + preload filter). */
 export const IPC_INVOKE_PREFIX = 'agentic-os:'

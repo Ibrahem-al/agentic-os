@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import {
   IPC_EVENT_INGEST_PROGRESS,
   IPC_EVENT_OLLAMA_PULL,
+  IPC_EVENT_UPDATER_STATUS,
   IPC_EVENT_WINDOW_MAXIMIZE,
   IPC_INVOKE_PREFIX,
   IPC_WINDOW_CLOSE,
@@ -13,7 +14,8 @@ import {
   type IpcRequest,
   type IpcResponse,
   type IpcResult,
-  type OllamaPullProgressDto
+  type OllamaPullProgressDto,
+  type UpdaterStatusDto
 } from '../shared/ipc'
 
 /**
@@ -44,6 +46,8 @@ const api = {
   onIngestProgress: subscribe<IngestProgressEventDto>(IPC_EVENT_INGEST_PROGRESS),
   /** Subscribe to Ollama model-pull progress pushes; returns unsubscribe. */
   onOllamaPull: subscribe<OllamaPullProgressDto>(IPC_EVENT_OLLAMA_PULL),
+  /** Subscribe to auto-updater status pushes (Settings "Updates"); returns unsubscribe. */
+  onUpdaterStatus: subscribe<UpdaterStatusDto>(IPC_EVENT_UPDATER_STATUS),
   /**
    * Window-chrome commands for the frameless title bar. Bespoke channels (not
    * the IpcChannels invoke map): OS window commands + chrome state, not DTOs.
