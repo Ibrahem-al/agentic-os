@@ -1,7 +1,8 @@
 # Design
 
-Visual system for the Agentic OS dashboard (phase 10). Register: product. Dials: VARIANCE 4 · MOTION 2 · DENSITY 7.
-Theme: **dark, locked** (single-theme app; scene: operator's second monitor, low ambient light, long sessions). No light mode in v1 — the window itself declares `color-scheme: dark`.
+Visual system for the Agentic OS dashboard. Register: product. Dials: VARIANCE 4 · MOTION 2 · DENSITY 7 → ~5.
+**Approachability pass (UI redesign):** the audience now includes less technical people, so density is dialed from 7 toward ~5 — plain-English labels lead, technical terms move behind tooltips/"Details", and overviews are visualization-first. Keep the instrument-panel honesty (truthful state, deliberate destructive actions); lose the cockpit clutter. The color system below is unchanged.
+Theme: **dark, locked** (single-theme app; scene: low ambient light, long sessions). No light mode in v1 — the window itself declares `color-scheme: dark`.
 
 ## Color (OKLCH; anchor seed hue 268 — "considered indigo behind a developer's keyboard at 11pm")
 
@@ -36,15 +37,16 @@ Scale (px): 11 (dense meta, mono only), 12 (table body, badges), 13 (default UI 
 
 ## Layout
 
-- App shell: fixed left rail 216px (nav: 9 panels + boot status footer), content area `min-w-0` with per-panel header row (title + primary action) and scrollable body. Content max-width none — density wins, tables stretch.
-- Spacing grid 4px. Table rows 34–36px; cell padding 8×10px; panel gutter 16–20px; section gaps 24px (VARIANCE 4: left-aligned headers over full-bleed data, occasional 2fr/1fr master-detail splits — no perfect symmetry, no masonry).
-- Cards banned for data (DENSITY 7): tables + hairlines + background tint zones. The only rounded containers: inputs, badges, buttons, modals (radius 6px everywhere — one radius system; badges pill).
+- App shell: fixed left rail 216–232px, content area `min-w-0` with per-panel header row (title + one-line plain subtitle + primary action) and scrollable body. Content max-width none — tables stretch.
+- Nav is **grouped**, not a flat list: **Home** (default on launch, the visualization-first overview) at top, then labelled groups **Decisions** (Approvals, History), **Knowledge** (Memory, Add knowledge, Skills), **Activity** (Background work, Agent runs, Spending), and **Settings** pinned at the bottom. Group labels are 11px medium sentence-case `ink-mute` — never tracked-caps eyebrows. Nav items are `Icon` + label, 32px tall; the boot-status footer speaks plain words ("All systems running").
+- Spacing grid 4px. Table rows ~40px; cell padding 8×10px; panel gutters roomier (20px); section gaps 24px (VARIANCE 4: left-aligned headers over full-bleed data, occasional 2fr/1fr master-detail splits — no perfect symmetry, no masonry).
+- Cards banned for data: tables + hairlines + background tint zones. Stats render as a hairline-separated **strip**, not floating cards. The only rounded containers: inputs, badges, buttons, modals, and the `bg-surface` inset of a "Details" disclosure (radius 6px everywhere — one radius system; badges pill).
 - z-scale: `sticky-header 10 · rail 20 · modal-backdrop 30 · modal 40 · toast 50`.
 
 ## Components
 
 - **Table**: sticky header row (surface bg, 11px mono uppercase-free labels, `ink-mute`), hairline row dividers, hover `raised`, selected row 2px accent inset-left via box-shadow (not border-left-stripe), numeric/id cells mono right-or-left per column, empty state = centered 13px `ink-mute` sentence + the action that populates it.
-- **Badge**: 11px mono lowercase status word, pill, tinted bg `color / 0.14` + colored text — always text + color, never dot-only.
+- **Badge**: 11px mono status pill, tinted bg `color / 0.14` + colored text — always text + color, never dot-only. Shows the **plain label** (from `lib/plain.ts`: waiting / in progress / finished / needs a look …) with the one-sentence explanation in its `title` tooltip; the RAW backend word always stays in `data-status`. Exception: on Approvals staged-write rows the raw word (`staged/approved/rejected/committed`) stays visible as the pill text, plain wording alongside.
 - **Confidence**: mono number `0.87` + 32×3px inline meter (no background track — filled portion only against `line`).
 - **Buttons**: primary = accent fill; danger = err fill (approve/undo confirm); ghost = hairline border. 28px tall dense, 32px default. `:active` translate-y 1px.
 - **Diff view**: mono 12px, `+` lines `ok`-tinted bg `ok/0.08`, `~` lines `warn/0.08`, `−` lines `err/0.08`; property diffs as `key: old → new` (the arrow is the backend's own rendering).
@@ -52,6 +54,12 @@ Scale (px): 11 (dense meta, mono only), 12 (table body, badges), 13 (default UI 
 - **Timeline (audit)**: 8px status square + action row; undone rows get `undo` badge and strikethrough-free dimming (`ink-mute`).
 - **Toasts**: bottom-right, surface bg + hairline, status-colored 3px top edge, auto-dismiss 5s except errors (sticky).
 - **Focus**: 2px accent ring, 2px offset, on every interactive element. Keyboard: arrow-row navigation in tables is nice-to-have; tab order strict.
+- **PanelHeader**: title + optional subdued `Icon` left of it + a one-line plain-English `subtitle` (12–13px `ink-mute`) under every panel title, saying in plain words what the panel is for.
+- **Disclosure** ("Details"): chevron + summary button (`aria-expanded`), children in a `bg-surface` inset. The home for ids, hashes, model names, raw JSON, and provenance — progressive disclosure, never the first thing a row says.
+- **Charts** (hand-rolled inline SVG, tokens only, `role="img"` + takeaway `aria-label`, all numerals mono, every chart has a plain-words empty state): `Sparkline` (accent line + last dot), `BarChart` (vertical bars, 2px top radius, first/last axis ticks), `MeterBar` (capacity: ok <70% / warn 70–90% / err ≥90%), `CompositionBar` (one 8px stacked part-of-whole bar + wrapping legend). `accent` = primary series; ok/warn/err only for semantic state; `line` for gridlines/tracks. No pies, no 3D, no gradient fills.
+- **StatStrip**: hairline-separated horizontal strip (NOT cards) — 20px mono value (toned only when a `tone` is set), 12px `ink-mute` sentence-case label, optional 60×20 sparkline, optional `ink-mute` hint line (`ink-faint` is banned for body/hints).
+- **Icons**: hand-drawn 16×16 inline SVG, `stroke="currentColor"`, 1.5 stroke, round caps/joins, `aria-hidden`; one consistent line set, no filled blobs. Icon-only controls carry an `aria-label`.
+- **Empty state**: plain sentence saying why it's empty and what fills it, plus an optional action and optional icon (e.g. "No memory changes waiting — when an agent proposes something, it appears here").
 
 ## Motion (MOTION 2)
 
@@ -59,4 +67,4 @@ Hover/active/focus transitions only: `background-color, border-color, opacity 12
 
 ## Voice
 
-Labels are lowercase-sentence, terse, concrete: "approve", "undo", "12 staged", "no pending approvals — agent actions that need consent will queue here". Errors verbatim from backend. No em-dashes in UI strings; hyphens fine. Timestamps: relative (`4m ago`) with absolute ISO on hover/title; mono.
+Sentence-case, plain English, concrete — written for someone who is not a developer. Prefer the plain word over the jargon: **Approvals** not "review queue", **History** not "audit log", **Spending** not "spend", **Agent runs** not "traces", **Add knowledge** not "ingest", "proposed memory change" not "staged write", "safety flag" not "injection flag", "local AI helper (Ollama)" not "embedder". The plain-language dictionary and status labels live once in `lib/plain.ts`; never restyle a status word inline per panel. Explain *why* something is empty and *what* will populate it. Technical identifiers (ids, hashes, model names, JSON) stay mono and move behind "Details" — visible on demand. Keep test-asserted strings and formats exact (`adoption mode: verifiable`, `name@version/model`, `N ingested`, the raw review status words). Errors verbatim from backend. No em-dashes in UI strings; hyphens fine. Timestamps: relative (`4m ago`) with absolute ISO on hover/title; mono.

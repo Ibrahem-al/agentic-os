@@ -4,6 +4,14 @@
  * retrievable labels, and a master-detail node inspector with edge navigation
  * and a back stack. VARIANCE 4: two-column 3fr/2fr split, each side scrolls
  * independently.
+ *
+ * Plain-language redesign: the counts lead with a CompositionBar ("what memory
+ * holds") over a labelled list where each category carries a one-line
+ * description; search hits read as text + a single "match" meter with the raw
+ * ranking signals tucked behind a Disclosure; the inspector leads with the
+ * human handle and keeps ids / complex JSON behind "Technical details". The
+ * label chip keeps its exact two-span "<Label> <count>" contract (e2e selects
+ * it by accessible name); the plain description lives in a SEPARATE element.
  */
 import { useCallback, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
@@ -20,6 +28,7 @@ import {
   Button,
   Confidence,
   DataTable,
+  Disclosure,
   EmptyState,
   ErrorState,
   KV,
@@ -30,12 +39,41 @@ import {
   Timestamp
 } from '../ui/kit'
 import type { Column } from '../ui/kit'
+import { CompositionBar } from '../ui/viz'
+import { Icon } from '../ui/icons'
 
 const PAGE_SIZE = 50
+
+/**
+ * One plain sentence per graph label so a less technical reader knows what each
+ * category actually is. Record over IpcNodeLabel keeps this exhaustive — a new
+ * label fails the build until it gets a description here.
+ */
+const LABEL_DESCRIPTIONS: Readonly<Record<IpcNodeLabel, string>> = {
+  Session: 'Past work sessions',
+  Project: 'Projects it knows',
+  Skill: 'Learned abilities',
+  SkillVersion: 'Skill revisions',
+  Example: 'Examples it learned from',
+  Correction: 'Corrections you made',
+  Preference: 'Your preferences',
+  MCP: 'Technical building blocks',
+  Plugin: 'Technical building blocks',
+  Component: 'Technical building blocks',
+  Document: 'Documents added',
+  Knowledge: 'Facts and notes',
+  Tag: 'Labels'
+}
+
+// Cycled across the composition segments so adjacent categories stay distinct;
+// tokens only (see viz CompTint), never semantic here — memory holds no state.
+const COMP_TINTS = ['accent', 'ok', 'warn', 'undo', 'mute'] as const
 
 interface NodeRef {
   readonly label: IpcNodeLabel
   readonly id: string
+  /** Human handle carried from the list row / edge so the inspector can lead with it. */
+  readonly display?: string
 }
 
 interface ListState {
@@ -59,6 +97,11 @@ function toIpcError(err: unknown): IpcError {
 
 function nodeKey(ref: { readonly label: IpcNodeLabel; readonly id: string }): string {
   return `${ref.label}:${ref.id}`
+}
+
+/** Raw graph edge/prop token → plain lowercase words ("RELATES_TO" → "relates to"). */
+function plainWords(raw: string): string {
+  return raw.toLowerCase().replace(/_/g, ' ')
 }
 
 // ── prop rendering ────────────────────────────────────────────────────────────
@@ -92,10 +135,12 @@ function groupEdges(edges: readonly MemoryEdgeDto[]): readonly (readonly [string
 
 function EdgeSection({
   title,
+  emptyText,
   edges,
   onNavigate
 }: {
   title: string
+  emptyText: string
   edges: readonly MemoryEdgeDto[]
   onNavigate: (ref: NodeRef) => void
 }): React.JSX.Element {
@@ -103,17 +148,20 @@ function EdgeSection({
     <section className="mt-5">
       <SectionHeader meta={edges.length === 0 ? undefined : String(edges.length)}>{title}</SectionHeader>
       {edges.length === 0 ? (
-        <div className="text-[12px] text-ink-mute">no {title} edges</div>
+        <div className="text-[12px] text-ink-mute">{emptyText}</div>
       ) : (
         groupEdges(edges).map(([type, group]) => (
           <div key={type} className="mb-3">
-            <div className="border-b border-line pb-1 font-mono text-[11px] text-ink-mute">{type}</div>
+            <div className="border-b border-line pb-1 text-[12px] text-ink-mute">{plainWords(type)}</div>
             <ul>
               {group.map((edge, i) => {
+                // Provenance (where the edge came from) rides in the tooltip — a
+                // technical id, not the first thing the row should say.
                 const extractedBy =
                   typeof edge.props['extracted_by'] === 'string' ? edge.props['extracted_by'] : null
                 const confidence =
                   typeof edge.props['confidence'] === 'number' ? edge.props['confidence'] : null
+                const detail = extractedBy !== null ? `${nodeKey(edge)} · ${extractedBy}` : nodeKey(edge)
                 return (
                   <li
                     key={`${edge.label}:${edge.id}:${i}`}
@@ -121,16 +169,12 @@ function EdgeSection({
                   >
                     <button
                       type="button"
-                      onClick={() => onNavigate({ label: edge.label, id: edge.id })}
+                      onClick={() => onNavigate({ label: edge.label, id: edge.id, display: edge.display })}
                       className="min-w-0 cursor-pointer text-left text-[12px] text-accent transition-colors duration-120 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-                      title={nodeKey(edge)}
+                      title={detail}
                     >
                       {truncate(edge.display, 120)}
                     </button>
-                    <span className="font-mono text-[11px] text-ink-faint">{edge.label}</span>
-                    {extractedBy !== null && (
-                      <span className="font-mono text-[11px] text-ink-mute">{extractedBy}</span>
-                    )}
                     {confidence !== null && <Confidence value={confidence} />}
                   </li>
                 )
@@ -163,34 +207,60 @@ function Inspector({
   const node = detail.data
   const extractedBy = typeof node.props['extracted_by'] === 'string' ? node.props['extracted_by'] : null
   const confidence = typeof node.props['confidence'] === 'number' ? node.props['confidence'] : null
-  const entries = Object.entries(node.props)
-    .filter(([key, value]) => value !== null && key !== 'extracted_by' && key !== 'confidence')
-    .map(([key, value]) => ({ k: key, v: renderPropValue(key, value) }))
+  const entries = Object.entries(node.props).filter(
+    ([key, value]) => value !== null && key !== 'extracted_by' && key !== 'confidence'
+  )
+  // Plain-first: primitive props read in the KV; nested JSON is technical detail.
+  const simple = entries.filter(([, value]) => typeof value !== 'object')
+  const complex = entries.filter(([, value]) => typeof value === 'object')
+  const heading = nodeRef.display ?? node.id
 
   return (
     <div className="px-4 py-3">
       <div className="flex items-center gap-2.5">
         {canBack && <Button onClick={onBack}>back</Button>}
-        <span className="font-mono text-[12px] text-ink-mute">{node.label}</span>
+        <span className="text-[12px] text-ink-mute">{node.label}</span>
       </div>
-      <div className="mt-1.5 font-mono text-[12px] break-all">{node.id}</div>
+      <div className="mt-1.5 text-[14px] break-words">{heading}</div>
       {(extractedBy !== null || confidence !== null) && (
-        <div className="mt-2.5 flex flex-wrap items-center gap-2.5 border-b border-line pb-2.5">
+        <div className="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 border-b border-line pb-2.5 text-[12px] text-ink-mute">
           {extractedBy !== null && (
-            <span className="font-mono text-[11px] text-ink-mute">{extractedBy}</span>
+            <span>
+              where this came from: <span className="font-mono text-[11px]">{extractedBy}</span>
+            </span>
           )}
           {confidence !== null && <Confidence value={confidence} />}
         </div>
       )}
       <div className="mt-3">
-        {entries.length === 0 ? (
-          <div className="text-[12px] text-ink-mute">no properties</div>
+        {simple.length === 0 ? (
+          <div className="text-[12px] text-ink-mute">Nothing else is recorded about this.</div>
         ) : (
-          <KV entries={entries} />
+          <KV entries={simple.map(([key, value]) => ({ k: plainWords(key), v: renderPropValue(key, value) }))} />
         )}
       </div>
-      <EdgeSection title="outgoing" edges={node.outgoing} onNavigate={onNavigate} />
-      <EdgeSection title="incoming" edges={node.incoming} onNavigate={onNavigate} />
+      {complex.length > 0 && (
+        <div className="mt-3">
+          <Disclosure summary="Technical details">
+            <div className="mb-2 text-[12px] text-ink-mute">
+              id <span className="font-mono break-all">{node.id}</span>
+            </div>
+            <KV entries={complex.map(([key, value]) => ({ k: key, v: renderPropValue(key, value) }))} />
+          </Disclosure>
+        </div>
+      )}
+      <EdgeSection
+        title="Connected to"
+        emptyText="This isn't connected to anything else yet."
+        edges={node.outgoing}
+        onNavigate={onNavigate}
+      />
+      <EdgeSection
+        title="Connected from"
+        emptyText="Nothing else points to this yet."
+        edges={node.incoming}
+        onNavigate={onNavigate}
+      />
     </div>
   )
 }
@@ -200,34 +270,14 @@ function Inspector({
 const LIST_COLUMNS: readonly Column<MemoryNodeSummaryDto>[] = [
   {
     key: 'display',
-    header: 'display',
+    header: 'what it is',
     render: (row) => <span>{truncate(row.display, 160)}</span>
   },
   {
     key: 'updated',
-    header: 'updated',
+    header: 'last updated',
     className: 'whitespace-nowrap',
     render: (row) => <Timestamp iso={row.updatedAt} />
-  }
-]
-
-const SEARCH_COLUMNS: readonly Column<MemorySearchHitDto>[] = [
-  {
-    key: 'label',
-    header: 'label',
-    className: 'whitespace-nowrap',
-    render: (hit) => <span className="font-mono text-[11px] text-ink-mute">{hit.label}</span>
-  },
-  {
-    key: 'text',
-    header: 'text',
-    render: (hit) => <span>{truncate(hit.text, 160)}</span>
-  },
-  {
-    key: 'score',
-    header: 'rerank',
-    className: 'text-right whitespace-nowrap',
-    render: (hit) => <span className="font-mono">{hit.rerankScore.toFixed(2)}</span>
   }
 ]
 
@@ -311,30 +361,50 @@ export default function MemoryPanel(): React.JSX.Element {
   } else if (counts.data === null) {
     browseBody = <LoadingRows rows={6} />
   } else {
+    const total = counts.data.reduce((sum, c) => sum + c.count, 0)
+    const segments = counts.data.map((c, i) => ({
+      label: c.label,
+      count: c.count,
+      tint: COMP_TINTS[i % COMP_TINTS.length] ?? 'accent'
+    }))
     browseBody = (
       <>
-        <div className="flex flex-wrap gap-1.5 px-4 py-3">
+        <div className="border-b border-line px-4 py-3">
+          <CompositionBar segments={segments} ariaLabel="What memory holds" />
+          <div className="mt-2 text-[12px] text-ink-mute">
+            {total === 0
+              ? 'Nothing remembered yet.'
+              : `${total.toLocaleString()} ${total === 1 ? 'thing' : 'things'} remembered`}
+          </div>
+        </div>
+        <div className="flex flex-col gap-1 px-4 py-3">
           {counts.data.map((c) => {
             const selected = list !== null && list.label === c.label
             return (
-              <button
-                key={c.label}
-                type="button"
-                onClick={() => loadPage(c.label, [])}
-                className={`flex cursor-pointer items-baseline gap-1.5 rounded-md px-2 py-1 text-[12px] transition-colors duration-120 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent ${
-                  selected
-                    ? 'bg-raised text-ink shadow-[inset_2px_0_0_var(--color-accent)]'
-                    : 'text-ink-mute hover:bg-raised hover:text-ink'
-                }`}
-              >
-                <span>{c.label}</span>
-                <span className="font-mono text-[11px]">{c.count}</span>
-              </button>
+              <div key={c.label}>
+                {/* Two spans only, no extra content — e2e selects this button by its
+                    "<Label> <count>" accessible name (a title does not change that).
+                    The plain description moves into the tooltip to keep the list
+                    compact instead of an always-visible line under every chip. */}
+                <button
+                  type="button"
+                  onClick={() => loadPage(c.label, [])}
+                  title={LABEL_DESCRIPTIONS[c.label]}
+                  className={`inline-flex cursor-pointer items-baseline gap-1.5 rounded-md px-2 py-1 text-[12px] transition-colors duration-120 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent ${
+                    selected
+                      ? 'bg-raised text-ink shadow-[inset_2px_0_0_var(--color-accent)]'
+                      : 'text-ink-mute hover:bg-raised hover:text-ink'
+                  }`}
+                >
+                  <span>{c.label}</span>
+                  <span className="font-mono text-[11px]">{c.count}</span>
+                </button>
+              </div>
             )
           })}
         </div>
         {list === null ? (
-          <EmptyState>pick a label above to list its nodes, or search</EmptyState>
+          <EmptyState>Pick a category above to see what&apos;s in it, or search everything.</EmptyState>
         ) : (
           <>
             <div className="px-4">
@@ -357,12 +427,12 @@ export default function MemoryPanel(): React.JSX.Element {
               rowKey={nodeKey}
               onRowClick={inspect}
               selectedKey={currentKey}
-              empty={list.loading ? 'loading' : `no ${list.label} nodes yet`}
+              empty={list.loading ? 'loading' : `Nothing under ${list.label} yet.`}
             />
             {list.loading && <LoadingRows rows={3} />}
             {!list.loading && list.rows.length < list.total && (
               <div className="px-4 py-3">
-                <Button onClick={() => loadPage(list.label, list.rows)}>load more</Button>
+                <Button onClick={() => loadPage(list.label, list.rows)}>Show more</Button>
               </div>
             )}
           </>
@@ -383,19 +453,62 @@ export default function MemoryPanel(): React.JSX.Element {
         <>
           <div className="px-4">
             <SectionHeader
-              meta={<span className="font-mono text-[11px]">{hits.length} hits</span>}
+              meta={
+                <span className="font-mono text-[11px]">
+                  {hits.length} {hits.length === 1 ? 'match' : 'matches'}
+                </span>
+              }
             >
-              results for &apos;{search.query}&apos;
+              Results for &apos;{search.query}&apos;
             </SectionHeader>
           </div>
-          <DataTable
-            columns={SEARCH_COLUMNS}
-            rows={hits}
-            rowKey={nodeKey}
-            onRowClick={inspect}
-            selectedKey={currentKey}
-            empty={`no hits for '${search.query}' in memory`}
-          />
+          {hits.length === 0 ? (
+            <EmptyState>Nothing matched &apos;{search.query}&apos;. Try different words.</EmptyState>
+          ) : (
+            <ul>
+              {hits.map((hit) => {
+                const key = nodeKey(hit)
+                const selected = currentKey === key
+                return (
+                  <li
+                    key={key}
+                    data-rowkey={key}
+                    className={`border-b border-line px-4 py-3 ${
+                      selected ? 'bg-raised shadow-[inset_2px_0_0_var(--color-accent)]' : ''
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => inspect({ label: hit.label, id: hit.id, display: hit.text })}
+                      className="block w-full cursor-pointer text-left text-[13px] break-words transition-colors duration-120 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                    >
+                      {truncate(hit.text, 200)}
+                    </button>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-ink-mute">
+                      <span className="inline-flex items-center gap-1.5">
+                        match <Confidence value={hit.rerankScore} />
+                      </span>
+                      <span>{hit.label}</span>
+                    </div>
+                    <div className="mt-1">
+                      <Disclosure summary="How this matched">
+                        <div className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 text-[12px]">
+                          <span className="text-ink-mute">meaning match (vector)</span>
+                          <span className="text-right font-mono">{hit.signals.vector.toFixed(3)}</span>
+                          <span className="text-ink-mute">word match (keyword)</span>
+                          <span className="text-right font-mono">{hit.signals.keyword.toFixed(3)}</span>
+                          <span className="text-ink-mute">related in memory (graph)</span>
+                          <span className="text-right font-mono">{hit.signals.graph.toFixed(3)}</span>
+                          <span className="text-ink-mute">combined score (fused)</span>
+                          <span className="text-right font-mono">{hit.fusedScore.toFixed(3)}</span>
+                        </div>
+                      </Disclosure>
+                    </div>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
         </>
       )
     }
@@ -404,14 +517,16 @@ export default function MemoryPanel(): React.JSX.Element {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <PanelHeader
-        title="memory"
+        title="Memory"
+        subtitle="Everything your assistant knows and remembers"
+        icon={<Icon name="memory" size={18} />}
         actions={
           <>
             <TextInput
               value={query}
               onChange={setQuery}
-              placeholder="search memory (vector + keyword + rerank)"
-              ariaLabel="search memory"
+              placeholder="Search everything it knows…"
+              ariaLabel="Search everything it knows"
               testId="memory-search-input"
               onEnter={() => runSearch(query)}
               width="w-80"
@@ -426,7 +541,7 @@ export default function MemoryPanel(): React.JSX.Element {
         </div>
         <div className="min-h-0 overflow-y-auto" data-testid="memory-inspector">
           {current === undefined ? (
-            <EmptyState>select a node to inspect it</EmptyState>
+            <EmptyState>Pick something on the left to see its details.</EmptyState>
           ) : (
             <Inspector
               nodeRef={current}

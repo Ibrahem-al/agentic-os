@@ -1,14 +1,21 @@
 /**
- * Review queue (phase 10) — the §13 safety surface. Three stacked sections
- * over the security spine: staged writes (approve → commit / reject with the
- * human diff shown first), queued agent approvals (allow / deny), and
- * injection-scanner flags (advisory; content already stored as inert data).
- * Destructive actions always show what will change (PRODUCT.md principle 3).
+ * Approvals (phase 10, plain-language redesign §P2) — the §13 safety surface,
+ * re-presented for less technical people. Three plain sections over the same
+ * security spine: memory changes an agent proposed (approve → commit / decline,
+ * with the human diff shown first), permission requests an agent is waiting on
+ * (allow / decline), and safety flags (advisory; the content is already stored
+ * as inert data). Destructive actions always show what will change first
+ * (PRODUCT.md principle 3).
  *
- * Phase 20 (P1.7) adds batch review UX: staged writes group by source session
- * with a per-group "approve all", and the approve path preflights Ollama —
- * new-Preference extraction creates embed at commit (embedOnCommit), so with
- * Ollama down the approve is disabled with a plain-language reason rather than
+ * The register shifted (approachability over density) but the honesty did not:
+ * rows lead with a plain sentence, the RAW status words stay visible on memory-
+ * change rows (constraint 5), and every technical identifier moves behind a
+ * "Details" disclosure — visible on demand, never the first thing a row says.
+ *
+ * Phase 20 (P1.7) batch review is preserved: staged writes group by source
+ * session with a per-group "approve all", and the approve path preflights Ollama
+ * — a new-preference extraction embeds at commit (embedOnCommit), so with the
+ * local AI helper down the approve is disabled with a plain reason rather than
  * failing at commit (§9.2: warn, not error).
  */
 import { useState } from 'react'
@@ -22,11 +29,13 @@ import type {
 } from '../../../shared/ipc'
 import { call, useIpc } from '../lib/ipc'
 import { truncate, usd } from '../lib/format'
+import { dayKey, lastNDays, plainStatus, plural } from '../lib/plain'
 import {
   Badge,
   Button,
   Confidence,
   DataTable,
+  Disclosure,
   EmptyState,
   ErrorState,
   KV,
@@ -39,6 +48,8 @@ import {
   useToast
 } from '../ui/kit'
 import type { Column } from '../ui/kit'
+import { Icon } from '../ui/icons'
+import { BarChart } from '../ui/viz'
 
 // ── JsonValue narrowing (StagedWriteDto.payload is JsonObject) ───────────────
 
@@ -76,7 +87,7 @@ function sourceSessionOf(row: StagedWriteDto): string | null {
   return asString(row.payload['session']) ?? asString(row.payload['sessionId'])
 }
 
-/** One-line human handle for a staged write in the batch-confirm list. */
+/** One-line human handle for a staged write (the statement/evidence/reason). */
 function summaryOf(row: StagedWriteDto): string {
   const node = asObject(row.payload['node'])
   const props = node !== null ? asObject(node['props']) : null
@@ -91,6 +102,29 @@ function summaryOf(row: StagedWriteDto): string {
     row.targetId ??
     row.id
   )
+}
+
+/** The plain verb for a staged write's operation (create/update/delete). */
+function verbFor(row: StagedWriteDto): string {
+  const op = asString(row.payload['op'])
+  if (op === 'create') return 'Add a new'
+  if (op === 'update' || op === 'patch') return 'Update'
+  if (op === 'delete' || op === 'remove') return 'Remove'
+  if (row.kind === 'correction') return 'Correct'
+  return 'Change'
+}
+
+/**
+ * A plain sentence for a memory-change row: verb + what it touches + the
+ * statement in quotes when there is a real one (summaryOf falls back to an id,
+ * which we never quote at the user).
+ */
+function describeStaged(row: StagedWriteDto): string {
+  const target = row.targetLabel ?? 'memory'
+  const head = `${verbFor(row)} ${target}`
+  const summary = summaryOf(row)
+  const hasStatement = summary !== row.id && summary !== row.targetId
+  return hasStatement ? `${head} — “${truncate(summary, 80)}”` : head
 }
 
 function diffLineClass(line: string): string {
@@ -132,37 +166,47 @@ function slug(key: string): string {
   return key.replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '')
 }
 
-// ── static columns (no closures needed) ───────────────────────────────────────
+/** Staged writes per day over the last week, for the small trend chart. */
+function stagedPerDay(rows: readonly StagedWriteDto[]): { label: string; value: number }[] {
+  const days = lastNDays(7)
+  const byDay = new Map<string, number>(days.map((d) => [d, 0]))
+  for (const row of rows) {
+    const key = dayKey(row.createdAt)
+    if (byDay.has(key)) byDay.set(key, (byDay.get(key) ?? 0) + 1)
+  }
+  return days.map((d) => ({ label: d.slice(5), value: byDay.get(d) ?? 0 }))
+}
 
+// ── memory-change columns (raw kind + raw status stay visible) ────────────────
+
+// The `change` cell leads with a plain sentence; its second line keeps the raw
+// `kind` word (golden-path asserts a row toContainText('extraction')) and the
+// proposer. The status Badge keeps the RAW word visible per constraint 5, with
+// the plain explanation in its tooltip.
 const STAGED_COLUMNS: readonly Column<StagedWriteDto>[] = [
   {
-    key: 'id',
-    header: 'id',
-    className: 'font-mono whitespace-nowrap',
-    render: (row) => <span title={row.id}>{row.id.slice(0, 10)}</span>
-  },
-  { key: 'kind', header: 'kind', render: (row) => row.kind },
-  { key: 'proposedBy', header: 'proposed by', className: 'font-mono', render: (row) => row.proposedBy },
-  {
-    key: 'target',
-    header: 'target',
-    render: (row) =>
-      row.targetLabel === null && row.targetId === null ? (
-        '-'
-      ) : (
-        <span>
-          {row.targetLabel ?? ''}{' '}
-          <span className="font-mono text-ink-mute">{row.targetId ?? ''}</span>
+    key: 'change',
+    header: 'change',
+    render: (row) => (
+      <div className="flex flex-col gap-0.5">
+        <span className="text-[13px] leading-5 text-ink">{describeStaged(row)}</span>
+        <span className="font-mono text-[11px] text-ink-mute">
+          {row.kind} · proposed by {row.proposedBy}
         </span>
-      )
+      </div>
+    )
   },
-  { key: 'created', header: 'created', render: (row) => <Timestamp iso={row.createdAt} /> },
-  { key: 'status', header: 'status', render: (row) => <Badge status={row.status} /> }
+  {
+    key: 'status',
+    header: 'status',
+    render: (row) => <Badge status={row.status} title={plainStatus(row.status).explain} />
+  },
+  { key: 'created', header: 'created', render: (row) => <Timestamp iso={row.createdAt} /> }
 ]
 
 /** Compact columns for the batch-approve confirm list (what will commit). */
 const APPROVE_ALL_COLUMNS: readonly Column<StagedWriteDto>[] = [
-  { key: 'kind', header: 'kind', render: (row) => row.kind },
+  { key: 'kind', header: 'kind', className: 'font-mono', render: (row) => row.kind },
   {
     key: 'target',
     header: 'target',
@@ -179,41 +223,25 @@ const APPROVE_ALL_COLUMNS: readonly Column<StagedWriteDto>[] = [
   }
 ]
 
-const FLAG_COLUMNS: readonly Column<InjectionFlagDto>[] = [
-  {
-    key: 'source',
-    header: 'source',
-    className: 'font-mono',
-    render: (row) => <span title={row.source}>{truncate(row.source, 48)}</span>
-  },
-  { key: 'detector', header: 'detector', render: (row) => <Badge status="flagged" label={row.detector} /> },
-  { key: 'pattern', header: 'pattern', className: 'font-mono', render: (row) => row.pattern },
-  {
-    key: 'excerpt',
-    header: 'excerpt',
-    render: (row) => <span title={row.excerpt}>{truncate(row.excerpt, 100)}</span>
-  },
-  { key: 'created', header: 'created', render: (row) => <Timestamp iso={row.createdAt} /> }
-]
-
 const STAGED_FILTER_OPTIONS = [
-  { value: 'staged', label: 'staged' },
+  { value: 'staged', label: 'waiting for review' },
   { value: 'approved', label: 'approved' },
-  { value: 'rejected', label: 'rejected' },
-  { value: 'committed', label: 'committed' },
+  { value: 'rejected', label: 'declined' },
+  { value: 'committed', label: 'saved' },
   { value: 'all', label: 'all' }
 ] as const
 
 const APPROVAL_FILTER_OPTIONS = [
-  { value: 'pending', label: 'pending' },
+  { value: 'pending', label: 'waiting' },
   { value: 'approved', label: 'approved' },
-  { value: 'denied', label: 'denied' },
+  { value: 'denied', label: 'declined' },
   { value: 'all', label: 'all' }
 ] as const
 
-const OLLAMA_REQUIRED_MSG = 'Ollama required to commit this item'
+// Button tooltip when a new-preference commit needs the local AI helper.
+const OLLAMA_BLOCKED_TITLE = 'Needs the local AI helper (Ollama), which looks offline right now.'
 
-// ── staged write modal ────────────────────────────────────────────────────────
+// ── memory-change modal ───────────────────────────────────────────────────────
 
 function StagedWriteModal({
   row,
@@ -241,11 +269,12 @@ function StagedWriteModal({
   const session = asString(payload['session']) ?? asString(payload['sessionId'])
   const reason = asString(payload['reason'])
   const commitError = row.validation !== null ? asString(row.validation['commitError']) : null
-  const hasProvenance = extractedBy !== null || confidence !== null || evidence !== null || session !== null
+  const hasProvenance = extractedBy !== null || confidence !== null || session !== null
 
   // Ollama preflight (P1.7): a new-Preference extraction embeds at commit, so a
   // known-down Ollama blocks the commit up front. Unknown status fails open.
   const blocked = requiresEmbedder(row) && ollamaReady === false
+  const plain = plainStatus(row.status)
 
   async function approve(): Promise<void> {
     setBusy(true)
@@ -255,7 +284,7 @@ function StagedWriteModal({
       onClose()
       onChanged()
     } catch (err) {
-      // Keep the modal open so the operator can retry or reject.
+      // Keep the modal open so the operator can retry or decline.
       toast.notify('err', errText(err))
     } finally {
       setBusy(false)
@@ -266,7 +295,7 @@ function StagedWriteModal({
     setBusy(true)
     try {
       await call('review.staged.reject', { id: row.id })
-      toast.notify('ok', 'rejected')
+      toast.notify('ok', 'Change declined.')
       onClose()
       onChanged()
     } catch (err) {
@@ -279,17 +308,17 @@ function StagedWriteModal({
   const footer =
     row.status === 'staged' ? (
       <>
-        <Button variant="danger" testId="staged-reject" disabled={busy} onClick={() => void reject()}>
-          reject
+        <Button variant="danger-ghost" testId="staged-reject" disabled={busy} onClick={() => void reject()}>
+          Decline
         </Button>
         <Button
           variant="primary"
           testId="staged-approve"
           disabled={busy || blocked}
-          {...(blocked ? { title: OLLAMA_REQUIRED_MSG } : {})}
+          {...(blocked ? { title: OLLAMA_BLOCKED_TITLE } : {})}
           onClick={() => void approve()}
         >
-          approve
+          Approve
         </Button>
       </>
     ) : row.status === 'approved' ? (
@@ -297,42 +326,39 @@ function StagedWriteModal({
         variant="primary"
         testId="staged-approve"
         disabled={busy || blocked}
-        {...(blocked ? { title: OLLAMA_REQUIRED_MSG } : {})}
+        {...(blocked ? { title: OLLAMA_BLOCKED_TITLE } : {})}
         onClick={() => void approve()}
       >
-        retry commit
+        Try saving again
       </Button>
     ) : undefined
 
   return (
-    <Modal title="staged write" onClose={onClose} wide footer={footer}>
-      {hasProvenance && (
+    <Modal title="Proposed memory change" onClose={onClose} wide footer={footer}>
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <span className="text-[14px] leading-5 text-ink">{describeStaged(row)}</span>
+        <Badge status={row.status} title={plain.explain} />
+      </div>
+
+      {evidence !== null && (
         <div className="mb-3">
-          <KV
-            entries={[
-              ...(extractedBy !== null
-                ? [{ k: 'extracted by', v: <span className="font-mono">{extractedBy}</span> }]
-                : []),
-              ...(confidence !== null ? [{ k: 'confidence', v: <Confidence value={confidence} /> }] : []),
-              ...(session !== null ? [{ k: 'session', v: <span className="font-mono">{session}</span> }] : [])
-            ]}
-          />
-          {evidence !== null && (
-            <blockquote className="mt-2 rounded-md bg-raised px-3 py-2 text-[12px] leading-5 text-ink-mute">
-              {evidence}
-            </blockquote>
-          )}
+          <div className="mb-1 text-[12px] text-ink-mute">Why this was proposed</div>
+          <blockquote className="rounded-md bg-raised px-3 py-2 text-[12px] leading-5 text-ink-mute">
+            {evidence}
+          </blockquote>
         </div>
       )}
-      {!hasProvenance && reason !== null && (
+      {evidence === null && reason !== null && (
         <div className="mb-3 text-[12px] text-ink-mute">
-          reason: <span className="text-ink">{reason}</span>
+          Why this was proposed: <span className="text-ink">{reason}</span>
         </div>
       )}
+
+      <div className="mb-1 text-[12px] text-ink-mute">What will change if you approve:</div>
       {diff.error !== null ? (
         <ErrorState error={diff.error} onRetry={diff.reload} />
       ) : diff.data === null ? (
-        <div className="py-2 text-[12px] text-ink-mute">loading diff…</div>
+        <div className="py-2 text-[12px] text-ink-mute">Loading the change…</div>
       ) : (
         <pre
           data-testid="staged-diff"
@@ -346,9 +372,10 @@ function StagedWriteModal({
           ))}
         </pre>
       )}
+
       {row.status === 'approved' && commitError !== null && (
         <div className="mt-3 rounded-md border border-err/40 bg-err/10 px-3 py-2" role="alert">
-          <div className="font-mono text-[11px] text-err">commit failed</div>
+          <div className="text-[12px] font-medium text-err">Saving failed</div>
           <div className="mt-1 text-[12px]">{commitError}</div>
         </div>
       )}
@@ -358,8 +385,24 @@ function StagedWriteModal({
           data-testid="staged-approve-blocked"
           className="mt-3 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px]"
         >
-          {OLLAMA_REQUIRED_MSG} — this new preference is embedded at commit and Ollama is not ready. Start Ollama, then
-          approve.
+          This new preference is saved with help from the local AI helper (Ollama), which looks offline right now. Start
+          Ollama, then approve.
+        </div>
+      )}
+
+      {hasProvenance && (
+        <div className="mt-3">
+          <Disclosure summary="Where this came from">
+            <KV
+              entries={[
+                ...(extractedBy !== null
+                  ? [{ k: 'extracted by', v: <span className="font-mono">{extractedBy}</span> }]
+                  : []),
+                ...(confidence !== null ? [{ k: 'confidence', v: <Confidence value={confidence} /> }] : []),
+                ...(session !== null ? [{ k: 'session', v: <span className="font-mono">{session}</span> }] : [])
+              ]}
+            />
+          </Disclosure>
         </div>
       )}
     </Modal>
@@ -401,9 +444,9 @@ function ApproveAllModal({
       }
     }
     setBusy(false)
-    const skipped = blocked.length > 0 ? `, ${blocked.length} need Ollama` : ''
-    if (failures.length === 0) toast.notify('ok', `approved ${approved}${skipped} (undoable in audit log)`)
-    else toast.notify('err', `approved ${approved}, ${failures.length} failed: ${failures[0]}`)
+    const skipped = blocked.length > 0 ? `, ${blocked.length} still need the local AI helper` : ''
+    if (failures.length === 0) toast.notify('ok', `Saved ${approved}${skipped} — undoable in History.`)
+    else toast.notify('err', `Saved ${approved}, ${failures.length} failed: ${failures[0]}`)
     onClose()
     onDone()
   }
@@ -411,7 +454,7 @@ function ApproveAllModal({
   const footer = (
     <>
       <Button disabled={busy} onClick={onClose}>
-        cancel
+        Cancel
       </Button>
       <Button
         variant="primary"
@@ -419,31 +462,31 @@ function ApproveAllModal({
         disabled={busy || eligible.length === 0}
         onClick={() => void approveAll()}
       >
-        approve {eligible.length}
+        Approve {eligible.length}
       </Button>
     </>
   )
 
   return (
-    <Modal title="approve all in group" onClose={onClose} wide footer={footer}>
+    <Modal title="Approve all in this group" onClose={onClose} wide footer={footer}>
       <div className="mb-2 text-[12px] text-ink-mute">
         {group.sessionId !== null ? (
           <>
-            session <span className="font-mono text-ink">{group.sessionId}</span>
+            From session <span className="font-mono text-ink">{group.sessionId}</span>
           </>
         ) : (
           <>
-            proposed by <span className="font-mono text-ink">{group.proposedBy}</span>
+            Proposed by <span className="font-mono text-ink">{group.proposedBy}</span>
           </>
         )}
-        . each row below becomes an undoable committed write. open any row first to see its full diff.
+        . Each row below becomes a saved change you can undo later. Open any row first to see its full diff.
       </div>
       <DataTable
         testId="staged-approve-all-list"
         columns={APPROVE_ALL_COLUMNS}
         rows={eligible}
         rowKey={(row) => row.id}
-        empty="nothing eligible to approve"
+        empty="Nothing here can be approved."
       />
       {blocked.length > 0 && (
         <div
@@ -451,15 +494,15 @@ function ApproveAllModal({
           data-testid="staged-approve-all-blocked"
           className="mt-2 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px]"
         >
-          {blocked.length} item{blocked.length === 1 ? '' : 's'} embed a new preference at commit and need a live
-          Ollama — skipped until it is ready.
+          {blocked.length} {blocked.length === 1 ? 'change saves' : 'changes save'} a new preference with the local AI
+          helper (Ollama), which looks offline — skipped until it is running.
         </div>
       )}
     </Modal>
   )
 }
 
-// ── one session group in the staged section ───────────────────────────────────
+// ── one session group in the memory-changes section ───────────────────────────
 
 function StagedGroupBlock({
   group,
@@ -482,21 +525,21 @@ function StagedGroupBlock({
     <div className="mb-4 rounded-md border border-line" data-testid={`staged-group-${slug(group.key)}`}>
       <div className="flex items-center justify-between gap-3 border-b border-line bg-surface px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="text-[11px] text-ink-faint">{group.sessionId !== null ? 'session' : 'proposed by'}</span>
+          <span className="text-[11px] text-ink-mute">{group.sessionId !== null ? 'From session' : 'Proposed by'}</span>
           <span className="truncate font-mono text-[12px] text-ink" title={group.sessionId ?? group.proposedBy}>
             {truncate(group.sessionId ?? group.proposedBy, 44)}
           </span>
-          <span className="font-mono text-[11px] text-ink-faint">{group.rows.length}</span>
+          <span className="font-mono text-[11px] text-ink-mute">{plural(group.rows.length, 'change')}</span>
         </div>
         {approvable.length > 0 && (
           <Button
             variant="primary"
             testId={`staged-approve-all-${slug(group.key)}`}
             disabled={allBlocked}
-            {...(allBlocked ? { title: OLLAMA_REQUIRED_MSG } : {})}
+            {...(allBlocked ? { title: OLLAMA_BLOCKED_TITLE } : {})}
             onClick={() => onApproveAll(group)}
           >
-            approve all ({approvable.length})
+            Approve all ({approvable.length})
           </Button>
         )}
       </div>
@@ -509,6 +552,108 @@ function StagedGroupBlock({
         empty=""
       />
     </div>
+  )
+}
+
+// ── permission-request row ─────────────────────────────────────────────────────
+
+/** Scope facts from an approval's details JSON: paths, host, usd. */
+function scopeFacts(details: JsonObject): string {
+  const parts: string[] = []
+  const paths = details['paths']
+  if (Array.isArray(paths)) {
+    const strings = paths.filter((p): p is string => typeof p === 'string')
+    if (strings.length > 0) parts.push(strings.join(' '))
+  }
+  const path = asString(details['path'])
+  if (path !== null) parts.push(path)
+  const host = asString(details['host'])
+  if (host !== null) parts.push(`host ${host}`)
+  const spend = asNumber(details['usd'])
+  if (spend !== null) parts.push(usd(spend))
+  return parts.length > 0 ? parts.join(' · ') : '-'
+}
+
+function ApprovalRow({
+  row,
+  deciding,
+  onDecide
+}: {
+  row: ApprovalDto
+  deciding: boolean
+  onDecide: (row: ApprovalDto, decision: 'approved' | 'denied') => void
+}): React.JSX.Element {
+  const scope = scopeFacts(row.details)
+  const plain = plainStatus(row.status)
+  return (
+    <li className="flex flex-col gap-2 px-3 py-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[13px] leading-5 text-ink">
+            Agent <span className="font-mono">{row.agentId}</span> wants to{' '}
+            <span className="font-mono">{row.actionName}</span>
+          </div>
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-ink-mute">
+            <Badge status={row.tier} title="How sensitive this action is — higher levels need a closer look." />
+            {scope !== '-' && <span className="font-mono">Affects: {scope}</span>}
+            <Timestamp iso={row.requestedAt} />
+          </div>
+        </div>
+        {row.status === 'pending' ? (
+          <div className="flex shrink-0 gap-1.5">
+            <Button
+              variant="danger-ghost"
+              testId={`approval-deny-${row.id}`}
+              disabled={deciding}
+              onClick={() => onDecide(row, 'denied')}
+            >
+              Decline
+            </Button>
+            <Button
+              variant="primary"
+              testId={`approval-approve-${row.id}`}
+              disabled={deciding}
+              onClick={() => onDecide(row, 'approved')}
+            >
+              Allow
+            </Button>
+          </div>
+        ) : (
+          <Badge status={row.status} label={plain.label} title={plain.explain} />
+        )}
+      </div>
+      <Disclosure summary="Technical details">
+        <pre className="overflow-x-auto font-mono text-[11px] leading-5 whitespace-pre-wrap text-ink-mute">
+          {JSON.stringify(row.details, null, 2)}
+        </pre>
+      </Disclosure>
+    </li>
+  )
+}
+
+// ── safety-flag row ────────────────────────────────────────────────────────────
+
+function FlagRow({ row }: { row: InjectionFlagDto }): React.JSX.Element {
+  const detector = plainStatus(row.detector).label
+  return (
+    <li className="flex flex-col gap-1.5 px-3 py-3">
+      <blockquote className="rounded-md bg-raised px-3 py-2 text-[12px] leading-5 text-ink">{row.excerpt}</blockquote>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-ink-mute">
+        <Badge status="flagged" label={detector} title={plainStatus(row.detector).explain} />
+        <Timestamp iso={row.createdAt} />
+      </div>
+      <Disclosure summary="Why this was flagged">
+        <div className="flex flex-col gap-1.5 text-[12px] text-ink-mute">
+          <div>
+            Flagged by the {detector} check because it matched the pattern{' '}
+            <span className="font-mono text-ink">{row.pattern}</span>.
+          </div>
+          <div className="break-all">
+            Source: <span className="font-mono text-ink">{row.source}</span>
+          </div>
+        </div>
+      </Disclosure>
+    </li>
   )
 }
 
@@ -534,12 +679,13 @@ export default function ReviewPanel(): React.JSX.Element {
   const groups = groupBySession(stagedRows)
   // null while loading → preflight fails open (never a false block).
   const ollamaReady = ollama.data === null ? null : ollama.data.state === 'ready'
+  const stagedBars = stagedPerDay(stagedRows)
 
   async function decide(row: ApprovalDto, decision: 'approved' | 'denied'): Promise<void> {
     setDeciding(row.id)
     try {
       await call('review.approvals.decide', { id: row.id, decision })
-      toast.notify('ok', decision)
+      toast.notify('ok', decision === 'approved' ? 'Request allowed.' : 'Request declined.')
       approvals.reload()
     } catch (err) {
       toast.notify('err', errText(err))
@@ -548,84 +694,51 @@ export default function ReviewPanel(): React.JSX.Element {
     }
   }
 
-  const approvalColumns: readonly Column<ApprovalDto>[] = [
-    { key: 'agent', header: 'agent', className: 'font-mono', render: (row) => row.agentId },
-    {
-      key: 'action',
-      header: 'action',
-      render: (row) => (
-        <span>
-          {row.actionKind} <span className="font-mono">{row.actionName}</span>
-        </span>
-      )
-    },
-    { key: 'tier', header: 'tier', className: 'font-mono', render: (row) => row.tier },
-    {
-      key: 'scope',
-      header: 'scope',
-      className: 'font-mono',
-      render: (row) => {
-        const facts = scopeFacts(row.details)
-        return <span title={facts}>{truncate(facts, 80)}</span>
-      }
-    },
-    { key: 'requested', header: 'requested', render: (row) => <Timestamp iso={row.requestedAt} /> },
-    { key: 'status', header: 'status', render: (row) => <Badge status={row.status} /> },
-    {
-      key: 'actions',
-      header: '',
-      render: (row) =>
-        row.status === 'pending' ? (
-          <div className="flex justify-end gap-1.5" onClick={(e) => e.stopPropagation()}>
-            <Button
-              variant="danger"
-              testId={`approval-deny-${row.id}`}
-              disabled={deciding === row.id}
-              onClick={() => void decide(row, 'denied')}
-            >
-              deny
-            </Button>
-            <Button
-              variant="primary"
-              testId={`approval-approve-${row.id}`}
-              disabled={deciding === row.id}
-              onClick={() => void decide(row, 'approved')}
-            >
-              approve
-            </Button>
-          </div>
-        ) : null
-    }
-  ]
-
   return (
     <>
       <PanelHeader
-        title="review queue"
+        title="Approvals"
+        subtitle="Changes and actions waiting for your decision."
+        icon={<Icon name="approvals" size={18} />}
         meta={
-          <span className="font-mono">
-            {stagedRows.length} writes · {approvalRows.length} approvals · {flagRows.length} flags
+          <span>
+            {plural(stagedRows.length, 'memory change')} · {plural(approvalRows.length, 'permission request')} ·{' '}
+            {plural(flagRows.length, 'safety flag')}
           </span>
         }
       />
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
         <section className="mb-6">
           <div className="flex items-center justify-between gap-3">
-            <SectionHeader meta={<span className="font-mono">{stagedRows.length}</span>}>
-              staged writes
-            </SectionHeader>
+            <SectionHeader meta={<span className="font-mono">{stagedRows.length}</span>}>Memory changes</SectionHeader>
             <Select
               value={stagedFilter}
               onChange={(value) => setStagedFilter(value as StagedWriteStatusDto | 'all')}
               options={STAGED_FILTER_OPTIONS}
-              ariaLabel="staged writes status filter"
+              ariaLabel="filter memory changes by status"
               testId="staged-status-filter"
             />
           </div>
+          <p className="mb-2 text-[12px] text-ink-mute">
+            Things an agent proposed remembering. Open one to see exactly what changes before you approve it.
+          </p>
           {ollamaReady === false && (
-            <div className="mb-2 text-[11px] text-ink-faint">
-              ollama is {ollama.data?.state ?? 'unavailable'} — approving a new-preference extraction is disabled until
-              it is ready (its embedding is computed at commit).
+            <div className="mb-2 flex items-start gap-1.5 text-[12px] text-ink-mute">
+              <Icon name="info" size={14} className="mt-0.5 shrink-0" />
+              <span>
+                The local AI helper (Ollama) looks offline. A change that saves a new preference can&apos;t be approved
+                until it is running again.
+              </span>
+            </div>
+          )}
+          {stagedRows.length > 1 && (
+            <div className="mb-3 flex flex-col gap-1">
+              <span className="text-[12px] text-ink-mute">Proposed changes per day — last 7 days</span>
+              <BarChart
+                bars={stagedBars}
+                height={36}
+                ariaLabel={`Proposed memory changes per day over the last week: ${stagedRows.length} in this view.`}
+              />
             </div>
           )}
           {staged.error !== null ? (
@@ -633,10 +746,12 @@ export default function ReviewPanel(): React.JSX.Element {
           ) : staged.data === null ? (
             <LoadingRows />
           ) : stagedRows.length === 0 ? (
-            <EmptyState>
+            <EmptyState icon={<Icon name="approvals" size={20} />}>
               {stagedFilter === 'staged'
-                ? 'no staged writes - low-confidence extractions and corrections queue here for review'
-                : `no ${stagedFilter === 'all' ? '' : `${stagedFilter} `}staged writes`}
+                ? 'No memory changes waiting — when an agent proposes something, it appears here.'
+                : stagedFilter === 'all'
+                  ? 'No memory changes.'
+                  : `No ${plainStatus(stagedFilter).label} memory changes.`}
             </EmptyState>
           ) : (
             // Wrapper keeps the golden-path `[data-testid="staged-table"] [data-rowkey]`
@@ -659,47 +774,56 @@ export default function ReviewPanel(): React.JSX.Element {
         <section className="mb-6">
           <div className="flex items-center justify-between gap-3">
             <SectionHeader meta={<span className="font-mono">{approvalRows.length}</span>}>
-              pending approvals
+              Permission requests
             </SectionHeader>
             <Select
               value={approvalFilter}
               onChange={(value) => setApprovalFilter(value as 'pending' | 'approved' | 'denied' | 'all')}
               options={APPROVAL_FILTER_OPTIONS}
-              ariaLabel="approvals status filter"
+              ariaLabel="filter permission requests by status"
               testId="approval-status-filter"
             />
           </div>
+          <p className="mb-2 text-[12px] text-ink-mute">
+            Actions an agent needs your OK for before it can do something sensitive.
+          </p>
           {approvals.error !== null ? (
             <ErrorState error={approvals.error} onRetry={approvals.reload} />
           ) : approvals.data === null ? (
             <LoadingRows />
+          ) : approvalRows.length === 0 ? (
+            <EmptyState icon={<Icon name="check" size={20} />}>
+              No permission requests — when an agent needs your OK for something sensitive, it appears here.
+            </EmptyState>
           ) : (
-            <DataTable
-              testId="approvals-table"
-              columns={approvalColumns}
-              rows={approvalRows}
-              rowKey={(row) => row.id}
-              empty="no pending approvals - agent actions that need consent will queue here"
-            />
+            <ul data-testid="approvals-table" className="flex flex-col divide-y divide-line rounded-md border border-line">
+              {approvalRows.map((row) => (
+                <ApprovalRow key={row.id} row={row} deciding={deciding === row.id} onDecide={(r, d) => void decide(r, d)} />
+              ))}
+            </ul>
           )}
         </section>
 
         <section className="mb-6">
-          <SectionHeader meta={<span className="font-mono">{flagRows.length}</span>}>
-            flagged documents
-          </SectionHeader>
+          <SectionHeader meta={<span className="font-mono">{flagRows.length}</span>}>Safety flags</SectionHeader>
+          <p className="mb-2 text-[12px] text-ink-mute">
+            Added content that looked like an attempt to manipulate the assistant. It is stored as plain data, not
+            instructions — this is just a heads-up.
+          </p>
           {flags.error !== null ? (
             <ErrorState error={flags.error} onRetry={flags.reload} />
           ) : flags.data === null ? (
             <LoadingRows />
+          ) : flagRows.length === 0 ? (
+            <EmptyState icon={<Icon name="check" size={20} />}>
+              No safety flags — content that looks like an attempt to manipulate the assistant would show up here.
+            </EmptyState>
           ) : (
-            <DataTable
-              testId="flags-table"
-              columns={FLAG_COLUMNS}
-              rows={flagRows}
-              rowKey={(row) => row.id}
-              empty="no injection flags - ingested documents that look like instructions land here"
-            />
+            <ul data-testid="flags-table" className="flex flex-col divide-y divide-line rounded-md border border-line">
+              {flagRows.map((row) => (
+                <FlagRow key={row.id} row={row} />
+              ))}
+            </ul>
           )}
         </section>
       </div>
@@ -723,21 +847,4 @@ export default function ReviewPanel(): React.JSX.Element {
       )}
     </>
   )
-}
-
-/** Scope facts from an approval's details JSON: paths, host, usd. */
-function scopeFacts(details: JsonObject): string {
-  const parts: string[] = []
-  const paths = details['paths']
-  if (Array.isArray(paths)) {
-    const strings = paths.filter((p): p is string => typeof p === 'string')
-    if (strings.length > 0) parts.push(strings.join(' '))
-  }
-  const path = asString(details['path'])
-  if (path !== null) parts.push(path)
-  const host = asString(details['host'])
-  if (host !== null) parts.push(`host ${host}`)
-  const spend = asNumber(details['usd'])
-  if (spend !== null) parts.push(usd(spend))
-  return parts.length > 0 ? parts.join(' · ') : '-'
 }

@@ -4,6 +4,7 @@
  * Ollama model status/pulls, and the MCP connection details (§4, §14).
  */
 import { useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import type {
   BackupSettingsDto,
   InstallHookResultDto,
@@ -16,9 +17,12 @@ import type {
   UpdaterStatusDto
 } from '../../../shared/ipc'
 import { call, IpcError, useIpc } from '../lib/ipc'
+import { plainBytes, plainStatus } from '../lib/plain'
+import { Icon } from '../ui/icons'
 import {
   Badge,
   Button,
+  Disclosure,
   ErrorState,
   LoadingRows,
   Modal,
@@ -58,17 +62,71 @@ function mbPerSec(bytesPerSecond: number | undefined): string {
   return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`
 }
 
-/** Human-readable byte size for the backup list. */
-function bytesHuman(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  const units = ['KB', 'MB', 'GB', 'TB']
-  let value = bytes / 1024
-  let unit = 0
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024
-    unit++
-  }
-  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`
+/**
+ * In-panel section nav (mini-TOC). A less technical user meets one long settings
+ * page as a short list of plain topics they can jump to instead of scrolling a
+ * wall. `id` matches the anchored section below; order matches the render order.
+ */
+const SECTIONS = [
+  { id: 'providers', label: 'AI providers' },
+  { id: 'local-ai', label: 'Local AI helper' },
+  { id: 'claude', label: 'Claude connection' },
+  { id: 'reasoning', label: 'Advanced reasoning' },
+  { id: 'updates', label: 'Updates' },
+  { id: 'backups', label: 'Data & backups' },
+  { id: 'hooks', label: 'Automation hooks' }
+] as const
+
+/**
+ * Download progress fill. Deliberately accent (not the capacity MeterBar, whose
+ * warn/err colors read "over budget"): a download nearing 100% is good news, so
+ * a bar going red near the end would mislead. Shared by the updater and Ollama
+ * model pulls. `prefers-reduced-motion` collapses the width transition globally.
+ */
+function ProgressBar({ percent, label }: { percent: number; label: string }): React.JSX.Element {
+  const pct = Math.max(0, Math.min(100, Math.round(percent)))
+  return (
+    <div className="h-2 w-full overflow-hidden rounded-full bg-line" role="img" aria-label={label}>
+      <div className="h-full rounded-full bg-accent transition-[width] duration-120" style={{ width: `${pct}%` }} />
+    </div>
+  )
+}
+
+/**
+ * One settings section: an anchored heading, a one-line plain sentence of what
+ * it is for, then its controls. `innerRef` registers the element so the mini-TOC
+ * chips can scroll to it; `divider` draws the hairline separator (off for the
+ * first section, which follows the sticky nav).
+ */
+function SettingsSection({
+  id,
+  title,
+  blurb,
+  testId,
+  divider = true,
+  innerRef,
+  children
+}: {
+  id: string
+  title: string
+  blurb: ReactNode
+  testId?: string
+  divider?: boolean
+  innerRef: (el: HTMLElement | null) => void
+  children: ReactNode
+}): React.JSX.Element {
+  return (
+    <section
+      ref={innerRef}
+      id={id}
+      className={`max-w-3xl scroll-mt-2 ${divider ? 'border-t border-line pt-5' : ''}`}
+      {...(testId !== undefined ? { 'data-testid': testId } : {})}
+    >
+      <SectionHeader>{title}</SectionHeader>
+      <p className="-mt-1 mb-3 text-[12px] text-ink-mute">{blurb}</p>
+      {children}
+    </section>
+  )
 }
 
 /** Auto-backup interval → a plain-language label. */
@@ -507,10 +565,32 @@ export default function SettingsPanel(): React.JSX.Element {
     }
   }
 
+  // ── in-panel section nav ───────────────────────────────────────────────────────
+  // The mini-TOC chips scroll to each anchored section; refs are registered per
+  // section id. No smooth behavior — instant jump respects reduced-motion and the
+  // no-decorative-motion rule.
+  const sectionRefs = useRef<Record<string, HTMLElement | null>>({})
+  // Block-body ref callback (returns void — a React 19 ref callback must not
+  // return a value); one per section id.
+  const registerSection =
+    (id: string) =>
+    (el: HTMLElement | null): void => {
+      sectionRefs.current[id] = el
+    }
+  const scrollToSection = (id: string): void => {
+    sectionRefs.current[id]?.scrollIntoView({ block: 'start' })
+  }
+
+  const headerProps = {
+    title: 'Settings',
+    subtitle: 'Connections, models, and your data.',
+    icon: <Icon name="settings" size={18} />
+  }
+
   if (dto === null) {
     return (
       <>
-        <PanelHeader title="settings" />
+        <PanelHeader {...headerProps} />
         {query.error !== null ? <ErrorState error={query.error} onRetry={query.reload} /> : <LoadingRows />}
       </>
     )
@@ -548,14 +628,36 @@ export default function SettingsPanel(): React.JSX.Element {
 
   return (
     <>
-      <PanelHeader title="settings" />
+      <PanelHeader {...headerProps} />
       <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto px-5 py-4">
-        {/* ── cloud provider ───────────────────────────────────────────────── */}
-        <section className="max-w-3xl">
-          <SectionHeader meta="the reasoning tier background agents use">cloud provider</SectionHeader>
+        {/* Mini-TOC: jump to a topic instead of scrolling the whole page. */}
+        <nav
+          aria-label="Settings sections"
+          className="sticky top-0 z-10 -mx-5 -mt-4 flex flex-wrap gap-1.5 border-b border-line bg-bg px-5 py-3"
+        >
+          {SECTIONS.map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              onClick={() => scrollToSection(s.id)}
+              className="cursor-pointer rounded-full border border-line-strong px-3 py-1 text-[12px] text-ink-mute transition-colors duration-120 hover:bg-raised hover:text-ink"
+            >
+              {s.label}
+            </button>
+          ))}
+        </nav>
+
+        {/* ── AI providers (cloud service + keys) ───────────────────────────── */}
+        <SettingsSection
+          id="providers"
+          title="AI providers"
+          blurb="The cloud AI service your background agents reason with, plus the keys they use to reach it."
+          divider={false}
+          innerRef={registerSection('providers')}
+        >
           <div className="flex items-end gap-2">
             <Select
-              label="provider"
+              label="cloud service"
               testId="settings-provider"
               value={provider}
               onChange={(value) => {
@@ -567,7 +669,7 @@ export default function SettingsPanel(): React.JSX.Element {
             />
             <div className="min-w-0 flex-1">
               <TextInput
-                label="model override"
+                label="model (optional)"
                 value={modelOverride}
                 onChange={setModelOverride}
                 mono
@@ -581,82 +683,104 @@ export default function SettingsPanel(): React.JSX.Element {
               disabled={savingProvider}
               onClick={() => void saveProvider()}
             >
-              save
+              Save
             </Button>
           </div>
-          <div className="mt-2 text-[11px] text-ink-faint">
-            api keys and provider changes arm background agents on next launch
-          </div>
-        </section>
+          <p className="mt-2 text-[12px] text-ink-mute">
+            Changes to the service or keys take effect the next time the app starts.
+          </p>
 
-        {/* ── api keys ─────────────────────────────────────────────────────── */}
-        <section className="max-w-3xl border-t border-line pt-5">
-          <SectionHeader meta="stored encrypted via safeStorage, never on disk in plaintext">api keys</SectionHeader>
-          <div>
+          <div className="mt-5 border-t border-line pt-4">
+            <div className="mb-1 text-[13px] font-medium">Keys</div>
+            <p className="mb-2 text-[12px] text-ink-mute">
+              Stored encrypted on this computer — never saved as plain text, and only ever sent to the service the
+              key belongs to.
+            </p>
             {dto.providers.map((p) => (
               <div key={p} className="flex items-center gap-3 border-b border-line py-2">
                 <span className="w-28 text-[13px]">{p}</span>
                 {dto.apiKeysPresent[p] ? (
-                  <Badge status="ok" label="key set" />
+                  <Badge status="ok" label="key set" title="A key is saved for this service." />
                 ) : (
-                  <span className="font-mono text-[11px] text-ink-faint">no key</span>
+                  <span className="text-[12px] text-ink-mute">no key yet</span>
                 )}
                 <div className="ml-auto flex items-center gap-2">
                   <Button testId={`settings-set-key-${p}`} onClick={() => setKeyModal(p)}>
-                    set key
+                    {dto.apiKeysPresent[p] ? 'Replace key' : 'Add key'}
                   </Button>
                   {dto.apiKeysPresent[p] && (
                     <Button variant="danger" onClick={() => void clearKey(p)}>
-                      clear
+                      Remove
                     </Button>
                   )}
                 </div>
               </div>
             ))}
           </div>
-        </section>
+        </SettingsSection>
 
-        {/* ── local models ─────────────────────────────────────────────────── */}
-        <section className="max-w-3xl border-t border-line pt-5">
-          <SectionHeader meta="ollama serves bge-m3 embeddings and the small llm">local models</SectionHeader>
+        {/* ── local AI helper (ollama) ─────────────────────────────────────── */}
+        <SettingsSection
+          id="local-ai"
+          title="Local AI helper"
+          blurb="A small AI that runs on your computer (Ollama). It powers search and quick local answers, so the app keeps working even offline."
+          innerRef={registerSection('local-ai')}
+        >
           <div className="flex flex-col gap-3">
-            <div className="flex items-center gap-2.5">
-              <Badge status={dto.ollama.state} />
+            <div className="flex flex-wrap items-center gap-2.5">
+              <Badge
+                status={dto.ollama.state}
+                label={plainStatus(dto.ollama.state).label}
+                title={plainStatus(dto.ollama.state).explain}
+              />
               {dto.ollama.installedModels.length > 0 && (
                 <span className="font-mono text-[12px] text-ink-mute">{dto.ollama.installedModels.join(' · ')}</span>
               )}
             </div>
             {dto.ollama.state === 'daemon-not-running' && (
-              <div className="flex items-center gap-2">
-                <span className="font-mono text-[12px] text-ink-mute">{dto.ollama.installUrl}</span>
-                <Button onClick={() => copy(dto.ollama.installUrl)}>copy</Button>
+              <div className="flex flex-col gap-1.5">
+                <p className="text-[12px] text-ink-mute">
+                  The local AI helper isn&apos;t running. Start Ollama, or install it from the link below.
+                </p>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-[12px] text-ink-mute">{dto.ollama.installUrl}</span>
+                  <Button onClick={() => copy(dto.ollama.installUrl)}>Copy link</Button>
+                </div>
               </div>
             )}
             {dto.ollama.missingModels.length > 0 && (
-              <div>
+              <div className="flex flex-col gap-1">
+                <p className="text-[12px] text-ink-mute">
+                  These models still need to download before everything works:
+                </p>
                 {dto.ollama.missingModels.map((model) => {
                   const progress = pulls[model]
+                  const pct =
+                    progress?.total !== undefined && progress.completed !== undefined
+                      ? Math.round((progress.completed / progress.total) * 100)
+                      : null
                   return (
-                    <div key={model} className="flex items-center gap-3 border-b border-line py-2">
-                      <span className="font-mono text-[12px]">{model}</span>
-                      {progress !== undefined && (
-                        <span className="font-mono text-[11px] text-ink-mute" role="status">
-                          {progress.error !== undefined ? progress.error : progress.status}
-                          {progress.total !== undefined && progress.completed !== undefined
-                            ? ` ${Math.round((progress.completed / progress.total) * 100)}%`
-                            : ''}
-                        </span>
-                      )}
-                      <div className="ml-auto">
-                        <Button
-                          variant="primary"
-                          testId={`settings-pull-${model}`}
-                          disabled={pulling[model] === true}
-                          onClick={() => void pull(model)}
-                        >
-                          pull
-                        </Button>
+                    <div key={model} className="flex flex-col gap-1.5 border-b border-line py-2">
+                      <div className="flex items-center gap-3">
+                        <span className="font-mono text-[12px]">{model}</span>
+                        {progress !== undefined && (
+                          <span className="font-mono text-[11px] text-ink-mute" role="status">
+                            {progress.error !== undefined ? progress.error : progress.status}
+                            {pct !== null ? ` ${pct}%` : ''}
+                          </span>
+                        )}
+                        <div className="ml-auto">
+                          <Button
+                            variant="primary"
+                            testId={`settings-pull-${model}`}
+                            disabled={pulling[model] === true}
+                            onClick={() => void pull(model)}
+                          >
+                            {pulling[model] === true ? 'Downloading…' : 'Download'}
+                          </Button>
+                        </div>
                       </div>
+                      {pct !== null && <ProgressBar percent={pct} label={`${model} download ${pct}%`} />}
                     </div>
                   )
                 })}
@@ -664,214 +788,189 @@ export default function SettingsPanel(): React.JSX.Element {
             )}
             <div className="flex items-end gap-2">
               <div className="min-w-0 flex-1">
-                <TextInput label="small llm override" value={smallLlm} onChange={setSmallLlm} mono placeholder="qwen3:4b" />
+                <TextInput label="small model (optional)" value={smallLlm} onChange={setSmallLlm} mono placeholder="qwen3:4b" />
               </div>
               <Button variant="primary" size="default" disabled={savingSmallLlm} onClick={() => void saveSmallLlm()}>
-                save
+                Save
               </Button>
             </div>
           </div>
-        </section>
+        </SettingsSection>
 
-        {/* ── subscription runner (phase 17) ───────────────────────────────── */}
-        <section className="max-w-3xl border-t border-line pt-5">
-          <SectionHeader meta="reason with a claude subscription via the local claude cli, off by default">
-            subscription runner
-          </SectionHeader>
+        {/* ── Claude connection (mcp) ──────────────────────────────────────── */}
+        <SettingsSection
+          id="claude"
+          title="Claude connection"
+          blurb="How Claude Code (or any MCP client) connects to this app. Share the command below to link it."
+          innerRef={registerSection('claude')}
+        >
           <div className="flex flex-col gap-3">
-            <div className="flex items-center gap-3">
-              <Toggle
-                label="enable subscription runner"
-                testId="settings-runner-enable"
-                checked={runnerCfg.enabled}
-                disabled={runnerBusy}
-                onChange={handleRunnerToggle}
-              />
-              <span className="text-[13px]">{runnerCfg.enabled ? 'enabled' : 'disabled'}</span>
-              <div className="ml-auto">
-                <Select
-                  ariaLabel="runner model"
-                  testId="settings-runner-model"
-                  value={runnerCfg.model}
-                  onChange={(value) => void saveRunner({ model: value })}
-                  options={runnerModelOptions}
-                />
-              </div>
+            <div className="font-mono text-[12px] text-ink-mute">
+              {dto.mcp.url ?? 'The connection is turned off for this launch.'}
             </div>
-
-            {/* Honest scope line (phase-doc required copy). */}
-            <div className="text-[12px] text-ink-mute">
-              the subscription replaces the reasoning llm, not the model stack. embeddings and reranking stay
-              local, so ollama remains required.
-            </div>
-
-            {/* Routing status: which tier background reasoning lands on right now (phase-22). */}
-            <div className="text-[12px] text-ink-mute" role="status" data-testid="settings-runner-routing">
-              {runnerRoutingLine}
-            </div>
-
-            {runnerStatus.data !== null && (
-              <div className="flex flex-col gap-1.5 border-t border-line pt-3" data-testid="runner-status">
-                <div className="flex flex-wrap items-center gap-2.5">
-                  <Badge status={runnerStatus.data.state} />
-                  {runnerStatus.data.version !== null && (
-                    <span className="font-mono text-[11px] text-ink-mute">
-                      cli {runnerStatus.data.version}
-                      {runnerStatus.data.versionOk ? '' : ' (unsupported)'}
-                    </span>
-                  )}
-                  {runnerStatus.data.lastRun !== null && (
-                    <span className="flex items-center gap-1.5 font-mono text-[11px] text-ink-faint">
-                      last run
-                      <Timestamp iso={runnerStatus.data.lastRun.startedAt} />
-                      {runnerStatus.data.lastRun.durationMs !== null
-                        ? `· ${runnerStatus.data.lastRun.durationMs}ms`
-                        : ''}
-                    </span>
-                  )}
-                </div>
-                <div className="font-mono text-[11px] break-all text-ink-faint">
-                  {runnerStatus.data.binaryPath ?? 'claude cli not found on PATH'}
-                </div>
-                {runnerStatus.data.lastError !== null && runnerStatus.data.lastError !== '' && (
-                  <div className="font-mono text-[11px] break-words text-err">{runnerStatus.data.lastError}</div>
-                )}
-              </div>
-            )}
-
-            <div className="flex items-center gap-2.5">
-              <Button testId="settings-runner-test" disabled={testing} onClick={() => void testRunnerConnection()}>
-                {testing ? 'testing…' : 'test connection'}
-              </Button>
-              {testResult !== null && (
-                <span
-                  role="status"
-                  data-testid="runner-test-result"
-                  className={`text-[12px] ${testResult.ok ? 'text-ok' : 'text-err'}`}
-                >
-                  {testResult.message}
-                </span>
-              )}
-            </div>
-            <div className="text-[11px] text-ink-faint">
-              test connection runs one manual 1-turn canary against the claude cli. it is never scheduled. quota
-              history and the run log are not surfaced here yet.
-            </div>
-          </div>
-        </section>
-
-        {/* ── mcp connection ───────────────────────────────────────────────── */}
-        <section className="max-w-3xl border-t border-line pt-5">
-          <SectionHeader meta="connect claude code or any mcp client">mcp connection</SectionHeader>
-          <div className="flex flex-col gap-3">
-            <div className="font-mono text-[12px] text-ink-mute">{dto.mcp.url ?? 'server disabled this launch'}</div>
             <div className="flex items-start gap-2">
               <div className="min-w-0 flex-1 rounded-md bg-raised p-3 font-mono text-[12px] break-all">
                 {dto.mcp.connectCommand}
               </div>
-              <Button onClick={() => copy(dto.mcp.connectCommand)}>copy</Button>
+              <Button onClick={() => copy(dto.mcp.connectCommand)}>Copy</Button>
             </div>
-            <div className="font-mono text-[11px] text-ink-faint">{dto.mcp.sampleConfigPath}</div>
-            {token === null ? (
-              <div>
-                <Button testId="settings-reveal-token" onClick={() => void revealToken()}>
-                  reveal token
-                </Button>
+            <Disclosure summary="Connection details" testId="settings-mcp-details">
+              <div className="flex flex-col gap-3">
+                <div className="font-mono text-[11px] text-ink-mute">{dto.mcp.sampleConfigPath}</div>
+                {token === null ? (
+                  <div>
+                    <Button testId="settings-reveal-token" onClick={() => void revealToken()}>
+                      Reveal token
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="flex items-start gap-2">
+                    <div className="min-w-0 flex-1 rounded-md bg-raised p-3 font-mono text-[12px] break-all">{token}</div>
+                    <Button onClick={() => copy(token)}>Copy</Button>
+                    <Button onClick={() => setToken(null)}>Hide</Button>
+                  </div>
+                )}
+                <p className="text-[12px] text-ink-mute">
+                  {'The token replaces <token> in the command. Treat it like a password.'}
+                </p>
               </div>
-            ) : (
-              <div className="flex items-start gap-2">
-                <div className="min-w-0 flex-1 rounded-md bg-raised p-3 font-mono text-[12px] break-all">{token}</div>
-                <Button onClick={() => copy(token)}>copy</Button>
-                <Button onClick={() => setToken(null)}>hide</Button>
-              </div>
-            )}
-            <div className="text-[11px] text-ink-faint">
-              {'the token replaces <token> in the command. treat it like a password.'}
-            </div>
+            </Disclosure>
           </div>
-        </section>
+        </SettingsSection>
 
-        {/* ── session-end hook (phase 11) ──────────────────────────────────── */}
-        <section className="max-w-3xl border-t border-line pt-5">
-          <SectionHeader meta="claude code posts finished sessions to the extraction queue">
-            session-end hook
-          </SectionHeader>
-          <div className="flex flex-col gap-3">
-            <div className="text-[12px] text-ink-mute">
-              {hookStatus.data === null
-                ? 'checking ~/.claude/settings.json…'
-                : hookStatus.data.hook.installed === true
-                  ? 'installed - sessions extract automatically when they end'
-                  : hookStatus.data.hook.installed === false
-                    ? 'not installed - one click merges the hook into ~/.claude/settings.json (existing hooks are preserved; a backup is written)'
-                    : 'state unknown - settings.json could not be read'}
-            </div>
-            <div>
-              <Button
-                variant="primary"
-                testId="settings-install-hook"
-                disabled={installingHook}
-                onClick={() => void installHook()}
-              >
-                {installingHook
-                  ? 'installing…'
-                  : hookStatus.data?.hook.installed === true
-                    ? 'reinstall / repair hook'
-                    : 'install hook'}
-              </Button>
-            </div>
-            {hookResult !== null && (
-              <div className="flex flex-col gap-2" data-testid="hook-install-result">
-                <div className="text-[12px]">
-                  {hookResult.changed
-                    ? `settings updated${hookResult.backupPath !== null ? ` (backup: ${hookResult.backupPath})` : ''}`
-                    : 'already installed - nothing changed'}
+        {/* ── Advanced reasoning (subscription runner) ─────────────────────── */}
+        <SettingsSection
+          id="reasoning"
+          title="Advanced reasoning"
+          blurb="Optional: let background work reason with your Claude subscription instead of a paid API key. Off by default."
+          innerRef={registerSection('reasoning')}
+        >
+          <Disclosure summary="Set up subscription reasoning" testId="settings-runner-advanced">
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center gap-3">
+                <Toggle
+                  label="enable subscription runner"
+                  testId="settings-runner-enable"
+                  checked={runnerCfg.enabled}
+                  disabled={runnerBusy}
+                  onChange={handleRunnerToggle}
+                />
+                <span className="text-[13px]">{runnerCfg.enabled ? 'on' : 'off'}</span>
+                <div className="ml-auto">
+                  <Select
+                    ariaLabel="runner model"
+                    testId="settings-runner-model"
+                    value={runnerCfg.model}
+                    onChange={(value) => void saveRunner({ model: value })}
+                    options={runnerModelOptions}
+                  />
                 </div>
-                {hookResult.diff !== '' && (
-                  <pre className="max-h-56 overflow-y-auto rounded-md bg-raised p-3 font-mono text-[11px] whitespace-pre-wrap">
-                    {hookResult.diff}
-                  </pre>
+              </div>
+
+              {/* Honest scope line (phase-doc required copy). */}
+              <div className="text-[12px] text-ink-mute">
+                the subscription replaces the reasoning llm, not the model stack. embeddings and reranking stay
+                local, so ollama remains required.
+              </div>
+
+              {/* Routing status: which tier background reasoning lands on right now (phase-22). */}
+              <div className="text-[12px] text-ink-mute" role="status" data-testid="settings-runner-routing">
+                {runnerRoutingLine}
+              </div>
+
+              {runnerStatus.data !== null && (
+                <div className="flex flex-col gap-1.5 border-t border-line pt-3" data-testid="runner-status">
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <Badge
+                      status={runnerStatus.data.state}
+                      label={plainStatus(runnerStatus.data.state).label}
+                      title={plainStatus(runnerStatus.data.state).explain}
+                    />
+                    {runnerStatus.data.version !== null && (
+                      <span className="font-mono text-[11px] text-ink-mute">
+                        cli {runnerStatus.data.version}
+                        {runnerStatus.data.versionOk ? '' : ' (unsupported)'}
+                      </span>
+                    )}
+                    {runnerStatus.data.lastRun !== null && (
+                      <span className="flex items-center gap-1.5 font-mono text-[11px] text-ink-mute">
+                        last run
+                        <Timestamp iso={runnerStatus.data.lastRun.startedAt} />
+                        {runnerStatus.data.lastRun.durationMs !== null
+                          ? `· ${runnerStatus.data.lastRun.durationMs}ms`
+                          : ''}
+                      </span>
+                    )}
+                  </div>
+                  <div className="font-mono text-[11px] break-all text-ink-mute">
+                    {runnerStatus.data.binaryPath ?? 'claude cli not found on PATH'}
+                  </div>
+                  {runnerStatus.data.lastError !== null && runnerStatus.data.lastError !== '' && (
+                    <div className="font-mono text-[11px] break-words text-err">{runnerStatus.data.lastError}</div>
+                  )}
+                </div>
+              )}
+
+              <div className="flex items-center gap-2.5">
+                <Button testId="settings-runner-test" disabled={testing} onClick={() => void testRunnerConnection()}>
+                  {testing ? 'Testing…' : 'Test connection'}
+                </Button>
+                {testResult !== null && (
+                  <span
+                    role="status"
+                    data-testid="runner-test-result"
+                    className={`text-[12px] ${testResult.ok ? 'text-ok' : 'text-err'}`}
+                  >
+                    {testResult.message}
+                  </span>
                 )}
               </div>
-            )}
-            <div className="text-[11px] text-ink-faint">
-              if the app is closed when a session ends, the hook spools the session and it is picked up at the next
-              launch. the fallback for other mcp clients: 30 minutes of call-log silence.
+              <div className="text-[12px] text-ink-mute">
+                Test connection runs one manual check against the Claude CLI. It is never scheduled. Usage history
+                and the run log aren&apos;t shown here yet.
+              </div>
             </div>
-          </div>
-        </section>
+          </Disclosure>
+        </SettingsSection>
 
-        {/* ── app updates ──────────────────────────────────────────────────── */}
-        <section className="max-w-3xl border-t border-line pt-5" data-testid="settings-updates">
-          <SectionHeader meta="download and install new versions of the app">updates</SectionHeader>
+        {/* ── updates ──────────────────────────────────────────────────────── */}
+        <SettingsSection
+          id="updates"
+          title="Updates"
+          blurb="Check for and install new versions of the app."
+          testId="settings-updates"
+          innerRef={registerSection('updates')}
+        >
           <div className="flex flex-col gap-3">
             <div className="flex items-center gap-2.5">
               <span className="text-[13px]">current version</span>
               <span className="font-mono text-[12px] text-ink-mute">v{appStatus.data?.version ?? '…'}</span>
-              {updState !== 'idle' && updState !== 'disabled' && <Badge status={updState} />}
+              {updState !== 'idle' && updState !== 'disabled' && (
+                <Badge status={updState} label={plainStatus(updState).label} title={plainStatus(updState).explain} />
+              )}
             </div>
 
             {/* Status line per state. */}
             {updState === 'disabled' && (
-              <div className="text-[12px] text-ink-mute" role="status">
-                {updater?.detail ?? 'auto-update runs only in the installed (packaged) app.'}
-              </div>
+              <p className="text-[12px] text-ink-mute" role="status">
+                {updater?.detail ?? 'Automatic updates only run in the installed app.'}
+              </p>
             )}
             {updState === 'checking' && (
-              <div className="text-[12px] text-ink-mute" role="status">
-                checking github releases for a newer version…
-              </div>
+              <p className="text-[12px] text-ink-mute" role="status">
+                Checking for a newer version…
+              </p>
             )}
             {updState === 'up-to-date' && (
-              <div className="text-[12px] text-ink-mute" role="status">
-                you are on the latest version{updater?.version !== undefined ? ` (v${updater.version})` : ''}.
-              </div>
+              <p className="text-[12px] text-ink-mute" role="status">
+                You&apos;re up to date{updater?.version !== undefined ? ` (v${updater.version})` : ''}.
+              </p>
             )}
             {updState === 'error' && (
               <div className="font-mono text-[11px] break-words text-err" role="alert">
                 {updater?.error !== undefined && updater.error !== ''
                   ? updater.error
-                  : 'the update check failed — try again later.'}
+                  : 'The update check failed — try again later.'}
               </div>
             )}
 
@@ -879,24 +978,20 @@ export default function SettingsPanel(): React.JSX.Element {
             {updState === 'downloading' && (
               <div className="flex flex-col gap-1.5" role="status" data-testid="updater-progress">
                 <div className="flex items-center justify-between font-mono text-[11px] text-ink-mute">
-                  <span>downloading{updater?.version !== undefined ? ` v${updater.version}` : ''}…</span>
+                  <span>Downloading{updater?.version !== undefined ? ` v${updater.version}` : ''}…</span>
                   <span>
                     {updPercent}%{updater?.bytesPerSecond !== undefined ? ` · ${mbPerSec(updater.bytesPerSecond)}` : ''}
                   </span>
                 </div>
-                <div className="h-1.5 w-full overflow-hidden rounded bg-line">
-                  <div
-                    className="h-full rounded bg-accent transition-[width] duration-120"
-                    style={{ width: `${updPercent}%` }}
-                  />
-                </div>
+                <ProgressBar percent={updPercent} label={`downloading ${updPercent}%`} />
               </div>
             )}
 
             {updState === 'downloaded' && (
-              <div className="text-[12px] text-ink-mute" role="status">
-                update{updater?.version !== undefined ? ` v${updater.version}` : ''} downloaded and ready to install.
-              </div>
+              <p className="text-[12px] text-ink-mute" role="status">
+                Version{updater?.version !== undefined ? ` v${updater.version}` : ''} is downloaded and ready to
+                install.
+              </p>
             )}
 
             {/* Actions: hidden entirely when auto-update is unavailable (dev build). */}
@@ -909,7 +1004,7 @@ export default function SettingsPanel(): React.JSX.Element {
                     disabled={updBusy}
                     onClick={() => void checkForUpdates()}
                   >
-                    {updBusy ? 'checking…' : 'check for updates'}
+                    {updBusy ? 'Checking…' : 'Check for updates'}
                   </Button>
                 ) : !confirmRestart ? (
                   <Button
@@ -917,35 +1012,37 @@ export default function SettingsPanel(): React.JSX.Element {
                     testId="settings-restart-update"
                     onClick={() => setConfirmRestart(true)}
                   >
-                    restart to update
+                    Restart to update
                   </Button>
                 ) : (
                   <div className="flex flex-wrap items-center gap-2.5" data-testid="updater-restart-confirm">
                     <span className="text-[12px]">
-                      restart now to install{updater?.version !== undefined ? ` v${updater.version}` : ''}?
+                      Restart now to install{updater?.version !== undefined ? ` v${updater.version}` : ''}?
                     </span>
                     <Button variant="primary" testId="settings-restart-confirm" onClick={() => void installUpdate()}>
-                      restart
+                      Restart
                     </Button>
                     <Button testId="settings-restart-cancel" onClick={() => setConfirmRestart(false)}>
-                      not now
+                      Not now
                     </Button>
                   </div>
                 )}
               </div>
             )}
-            <div className="text-[11px] text-ink-faint">
-              updates install in the background and finish applying the next time the app restarts. downloading a
-              new version happens automatically; use restart to update to apply it now.
-            </div>
+            <p className="text-[12px] text-ink-mute">
+              Updates download in the background and finish applying the next time the app restarts.
+            </p>
           </div>
-        </section>
+        </SettingsSection>
 
         {/* ── data & backups ───────────────────────────────────────────────── */}
-        <section className="max-w-3xl border-t border-line pt-5" data-testid="settings-backups">
-          <SectionHeader meta="a version history of your data — snapshot now, restore to any point, or start fresh">
-            data &amp; backups
-          </SectionHeader>
+        <SettingsSection
+          id="backups"
+          title="Data & backups"
+          blurb="A backup is a snapshot of everything the assistant knows. Snapshot now, restore to an earlier point, or start fresh."
+          testId="settings-backups"
+          innerRef={registerSection('backups')}
+        >
           <div className="flex flex-col gap-4">
             {/* Backup now */}
             <div className="flex flex-wrap items-center gap-2.5">
@@ -956,7 +1053,7 @@ export default function SettingsPanel(): React.JSX.Element {
                   disabled={restarting}
                   onClick={() => setConfirmBackup(true)}
                 >
-                  back up now
+                  Back up now
                 </Button>
               ) : (
                 <div className="flex flex-wrap items-center gap-2.5" data-testid="backups-create-confirm">
@@ -969,10 +1066,10 @@ export default function SettingsPanel(): React.JSX.Element {
                     disabled={restarting}
                     onClick={() => void backupNow()}
                   >
-                    back up &amp; restart
+                    Back up &amp; restart
                   </Button>
                   <Button disabled={restarting} onClick={() => setConfirmBackup(false)}>
-                    cancel
+                    Cancel
                   </Button>
                 </div>
               )}
@@ -1039,14 +1136,14 @@ export default function SettingsPanel(): React.JSX.Element {
                   disabled={savingBackupSettings || restarting}
                   onClick={() => void saveRetention()}
                 >
-                  save
+                  Save
                 </Button>
               </div>
-              <div className="text-[11px] text-ink-faint">
-                only automatic backups are pruned by these limits — manual backups and the safety snapshots taken
-                before a restore or reset are kept forever. automatic backups are created at app startup when one is
+              <p className="text-[12px] text-ink-mute">
+                Only automatic backups are pruned by these limits — manual backups and the safety snapshots taken
+                before a restore or reset are kept forever. Automatic backups are created at app startup when one is
                 due (the memory graph can only be snapshotted safely while the app is not holding it open).
-              </div>
+              </p>
             </div>
 
             {/* Backup list */}
@@ -1063,18 +1160,18 @@ export default function SettingsPanel(): React.JSX.Element {
                 <div data-testid="backups-list">
                   {backupsQuery.data.backups.map((b) => (
                     <div key={b.dirName} className="flex flex-wrap items-center gap-3 border-b border-line py-2">
-                      <Badge status={b.kind} />
+                      <Badge status={b.kind} label={plainStatus(b.kind).label} title={plainStatus(b.kind).explain} />
                       {b.createdAt !== null ? (
                         <Timestamp iso={b.createdAt} />
                       ) : (
-                        <span className="font-mono text-[11px] text-ink-faint">{b.dirName}</span>
+                        <span className="font-mono text-[11px] text-ink-mute">{b.dirName}</span>
                       )}
                       <span className="font-mono text-[11px] text-ink-mute">
-                        {bytesHuman(b.bytes)} · {b.files} files
+                        {plainBytes(b.bytes)} · {b.files} files
                       </span>
                       <div className="ml-auto">
                         {!b.restorable ? (
-                          <span className="text-[11px] text-ink-faint">not restorable</span>
+                          <span className="text-[12px] text-ink-mute">not restorable</span>
                         ) : restoreConfirm === b.dirName ? (
                           <div className="flex flex-wrap items-center gap-2" data-testid="backups-restore-confirm">
                             <span className="text-[11px] text-ink-mute">
@@ -1086,10 +1183,10 @@ export default function SettingsPanel(): React.JSX.Element {
                               disabled={restarting}
                               onClick={() => void restoreBackup(b.dirName)}
                             >
-                              restore &amp; restart
+                              Restore &amp; restart
                             </Button>
                             <Button disabled={restarting} onClick={() => setRestoreConfirm(null)}>
-                              cancel
+                              Cancel
                             </Button>
                           </div>
                         ) : (
@@ -1098,7 +1195,7 @@ export default function SettingsPanel(): React.JSX.Element {
                             disabled={restarting}
                             onClick={() => setRestoreConfirm(b.dirName)}
                           >
-                            restore
+                            Restore
                           </Button>
                         )}
                       </div>
@@ -1111,15 +1208,15 @@ export default function SettingsPanel(): React.JSX.Element {
             {/* Export */}
             <div className="flex flex-wrap items-center gap-2.5 border-t border-line pt-3">
               <Button testId="data-export" disabled={exporting || restarting} onClick={() => void exportData()}>
-                {exporting ? 'exporting…' : 'export data…'}
+                {exporting ? 'Exporting…' : 'Export data…'}
               </Button>
               {exportPath !== null && (
                 <span className="font-mono text-[11px] break-all text-ink-mute" data-testid="data-export-path">
                   exported to {exportPath}
                 </span>
               )}
-              <span className="text-[11px] text-ink-faint">
-                a portable copy: the graph as csv + cypher, appdata, and settings (api keys are never exported).
+              <span className="text-[12px] text-ink-mute">
+                A portable copy: the graph as csv + cypher, appdata, and settings (api keys are never exported).
               </span>
             </div>
 
@@ -1134,12 +1231,66 @@ export default function SettingsPanel(): React.JSX.Element {
               </div>
               <div>
                 <Button variant="danger" testId="data-reset-open" disabled={restarting} onClick={() => setResetOpen(true)}>
-                  reset all data…
+                  Reset all data…
                 </Button>
               </div>
             </div>
           </div>
-        </section>
+        </SettingsSection>
+
+        {/* ── automation hooks (session-end hook) ──────────────────────────── */}
+        <SettingsSection
+          id="hooks"
+          title="Automation hooks"
+          blurb="Automatically hand finished Claude Code sessions to this app so it can learn from them."
+          innerRef={registerSection('hooks')}
+        >
+          <div className="flex flex-col gap-3">
+            <p className="text-[12px] text-ink-mute">
+              {hookStatus.data === null
+                ? 'Checking ~/.claude/settings.json…'
+                : hookStatus.data.hook.installed === true
+                  ? 'Installed — finished sessions are sent here automatically when they end.'
+                  : hookStatus.data.hook.installed === false
+                    ? 'Not installed — one click merges the hook into ~/.claude/settings.json (existing hooks are preserved; a backup is written first).'
+                    : 'Status unknown — settings.json could not be read.'}
+            </p>
+            <div>
+              <Button
+                variant="primary"
+                testId="settings-install-hook"
+                disabled={installingHook}
+                onClick={() => void installHook()}
+              >
+                {installingHook
+                  ? 'Installing…'
+                  : hookStatus.data?.hook.installed === true
+                    ? 'Reinstall / repair hook'
+                    : 'Install hook'}
+              </Button>
+            </div>
+            {hookResult !== null && (
+              <div className="flex flex-col gap-2" data-testid="hook-install-result">
+                <div className="text-[12px]">
+                  {hookResult.changed
+                    ? `Settings updated${hookResult.backupPath !== null ? ` (backup: ${hookResult.backupPath})` : ''}.`
+                    : 'Already installed — nothing changed.'}
+                </div>
+                {hookResult.diff !== '' && (
+                  <Disclosure summary="See what changed" testId="settings-hook-diff">
+                    <pre className="max-h-56 overflow-y-auto font-mono text-[11px] whitespace-pre-wrap">
+                      {hookResult.diff}
+                    </pre>
+                  </Disclosure>
+                )}
+              </div>
+            )}
+            <p className="text-[12px] text-ink-mute">
+              If the app is closed when a session ends, the hook saves it and it is picked up at the next launch. The
+              fallback for other MCP clients is 30 minutes of quiet in the call log.
+            </p>
+          </div>
+        </SettingsSection>
       </div>
 
       {consentOpen && (
@@ -1148,7 +1299,7 @@ export default function SettingsPanel(): React.JSX.Element {
           onClose={() => setConsentOpen(false)}
           footer={
             <>
-              <Button onClick={() => setConsentOpen(false)}>cancel</Button>
+              <Button onClick={() => setConsentOpen(false)}>Cancel</Button>
               <Button
                 variant="primary"
                 testId="settings-runner-consent-confirm"
@@ -1195,14 +1346,14 @@ export default function SettingsPanel(): React.JSX.Element {
           onClose={closeKeyModal}
           footer={
             <>
-              <Button onClick={closeKeyModal}>cancel</Button>
+              <Button onClick={closeKeyModal}>Cancel</Button>
               <Button
                 variant="primary"
                 testId="settings-key-save"
                 disabled={keySaving || keyValue.trim() === ''}
                 onClick={() => void saveKey()}
               >
-                save
+                Save
               </Button>
             </>
           }
@@ -1218,7 +1369,7 @@ export default function SettingsPanel(): React.JSX.Element {
               className="h-8 w-full rounded-md border border-line-strong bg-raised px-2.5 font-mono text-[12px] text-ink placeholder:text-ink-mute focus:border-accent focus:outline-none"
             />
           </label>
-          <p className="mt-2 text-[11px] text-ink-faint">encrypted with safeStorage; never shown or logged.</p>
+          <p className="mt-2 text-[12px] text-ink-mute">Encrypted on this computer; never shown again or written to a log.</p>
         </Modal>
       )}
 
@@ -1237,7 +1388,7 @@ export default function SettingsPanel(): React.JSX.Element {
                   setResetText('')
                 }}
               >
-                cancel
+                Cancel
               </Button>
               <Button
                 variant="danger"
@@ -1245,7 +1396,7 @@ export default function SettingsPanel(): React.JSX.Element {
                 disabled={restarting || resetText !== 'RESET'}
                 onClick={() => void resetData()}
               >
-                reset &amp; restart
+                Reset &amp; restart
               </Button>
             </>
           }

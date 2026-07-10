@@ -1,36 +1,62 @@
 /**
- * Traces panel (phase 10, spec §3): observability viewer over the local trace
- * store. Master-detail: recent traces left, span waterfall right (24px rows,
- * 8px bars, offset+width as % of trace wall-clock per DESIGN.md). Clicking a
- * span toggles its attributes; permission.* rows render bold — they are the
- * §13 decision trail.
+ * Agent runs panel (UI redesign §P6; was "traces", phase 10 spec §3): the
+ * plain-language observability viewer over the local trace store. Master-detail:
+ * recent runs left as plain sentences, span waterfall right — the waterfall IS
+ * the visualization (28px rows, 8px bars, offset+width as % of run wall-clock
+ * per DESIGN.md). Clicking a step toggles its recorded details; permission.*
+ * rows render bold — they are the §13 decision trail. Read-only.
  */
 import { useMemo, useState } from 'react'
 import { useIpc } from '../lib/ipc'
 import { duration, truncate } from '../lib/format'
-import { DataTable, EmptyState, ErrorState, LoadingRows, PanelHeader, Timestamp } from '../ui/kit'
+import { plainDuration, plainStatus, plural } from '../lib/plain'
+import {
+  Badge,
+  DataTable,
+  EmptyState,
+  ErrorState,
+  LoadingRows,
+  PanelHeader,
+  Timestamp
+} from '../ui/kit'
 import type { Column } from '../ui/kit'
+import { Icon } from '../ui/icons'
 import type { JsonValue, TraceSpanDto, TraceSummaryDto } from '../../../shared/ipc'
 
-const TRACE_COLUMNS: readonly Column<TraceSummaryDto>[] = [
+/** One-line plain summary of a run: how long, how many steps, error state. */
+function runSummary(trace: TraceSummaryDto): React.JSX.Element {
+  const steps = plural(trace.spanCount, 'step')
+  // A null duration means the run has not finished recording.
+  if (trace.durationMs === null) return <>In progress · {steps}</>
+  const lead = `Finished in ${plainDuration(trace.durationMs)} · ${steps} · `
+  return trace.errorCount > 0 ? (
+    <>
+      {lead}
+      <span className="text-err">{plural(trace.errorCount, 'error')}</span>
+    </>
+  ) : (
+    <>{lead}no errors</>
+  )
+}
+
+const RUN_COLUMNS: readonly Column<TraceSummaryDto>[] = [
   {
-    key: 'root',
-    header: 'root',
-    render: (row) => <span title={row.rootName}>{truncate(row.rootName, 40)}</span>
+    key: 'run',
+    header: 'run',
+    render: (row) => (
+      <div className="flex flex-col gap-0.5">
+        <span className="truncate font-mono text-ok" title={row.rootName}>
+          {truncate(row.rootName, 40)}
+        </span>
+        <span className="text-[12px] text-ink-mute">{runSummary(row)}</span>
+      </div>
+    )
   },
-  { key: 'started', header: 'started', render: (row) => <Timestamp ms={row.startUnixMs} /> },
   {
-    key: 'duration',
-    header: 'duration',
-    className: 'font-mono text-right',
-    render: (row) => duration(row.durationMs)
-  },
-  { key: 'spans', header: 'spans', className: 'font-mono text-right', render: (row) => row.spanCount },
-  {
-    key: 'errors',
-    header: 'errors',
-    className: 'font-mono text-right',
-    render: (row) => <span className={row.errorCount > 0 ? 'text-err' : ''}>{row.errorCount}</span>
+    key: 'when',
+    header: 'when',
+    className: 'text-right whitespace-nowrap',
+    render: (row) => <Timestamp ms={row.startUnixMs} />
   }
 ]
 
@@ -92,28 +118,31 @@ function TraceDetail({ trace }: { trace: TraceSummaryDto }): React.JSX.Element {
         <span className="min-w-0 truncate text-[13px] font-semibold" title={trace.rootName}>
           {trace.rootName}
         </span>
-        <span className="shrink-0 font-mono text-[11px] text-ink-mute">
-          {duration(trace.durationMs)} · {trace.spanCount} spans
-        </span>
+        <span className="shrink-0 text-[12px] text-ink-mute">{runSummary(trace)}</span>
       </div>
       {spans.error !== null ? (
         <ErrorState error={spans.error} onRetry={spans.reload} />
       ) : spans.data === null ? (
         <LoadingRows />
       ) : rows.length === 0 ? (
-        <EmptyState>no spans recorded for this trace</EmptyState>
+        <EmptyState>This run recorded no steps.</EmptyState>
       ) : (
         <div className="px-4 py-2" data-testid="trace-waterfall">
+          <p className="mb-2 text-[12px] text-ink-mute">
+            Each bar is one step; longer bars took longer. Select a step to see its details.
+          </p>
           {rows.map(({ span, depth, leftPct, widthPct, durMs }) => {
             const expanded = expandedSpanId === span.spanId
             const attributes = Object.entries(span.attributes)
+            const hasPermission = attributes.some(([key]) => key.startsWith('permission.'))
+            const plain = span.status !== null ? plainStatus(span.status) : null
             return (
               <div key={span.spanId}>
                 <button
                   type="button"
                   onClick={() => setExpandedSpanId(expanded ? null : span.spanId)}
                   aria-expanded={expanded}
-                  className="flex h-6 w-full cursor-pointer items-center border-b border-line text-left transition-colors duration-120 hover:bg-raised"
+                  className="flex h-7 w-full cursor-pointer items-center border-b border-line text-left transition-colors duration-120 hover:bg-raised"
                 >
                   <span
                     className="w-[40%] shrink-0 truncate pr-2 text-[11px]"
@@ -136,33 +165,46 @@ function TraceDetail({ trace }: { trace: TraceSummaryDto }): React.JSX.Element {
                   </span>
                 </button>
                 {expanded && (
-                  <div className="border-b border-line bg-surface px-3 py-2">
+                  <div className="flex flex-col gap-2 border-b border-line bg-surface px-3 py-2.5">
+                    <div className="flex items-center gap-2 text-[12px] text-ink-mute">
+                      {plain !== null && (
+                        <Badge status={span.status ?? ''} label={plain.label} title={plain.explain} />
+                      )}
+                      <span>took {plainDuration(durMs)}</span>
+                    </div>
                     {attributes.length === 0 ? (
-                      <div className="text-[11px] text-ink-mute">no attributes</div>
+                      <div className="text-[12px] text-ink-mute">No extra details were recorded for this step.</div>
                     ) : (
-                      <dl className="grid grid-cols-[minmax(96px,max-content)_1fr] gap-x-4 gap-y-1">
-                        {attributes.map(([key, value]) => {
-                          const permission = key.startsWith('permission.')
-                          return (
-                            <div key={key} className="contents">
-                              <dt
-                                className={`font-mono text-[11px] leading-5 ${
-                                  permission ? 'font-semibold text-ink' : 'text-ink-mute'
-                                }`}
-                              >
-                                {key}
-                              </dt>
-                              <dd
-                                className={`min-w-0 font-mono text-[11px] leading-5 break-words ${
-                                  permission ? 'font-semibold' : ''
-                                }`}
-                              >
-                                {attrValue(value)}
-                              </dd>
-                            </div>
-                          )
-                        })}
-                      </dl>
+                      <>
+                        {hasPermission && (
+                          <div className="text-[11px] text-ink-mute">
+                            Highlighted rows are permission decisions — the record of what the agent was allowed to do.
+                          </div>
+                        )}
+                        <dl className="grid grid-cols-[minmax(96px,max-content)_1fr] gap-x-4 gap-y-1">
+                          {attributes.map(([key, value]) => {
+                            const permission = key.startsWith('permission.')
+                            return (
+                              <div key={key} className="contents">
+                                <dt
+                                  className={`font-mono text-[11px] leading-5 ${
+                                    permission ? 'font-semibold text-ink' : 'text-ink-mute'
+                                  }`}
+                                >
+                                  {key}
+                                </dt>
+                                <dd
+                                  className={`min-w-0 font-mono text-[11px] leading-5 break-words ${
+                                    permission ? 'font-semibold' : ''
+                                  }`}
+                                >
+                                  {attrValue(value)}
+                                </dd>
+                              </div>
+                            )
+                          })}
+                        </dl>
+                      </>
                     )}
                   </div>
                 )}
@@ -182,7 +224,11 @@ export default function TracesPanel(): React.JSX.Element {
 
   return (
     <>
-      <PanelHeader title="traces" />
+      <PanelHeader
+        title="Agent runs"
+        subtitle="A step-by-step record of each thing the agent did."
+        icon={<Icon name="runs" size={18} />}
+      />
       <div className="grid min-h-0 flex-1 grid-cols-[2fr_3fr]">
         <div className="min-h-0 overflow-y-auto border-r border-line">
           {traces.error !== null ? (
@@ -191,12 +237,12 @@ export default function TracesPanel(): React.JSX.Element {
             <LoadingRows />
           ) : (
             <DataTable
-              columns={TRACE_COLUMNS}
+              columns={RUN_COLUMNS}
               rows={traces.data}
               rowKey={(row) => row.traceId}
               onRowClick={(row) => setSelectedId(row.traceId)}
               selectedKey={selectedId}
-              empty="no traces yet - every kernel action and workflow step records spans here"
+              empty="No agent runs yet — each time the assistant does something, its step-by-step record shows up here."
               testId="traces-table"
             />
           )}
@@ -205,7 +251,9 @@ export default function TracesPanel(): React.JSX.Element {
           {selected !== null ? (
             <TraceDetail key={selected.traceId} trace={selected} />
           ) : (
-            <EmptyState>select a trace to see its span waterfall</EmptyState>
+            <EmptyState icon={<Icon name="runs" size={20} />}>
+              Select a run on the left to see each step it took.
+            </EmptyState>
           )}
         </div>
       </div>

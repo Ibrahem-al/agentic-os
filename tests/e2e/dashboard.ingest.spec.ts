@@ -36,6 +36,9 @@ test('trigger a watched-folder ingest from the UI', async () => {
   // The chunks are real graph memory now: Knowledge nodes appear in the
   // memory browser (fixture graph seeds some; the scan adds more sources).
   await page.getByTestId('nav-memory').click()
-  await page.getByRole('button', { name: /knowledge/i }).first().click()
+  // Anchor to the memory label chip ("Knowledge <count>"): the redesign's nav
+  // rail now carries an "Add knowledge" button that an unanchored /knowledge/i
+  // would match first (DOM order), bouncing back to the ingest panel.
+  await page.getByRole('button', { name: /^knowledge/i }).first().click()
   await expect(page.getByText('runbook', { exact: false }).first()).toBeVisible({ timeout: 20_000 })
 })

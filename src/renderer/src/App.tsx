@@ -1,13 +1,18 @@
 /**
- * Dashboard shell (phase 10): fixed left rail (9 panels + subsystem status),
- * panel host on the right. Panel switching is local state — this is a
- * single-window cockpit, not a routed site.
+ * Dashboard shell (phase 10; UI redesign): fixed left rail (Home + grouped
+ * panels + subsystem status), panel host on the right. Panel switching is local
+ * state — this is a single-window app, not a routed site. Labels and grouping
+ * are plain-English per the redesign brief; testids are unchanged.
  */
 import { useCallback, useEffect, useState } from 'react'
 import type { RunnerStatusDto } from '../../shared/ipc'
 import { call, useIpc } from './lib/ipc'
+import { plainStatus } from './lib/plain'
 import { Badge, Button, ToastProvider } from './ui/kit'
+import { Icon } from './ui/icons'
+import type { IconName } from './ui/icons'
 import TitleBar from './ui/TitleBar'
+import HomePanel from './panels/HomePanel'
 import MemoryPanel from './panels/MemoryPanel'
 import ReviewPanel from './panels/ReviewPanel'
 import AuditPanel from './panels/AuditPanel'
@@ -18,19 +23,47 @@ import SkillsPanel from './panels/SkillsPanel'
 import IngestPanel from './panels/IngestPanel'
 import SettingsPanel from './panels/SettingsPanel'
 
-const PANELS = [
-  { key: 'memory', label: 'memory', component: MemoryPanel },
-  { key: 'review', label: 'review queue', component: ReviewPanel },
-  { key: 'audit', label: 'audit log', component: AuditPanel },
-  { key: 'spend', label: 'spend', component: SpendPanel },
-  { key: 'tasks', label: 'tasks & watchers', component: TasksPanel },
-  { key: 'traces', label: 'traces', component: TracesPanel },
-  { key: 'skills', label: 'skills', component: SkillsPanel },
-  { key: 'ingest', label: 'ingestion', component: IngestPanel },
-  { key: 'settings', label: 'settings', component: SettingsPanel }
-] as const
+/**
+ * Panel identity is a fixed union (not derived) so it can be referenced from
+ * PanelProps without a type cycle. Every key keeps its historical `nav-<key>`
+ * testid; only the visible labels moved to plain English.
+ */
+type PanelKey = 'home' | 'memory' | 'review' | 'audit' | 'spend' | 'tasks' | 'traces' | 'skills' | 'ingest' | 'settings'
 
-type PanelKey = (typeof PANELS)[number]['key']
+/**
+ * Shared panel prop bag. Home needs to route the user to a deeper panel; the
+ * other panels may ignore it (their `() => JSX` signatures stay assignable).
+ */
+export interface PanelProps {
+  onNavigate: (key: PanelKey) => void
+}
+
+interface PanelDef {
+  readonly label: string
+  readonly icon: IconName
+  readonly component: (props: PanelProps) => React.JSX.Element
+}
+
+const PANELS: Record<PanelKey, PanelDef> = {
+  home: { label: 'Home', icon: 'home', component: HomePanel },
+  memory: { label: 'Memory', icon: 'memory', component: MemoryPanel },
+  review: { label: 'Approvals', icon: 'approvals', component: ReviewPanel },
+  audit: { label: 'History', icon: 'history', component: AuditPanel },
+  spend: { label: 'Spending', icon: 'spending', component: SpendPanel },
+  tasks: { label: 'Background work', icon: 'tasks', component: TasksPanel },
+  traces: { label: 'Agent runs', icon: 'runs', component: TracesPanel },
+  skills: { label: 'Skills', icon: 'skills', component: SkillsPanel },
+  ingest: { label: 'Add knowledge', icon: 'ingest', component: IngestPanel },
+  settings: { label: 'Settings', icon: 'settings', component: SettingsPanel }
+}
+
+/** Grouped nav (brief IA): Home stands alone; the rest fall under plain group headings. */
+const NAV_GROUPS: readonly { readonly label: string | null; readonly keys: readonly PanelKey[] }[] = [
+  { label: null, keys: ['home'] },
+  { label: 'Decisions', keys: ['review', 'audit'] },
+  { label: 'Knowledge', keys: ['memory', 'ingest', 'skills'] },
+  { label: 'Activity', keys: ['tasks', 'traces', 'spend'] }
+]
 
 /** Poll a rail count every 20s; failures keep the last value (the owning panel reports the outage). */
 function usePolledCount(fetchCount: () => Promise<number>): number {
@@ -68,41 +101,6 @@ const fetchPendingCount = async (): Promise<number> => {
 const fetchDriftCount = async (): Promise<number> => {
   const summary = await call('skills.driftSummary', undefined)
   return summary.flagged
-}
-
-/**
- * Review throughput this week (P1.7) — staged vs decided over the last 7 days,
- * shown in the rail so `stageAll` backlog growth is visible from any panel
- * without opening the review queue. staged > decided ⇒ the queue is growing.
- * Polls every 20s; failures keep the last value (the review panel reports detail).
- */
-function useReviewWeek(): { staged: number; decided: number } {
-  const [week, setWeek] = useState({ staged: 0, decided: 0 })
-  useEffect(() => {
-    let cancelled = false
-    const refresh = async (): Promise<void> => {
-      try {
-        const rows = await call('review.staged.list', {})
-        const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
-        let staged = 0
-        let decided = 0
-        for (const row of rows) {
-          if (Date.parse(row.createdAt) >= weekAgo) staged += 1
-          if (row.decidedAt !== null && Date.parse(row.decidedAt) >= weekAgo) decided += 1
-        }
-        if (!cancelled) setWeek({ staged, decided })
-      } catch {
-        // Review subsystem unavailable this poll — keep the last value.
-      }
-    }
-    void refresh()
-    const timer = setInterval(() => void refresh(), 20_000)
-    return () => {
-      cancelled = true
-      clearInterval(timer)
-    }
-  }, [])
-  return week
 }
 
 /**
@@ -155,30 +153,30 @@ function isRunnerBannerState(state: string): state is RunnerBannerState {
  */
 const RUNNER_BANNER_COPY: Record<RunnerBannerState, { title: string; hint: React.JSX.Element; tint: string }> = {
   'auth-expired': {
-    title: 'subscription runner sign-in expired',
+    title: 'Your Claude sign-in has expired',
     hint: (
       <>
-        run <code className="rounded bg-raised px-1 font-mono text-[11px] text-ink">claude /login</code> in any
+        Run <code className="rounded bg-raised px-1 font-mono text-[11px] text-ink">claude /login</code> in any
         terminal, then retry.
       </>
     ),
     tint: 'border-err/40 bg-err/10'
   },
   'quota-exhausted': {
-    title: 'subscription runner usage limit reached',
-    hint: <>the subscription hit its usage limit. it resets automatically; retry once it does.</>,
+    title: 'Claude usage limit reached',
+    hint: <>Your Claude subscription hit its usage limit. It resets on its own — retry once it does.</>,
     tint: 'border-warn/40 bg-warn/10'
   },
   'not-installed': {
-    title: 'subscription runner cli unavailable',
+    title: 'The Claude command-line tool isn’t set up',
     hint: (
       <>
-        install claude code (
+        Install Claude Code (
         <code className="rounded bg-raised px-1 font-mono text-[11px] text-ink">
           npm install -g @anthropic-ai/claude-code
         </code>
         ) or point <code className="rounded bg-raised px-1 font-mono text-[11px] text-ink">runner.binaryPath</code> in
-        settings.json at the cli, then retry.
+        settings.json at the tool, then retry.
       </>
     ),
     tint: 'border-warn/40 bg-warn/10'
@@ -202,16 +200,17 @@ function RunnerBanner({
   onRetry: () => void
 }): React.JSX.Element {
   const { title, hint, tint } = RUNNER_BANNER_COPY[state]
+  const plain = plainStatus(state)
   return (
     <div role="alert" data-testid="runner-banner" className={`flex items-start gap-3 border-b px-5 py-2.5 ${tint}`}>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <Badge status={state} />
+          <Badge status={state} label={plain.label} title={plain.explain} />
           <span className="text-[13px] font-medium">{title}</span>
         </div>
         <div className="mt-1 text-[12px] text-ink-mute">
           {hint}{' '}
-          reasoning falls back to your cloud or local tier until this clears, so nothing is blocked.
+          Meanwhile your work keeps running on your cloud or local AI, so nothing is blocked.
         </div>
         {lastError !== null && lastError !== '' && (
           <div className="mt-1 font-mono text-[11px] break-words text-err">{lastError}</div>
@@ -277,62 +276,71 @@ function SubsystemStatus(): React.JSX.Element {
   }, [reload])
   if (status.data === null) return <div className="px-4 py-3 text-[11px] text-ink-faint">…</div>
   const subs = status.data.subsystems
+  // Boot subsystems in plain words (brief dictionary). `up` is whether the boot
+  // stage produced a live singleton this launch.
   const entries: readonly { key: string; label: string; up: boolean }[] = [
-    { key: 'storage', label: 'storage', up: subs.storage },
-    { key: 'models', label: 'models', up: subs.models },
-    { key: 'kernel', label: 'kernel', up: subs.kernel },
-    { key: 'mcp', label: 'mcp', up: subs.mcp },
-    { key: 'agents', label: 'agents', up: subs.agents }
+    { key: 'storage', label: 'Storage', up: subs.storage },
+    { key: 'models', label: 'AI models', up: subs.models },
+    { key: 'kernel', label: 'Core engine', up: subs.kernel },
+    { key: 'mcp', label: 'Claude connection', up: subs.mcp },
+    { key: 'agents', label: 'Background agents', up: subs.agents }
   ]
+  const plainSubsystem = (key: string): string => entries.find((e) => e.key === key)?.label ?? key
   // Any subsystem that failed or came up degraded, with its human-readable
   // reason (a corrupt WAL, a decrypt failure, a port in use, …). Shown only when
-  // something is wrong — a healthy launch renders just the dot strip.
+  // something is wrong — a healthy launch renders just the calm "all running" row.
   const problems = (status.data.diagnostics ?? []).filter((d) => d.level !== 'ok')
+  // What to name in the "needs attention" line: down subsystems plus any that
+  // came up but reported a warn/error diagnostic (up-but-degraded).
+  const attention = new Set<string>()
+  for (const entry of entries) if (!entry.up) attention.add(entry.label)
+  for (const problem of problems) attention.add(plainSubsystem(problem.subsystem))
+  const healthy = attention.size === 0
   return (
     <div className="border-t border-line px-4 py-3">
-      <div className="flex items-center justify-between gap-2">
-        <ul className="flex flex-wrap gap-x-3 gap-y-1">
-          {entries.map((entry) => (
-            <li key={entry.key} className="flex items-center gap-1.5 font-mono text-[11px]">
-              <span
-                aria-hidden="true"
-                className={`inline-block size-1.5 rounded-full ${entry.up ? 'bg-ok' : 'bg-err'}`}
-              />
-              <span className={entry.up ? 'text-ink-mute' : 'text-err'}>
-                {entry.label}
-                <span className="sr-only">{entry.up ? ' up' : ' down'}</span>
+      {healthy ? (
+        <div className="flex items-center gap-1.5 text-[12px] text-ink-mute">
+          <span aria-hidden="true" className="inline-block size-1.5 rounded-full bg-ok" />
+          <span>All systems running</span>
+        </div>
+      ) : (
+        <>
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-start gap-1.5 text-[12px] text-warn">
+              <span aria-hidden="true" className="mt-1.5 inline-block size-1.5 shrink-0 rounded-full bg-err" />
+              <span>
+                {attention.size === 1 ? '1 part needs' : `${attention.size} parts need`} attention:{' '}
+                {[...attention].join(', ')}
               </span>
-            </li>
-          ))}
-        </ul>
-        {problems.length > 0 && (
-          <Button
-            testId="subsystem-reconnect"
-            onClick={() => void onReconnect()}
-            disabled={reconnecting}
-            title="re-run every down subsystem's boot step"
-          >
-            {reconnecting ? 'reconnecting…' : 'reconnect'}
-          </Button>
-        )}
-      </div>
-      {problems.length > 0 && (
-        <ul
-          role="status"
-          data-testid="subsystem-diagnostics"
-          className="mt-2 max-h-44 space-y-1.5 overflow-y-auto"
-        >
-          {problems.map((d) => (
-            <li key={d.subsystem} className="text-[11px] leading-snug">
-              <span
-                className={`font-mono font-medium ${d.level === 'error' ? 'text-err' : 'text-warn'}`}
+            </div>
+            {problems.length > 0 && (
+              <Button
+                testId="subsystem-reconnect"
+                onClick={() => void onReconnect()}
+                disabled={reconnecting}
+                title="Try starting the parts that didn’t come up again"
               >
-                {d.subsystem}
-              </span>{' '}
-              <span className="break-words text-ink-mute">{d.detail}</span>
-            </li>
-          ))}
-        </ul>
+                {reconnecting ? 'reconnecting…' : 'reconnect'}
+              </Button>
+            )}
+          </div>
+          {problems.length > 0 && (
+            <ul
+              role="status"
+              data-testid="subsystem-diagnostics"
+              className="mt-2 max-h-44 space-y-1.5 overflow-y-auto"
+            >
+              {problems.map((d) => (
+                <li key={d.subsystem} className="text-[11px] leading-snug">
+                  <span className={`font-medium ${d.level === 'error' ? 'text-err' : 'text-warn'}`}>
+                    {plainSubsystem(d.subsystem)}
+                  </span>{' '}
+                  <span className="break-words text-ink-mute">{d.detail}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
       )}
       <div className="mt-2 font-mono text-[11px] text-ink-faint">
         v{status.data.version} · {status.data.mcpUrl ?? 'mcp off'}
@@ -341,13 +349,67 @@ function SubsystemStatus(): React.JSX.Element {
   )
 }
 
+/**
+ * One nav-rail item: icon + plain label, 32px tall, the grandfathered 2px accent
+ * inset when active. Carries the review pending-count and skills drift badges
+ * (unchanged testids). Keeps its historical `nav-<key>` testid.
+ */
+function NavItem({
+  panelKey,
+  active,
+  pending,
+  drift,
+  onSelect
+}: {
+  panelKey: PanelKey
+  active: PanelKey
+  pending: number
+  drift: number
+  onSelect: (key: PanelKey) => void
+}): React.JSX.Element {
+  const def = PANELS[panelKey]
+  const isActive = panelKey === active
+  return (
+    <button
+      type="button"
+      data-testid={`nav-${panelKey}`}
+      aria-current={isActive ? 'page' : undefined}
+      onClick={() => onSelect(panelKey)}
+      className={`flex h-8 w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 text-left text-[13px] transition-colors duration-120 ${
+        isActive
+          ? 'bg-raised text-ink shadow-[inset_2px_0_0_var(--color-accent)]'
+          : 'text-ink-mute hover:bg-raised hover:text-ink'
+      }`}
+    >
+      <Icon name={def.icon} size={16} className="shrink-0" />
+      <span className="min-w-0 flex-1 truncate">{def.label}</span>
+      {panelKey === 'review' && pending > 0 && (
+        <span
+          className="rounded-full bg-warn/15 px-1.5 font-mono text-[11px] text-warn"
+          data-testid="review-pending-count"
+        >
+          {pending}
+        </span>
+      )}
+      {panelKey === 'skills' && drift > 0 && (
+        <span
+          className="rounded-full bg-warn/15 px-1.5 font-mono text-[11px] text-warn"
+          data-testid="drift-flagged-count"
+        >
+          {drift}
+          <span className="sr-only"> drift-flagged skill versions</span>
+        </span>
+      )}
+    </button>
+  )
+}
+
 export default function App(): React.JSX.Element {
-  const [active, setActive] = useState<PanelKey>('memory')
+  const [active, setActive] = useState<PanelKey>('home')
   const pending = usePolledCount(fetchPendingCount)
   const drift = usePolledCount(fetchDriftCount)
-  const week = useReviewWeek()
   const { status: runnerStatus, refresh: refreshRunner } = useRunnerStatus()
-  const ActivePanel = PANELS.find((p) => p.key === active)?.component ?? MemoryPanel
+  const ActivePanel = PANELS[active].component
 
   // Retry = one live re-check (the canary) then re-read the snapshot.
   const retryRunner = useCallback(async (): Promise<void> => {
@@ -382,50 +444,36 @@ export default function App(): React.JSX.Element {
         <TitleBar />
         <div className="flex min-h-0 flex-1">
           <nav className="z-20 flex w-[216px] shrink-0 flex-col border-r border-line bg-surface" aria-label="panels">
-            <ul className="flex-1 overflow-y-auto px-2 pt-3">
-              {PANELS.map((panel) => {
-                const isActive = panel.key === active
-                return (
-                  <li key={panel.key}>
-                    <button
-                      type="button"
-                      data-testid={`nav-${panel.key}`}
-                      aria-current={isActive ? 'page' : undefined}
-                      onClick={() => setActive(panel.key)}
-                      className={`flex w-full cursor-pointer items-center justify-between rounded-md px-2.5 py-[7px] text-left text-[13px] transition-colors duration-120 ${
-                        isActive ? 'bg-raised text-ink shadow-[inset_2px_0_0_var(--color-accent)]' : 'text-ink-mute hover:bg-raised hover:text-ink'
-                      }`}
-                    >
-                      <span>{panel.label}</span>
-                      {panel.key === 'review' && pending > 0 && (
-                        <span className="rounded-full bg-warn/15 px-1.5 font-mono text-[11px] text-warn" data-testid="review-pending-count">
-                          {pending}
-                        </span>
-                      )}
-                      {panel.key === 'skills' && drift > 0 && (
-                        <span className="rounded-full bg-warn/15 px-1.5 font-mono text-[11px] text-warn" data-testid="drift-flagged-count">
-                          {drift}
-                          <span className="sr-only"> drift-flagged skill versions</span>
-                        </span>
-                      )}
-                    </button>
-                  </li>
-                )
-              })}
-            </ul>
-            <div className="border-t border-line px-4 py-2.5">
-              <div className="font-mono text-[11px] text-ink-faint" data-testid="review-week-counter">
-                this week{' '}
-                <span className={week.staged > week.decided ? 'text-warn' : 'text-ink-mute'}>staged {week.staged}</span>{' '}
-                · <span className="text-ink-mute">decided {week.decided}</span>
-              </div>
+            <div className="flex-1 overflow-y-auto px-2 pt-3">
+              {NAV_GROUPS.map((group, i) => (
+                <div key={group.label ?? 'top'} className={i > 0 ? 'mt-3' : ''}>
+                  {group.label !== null && (
+                    <div className="px-2.5 pb-1 text-[11px] font-medium text-ink-mute">{group.label}</div>
+                  )}
+                  <div className="flex flex-col gap-0.5">
+                    {group.keys.map((key) => (
+                      <NavItem
+                        key={key}
+                        panelKey={key}
+                        active={active}
+                        pending={pending}
+                        drift={drift}
+                        onSelect={setActive}
+                      />
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="border-t border-line px-2 py-2">
+              <NavItem panelKey="settings" active={active} pending={pending} drift={drift} onSelect={setActive} />
             </div>
             {runnerFallbackChip}
             <SubsystemStatus />
           </nav>
           <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
             {runnerBanner}
-            <ActivePanel />
+            <ActivePanel onNavigate={setActive} />
           </main>
         </div>
       </div>

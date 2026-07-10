@@ -38,6 +38,10 @@ test('capture every panel', async () => {
     await page.screenshot({ path: join(outDir, `${name}.png`) })
   }
 
+  // home: the app's new default landing panel
+  await page.getByTestId('nav-home').click()
+  await shoot('home')
+
   // memory: browse a label + inspect a node
   await page.getByTestId('nav-memory').click()
   await page.getByRole('button', { name: /preference/i }).first().click()

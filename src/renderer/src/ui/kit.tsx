@@ -8,6 +8,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import type { ReactNode } from 'react'
 import { statusColor } from '../design-tokens'
 import type { IpcError } from '../lib/ipc'
+import { Icon } from './icons'
 
 // ── status grammar ────────────────────────────────────────────────────────────
 
@@ -26,8 +27,21 @@ const STATUS_BG: Record<string, string> = {
   accent: 'bg-accent/15'
 }
 
-/** Status word → the shared color grammar; unmapped statuses render neutral. */
-export function Badge({ status, label }: { status: string; label?: string }): React.JSX.Element {
+/**
+ * Status word → the shared color grammar; unmapped statuses render neutral.
+ * `data-status` always carries the RAW backend word (tests + design tokens key
+ * off it); `label` is the plain-language display text and `title` the tooltip
+ * that explains it, both from lib/plain.
+ */
+export function Badge({
+  status,
+  label,
+  title
+}: {
+  status: string
+  label?: string
+  title?: string
+}): React.JSX.Element {
   const token = statusColor[status]
   const textCls = token !== undefined ? (STATUS_TEXT[token] ?? 'text-ink-mute') : 'text-ink-mute'
   const bgCls = token !== undefined ? (STATUS_BG[token] ?? 'bg-raised') : 'bg-raised'
@@ -35,6 +49,7 @@ export function Badge({ status, label }: { status: string; label?: string }): Re
     <span
       className={`inline-block rounded-full px-2 py-0.5 font-mono text-[11px] leading-4 whitespace-nowrap ${textCls} ${bgCls}`}
       data-status={status}
+      {...(title !== undefined ? { title } : {})}
     >
       {label ?? status}
     </span>
@@ -60,7 +75,7 @@ export function Confidence({ value }: { value: number | null | undefined }): Rea
 
 // ── buttons & inputs ──────────────────────────────────────────────────────────
 
-type ButtonVariant = 'primary' | 'danger' | 'ghost'
+type ButtonVariant = 'primary' | 'danger' | 'danger-ghost' | 'ghost'
 
 export function Button({
   variant = 'ghost',
@@ -90,7 +105,11 @@ export function Button({
       ? 'bg-accent text-accent-ink hover:bg-accent/85'
       : variant === 'danger'
         ? 'bg-err/85 text-ink hover:bg-err'
-        : 'border border-line-strong text-ink hover:bg-raised'
+        : // A calmer destructive look for actions that sit beside a primary one:
+          // a hairline error border instead of a full red fill (brief §5).
+          variant === 'danger-ghost'
+          ? 'border border-err/40 text-err hover:bg-err/10'
+          : 'border border-line-strong text-ink hover:bg-raised'
   return (
     <button
       type={type}
@@ -238,21 +257,35 @@ export function Toggle({
 
 // ── layout ────────────────────────────────────────────────────────────────────
 
-/** Panel header row: title left, actions right (VARIANCE 4: left-aligned). */
+/**
+ * Panel header row: title left, actions right (VARIANCE 4: left-aligned). The
+ * redesign adds an optional subdued `icon` left of the title and a one-line
+ * plain-English `subtitle` under it (every panel gets one — brief §Design rules).
+ */
 export function PanelHeader({
   title,
+  subtitle,
+  icon,
   meta,
   actions
 }: {
   title: string
+  subtitle?: string
+  icon?: ReactNode
   meta?: ReactNode
   actions?: ReactNode
 }): React.JSX.Element {
   return (
-    <header className="flex items-baseline gap-3 border-b border-line px-5 py-3">
-      <h1 className="text-[20px] font-semibold leading-7">{title}</h1>
-      {meta !== undefined && <div className="text-[12px] text-ink-mute">{meta}</div>}
-      {actions !== undefined && <div className="ml-auto flex items-center gap-2">{actions}</div>}
+    <header className="border-b border-line px-5 py-3">
+      <div className="flex items-baseline gap-3">
+        <div className="flex items-center gap-2">
+          {icon !== undefined && <span className="text-ink-mute">{icon}</span>}
+          <h1 className="text-[20px] font-semibold leading-7">{title}</h1>
+        </div>
+        {meta !== undefined && <div className="text-[12px] text-ink-mute">{meta}</div>}
+        {actions !== undefined && <div className="ml-auto flex items-center gap-2">{actions}</div>}
+      </div>
+      {subtitle !== undefined && <p className="mt-0.5 text-[12px] text-ink-mute">{subtitle}</p>}
     </header>
   )
 }
@@ -268,9 +301,65 @@ export function SectionHeader({ children, meta }: { children: ReactNode; meta?: 
 
 // ── states ────────────────────────────────────────────────────────────────────
 
-/** Empty state: says why it's empty + what populates it (PRODUCT.md #4). */
-export function EmptyState({ children }: { children: ReactNode }): React.JSX.Element {
-  return <div className="px-5 py-10 text-center text-[13px] text-ink-mute">{children}</div>
+/**
+ * Empty state: says why it's empty + what populates it (PRODUCT.md #4). The
+ * redesign adds an optional subdued `icon` above the sentence and an optional
+ * `action` (a button/link to the thing that fills it) below.
+ */
+export function EmptyState({
+  children,
+  action,
+  icon
+}: {
+  children: ReactNode
+  action?: ReactNode
+  icon?: ReactNode
+}): React.JSX.Element {
+  return (
+    <div className="px-5 py-10 text-center text-[13px] text-ink-mute">
+      {icon !== undefined && <div className="mb-2 flex justify-center text-ink-mute">{icon}</div>}
+      <div>{children}</div>
+      {action !== undefined && <div className="mt-3 flex justify-center">{action}</div>}
+    </div>
+  )
+}
+
+/**
+ * Progressive-disclosure expander for technical detail (ids, JSON, raw signals)
+ * — the redesign moves cockpit density behind these so a row leads with a plain
+ * sentence. Chevron rotates on open (feedback transition; global reduced-motion
+ * collapses it); children sit in a bg-surface inset.
+ */
+export function Disclosure({
+  summary,
+  children,
+  testId,
+  defaultOpen = false
+}: {
+  summary: ReactNode
+  children: ReactNode
+  testId?: string
+  defaultOpen?: boolean
+}): React.JSX.Element {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div {...(testId !== undefined ? { 'data-testid': testId } : {})}>
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((prev) => !prev)}
+        className="flex w-full cursor-pointer items-center gap-1.5 rounded-md py-1 text-left text-[12px] text-ink-mute transition-colors duration-120 hover:text-ink"
+      >
+        <Icon
+          name="chevron"
+          size={12}
+          className={`shrink-0 transition-transform duration-120 ${open ? 'rotate-90' : ''}`}
+        />
+        <span className="min-w-0">{summary}</span>
+      </button>
+      {open && <div className="mt-1 rounded-md bg-surface px-3 py-2">{children}</div>}
+    </div>
+  )
 }
 
 /** Backend errors verbatim — they are written for operators. */
