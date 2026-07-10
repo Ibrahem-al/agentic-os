@@ -7,7 +7,8 @@ import {
   IPC_WINDOW_CLOSE,
   IPC_WINDOW_IS_MAXIMIZED,
   IPC_WINDOW_MINIMIZE,
-  IPC_WINDOW_TOGGLE_MAXIMIZE
+  IPC_WINDOW_TOGGLE_MAXIMIZE,
+  type BootDiagnosticDto
 } from '../shared/ipc'
 import {
   appDataPaths,
@@ -91,6 +92,7 @@ import {
 } from './triggers'
 import { registerIpcHandlers } from './ipc'
 import { bootUpdater } from './updater'
+import { computeBootDiagnostics } from './bootDiagnostics'
 
 // Native modules are CJS; load them through require so the bundler leaves them
 // external and Electron resolves them from node_modules at runtime.
@@ -155,6 +157,40 @@ let triggerInstances: {
   inactivity: InactivityMonitor
   rules: RuleLoadResult
 } | null = null
+
+/**
+ * Per-subsystem boot outcome, surfaced to the dashboard (App.tsx subsystem
+ * strip) and the get_app_status MCP tool so a failed/degraded connection shows
+ * its CAUSE, not just a red dot. Each boot step's catch records here; a couple of
+ * non-throwing degradations (mcp port-in-use) record directly; computeBootDiagnostics
+ * folds them with the resulting singleton state into the surfaced list.
+ */
+const bootErrors = new Map<string, string>()
+function recordBootError(subsystem: string, err: unknown): void {
+  bootErrors.set(subsystem, err instanceof Error ? err.message : String(err))
+}
+
+/**
+ * Snapshot the module singletons + captured boot errors and fold them into the
+ * per-subsystem diagnostics the dashboard shows (the pure fold lives in
+ * bootDiagnostics.ts so it is unit-testable). Called once at bootIpc (the last
+ * boot step) — a boot-time property, static until the next launch, like
+ * `subsystems`.
+ */
+function currentBootDiagnostics(): BootDiagnosticDto[] {
+  return computeBootDiagnostics({
+    errors: bootErrors,
+    engineOpen: engine !== null,
+    appDataOpen: appData !== null,
+    walQuarantined: engine?.walQuarantined ?? null,
+    modelsOpen: ollama !== null,
+    kernelOpen: kernelInstances !== null,
+    mcpOpen: mcpServer !== null,
+    mcpUrl: mcpServer?.url ?? null,
+    agentsOpen: extractionAgent !== null,
+    triggersOpen: triggerInstances !== null
+  })
+}
 
 /**
  * Phase-13 test seam (rule 12, recorded): AGENTIC_OS_RERANKER_FILES points at
@@ -296,6 +332,11 @@ async function bootStorage(): Promise<void> {
       counts[0]?.['c'] ?? 0
     )} nodes, vector+FTS from vendored extensions${backupNote}`
   )
+  if (engine.walQuarantined !== null) {
+    console.warn(
+      `[storage] RECOVERED from a corrupt graph WAL — quarantined the torn WAL to ${engine.walQuarantined} and reopened at the last checkpoint. Un-checkpointed writes since that checkpoint were lost; the quarantined WAL is preserved for inspection.`
+    )
+  }
 
   // Refresh the machine-readable data manifest (§3 "note") with live versions +
   // backup pointers. Atomic tmp+rename; a manifest write failure never takes
@@ -522,6 +563,7 @@ async function bootMcp(): Promise<void> {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code
     if (code === 'EADDRINUSE') {
+      bootErrors.set('mcp', `port ${MCP_PORT} already in use (another ${PRODUCT_NAME} instance?) — MCP server disabled`)
       console.error(
         `[mcp] port ${MCP_PORT} is already in use (another ${PRODUCT_NAME} instance?) — MCP server disabled this launch`
       )
@@ -804,6 +846,7 @@ function bootIpc(): void {
     mcp: mcpServer !== null,
     agents: extractionAgent !== null
   }
+  const diagnostics = currentBootDiagnostics()
   registerIpcHandlers({
     engine,
     db: appData?.db ?? null,
@@ -826,7 +869,8 @@ function bootIpc(): void {
     // snapshot — provider/model/key changes take effect on the NEXT reasoning
     // call with no app restart.
     onSettingsChanged: () => providerRouter?.invalidate(),
-    subsystems
+    subsystems,
+    diagnostics
   })
   // §4 read tools ride the SAME shared read functions as the IPC handlers above;
   // supply their late-bound deps now — the last boot step, where every singleton
@@ -853,7 +897,8 @@ function bootIpc(): void {
         platform: process.platform,
         userDataDir,
         subsystems,
-        mcpUrl: mcpServer.url
+        mcpUrl: mcpServer.url,
+        diagnostics
       }
     })
   }
@@ -947,36 +992,43 @@ void app.whenReady().then(async () => {
   try {
     logNativeModuleVersions()
   } catch (err) {
+    recordBootError('native', err)
     console.error('[native] native-module load FAILED', err)
   }
   try {
     await bootStorage()
   } catch (err) {
+    recordBootError('storage', err)
     console.error('[storage] storage boot FAILED', err)
   }
   try {
     await bootModels()
   } catch (err) {
+    recordBootError('models', err)
     console.error('[models] model-layer boot FAILED', err)
   }
   try {
     bootKernel()
   } catch (err) {
+    recordBootError('kernel', err)
     console.error('[kernel] kernel boot FAILED', err)
   }
   try {
     await bootMcp()
   } catch (err) {
+    recordBootError('mcp', err)
     console.error('[mcp] MCP boot FAILED', err)
   }
   try {
     bootAgents()
   } catch (err) {
+    recordBootError('agents', err)
     console.error('[agents] agents boot FAILED', err)
   }
   try {
     await bootTriggers()
   } catch (err) {
+    recordBootError('triggers', err)
     console.error('[triggers] triggers boot FAILED', err)
   }
   try {

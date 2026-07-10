@@ -267,6 +267,10 @@ function SubsystemStatus(): React.JSX.Element {
     { key: 'mcp', label: 'mcp', up: subs.mcp },
     { key: 'agents', label: 'agents', up: subs.agents }
   ]
+  // Any subsystem that failed or came up degraded, with its human-readable
+  // reason (a corrupt WAL, a decrypt failure, a port in use, …). Shown only when
+  // something is wrong — a healthy launch renders just the dot strip.
+  const problems = (status.data.diagnostics ?? []).filter((d) => d.level !== 'ok')
   return (
     <div className="border-t border-line px-4 py-3">
       <ul className="flex flex-wrap gap-x-3 gap-y-1">
@@ -283,6 +287,24 @@ function SubsystemStatus(): React.JSX.Element {
           </li>
         ))}
       </ul>
+      {problems.length > 0 && (
+        <ul
+          role="status"
+          data-testid="subsystem-diagnostics"
+          className="mt-2 max-h-44 space-y-1.5 overflow-y-auto"
+        >
+          {problems.map((d) => (
+            <li key={d.subsystem} className="text-[11px] leading-snug">
+              <span
+                className={`font-mono font-medium ${d.level === 'error' ? 'text-err' : 'text-warn'}`}
+              >
+                {d.subsystem}
+              </span>{' '}
+              <span className="break-words text-ink-mute">{d.detail}</span>
+            </li>
+          ))}
+        </ul>
+      )}
       <div className="mt-2 font-mono text-[11px] text-ink-faint">
         v{status.data.version} · {status.data.mcpUrl ?? 'mcp off'}
       </div>

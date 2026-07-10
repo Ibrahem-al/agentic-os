@@ -35,6 +35,7 @@ export async function getAppStatus(deps: AppStatusDeps): Promise<AppStatusFullDt
     userDataDir: deps.userDataDir,
     subsystems: deps.subsystems,
     mcpUrl: deps.mcpUrl,
+    diagnostics: deps.diagnostics ?? [],
     ollama: {
       state: status.state,
       installedModels: status.installedModels,
