@@ -5,6 +5,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import type {
+  BackupSettingsDto,
   InstallHookResultDto,
   IpcCloudProvider,
   ModelSettingsPatchDto,
@@ -55,6 +56,26 @@ function errMessage(err: unknown): string {
 function mbPerSec(bytesPerSecond: number | undefined): string {
   if (bytesPerSecond === undefined) return ''
   return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`
+}
+
+/** Human-readable byte size for the backup list. */
+function bytesHuman(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit++
+  }
+  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`
+}
+
+/** Auto-backup interval → a plain-language label. */
+function intervalLabel(hours: number): string {
+  if (hours === 24) return 'daily'
+  if (hours === 168) return 'weekly'
+  return `every ${hours} hours`
 }
 
 /**
@@ -115,6 +136,104 @@ export default function SettingsPanel(): React.JSX.Element {
   // First-enable §10.7 egress consent (P1.10).
   const [consentOpen, setConsentOpen] = useState(false)
   const [consentAck, setConsentAck] = useState(false)
+
+  // ── data & backups ───────────────────────────────────────────────────────────
+  const backupsQuery = useIpc('backups.list', undefined)
+  // A create/restore/reset stages a marker and relaunches the app; this flag
+  // shows a "restarting…" state and freezes the section while it happens.
+  const [restarting, setRestarting] = useState(false)
+  const [confirmBackup, setConfirmBackup] = useState(false)
+  const [restoreConfirm, setRestoreConfirm] = useState<string | null>(null)
+  const [savingBackupSettings, setSavingBackupSettings] = useState(false)
+  const [keepLastInput, setKeepLastInput] = useState('')
+  const [keepDaysInput, setKeepDaysInput] = useState('')
+  const [exporting, setExporting] = useState(false)
+  const [exportPath, setExportPath] = useState<string | null>(null)
+  const [resetOpen, setResetOpen] = useState(false)
+  const [resetText, setResetText] = useState('')
+
+  // Seed the retention inputs from persisted settings whenever they arrive.
+  useEffect(() => {
+    const s = backupsQuery.data?.settings
+    if (s === undefined) return
+    setKeepLastInput(String(s.keepLast))
+    setKeepDaysInput(s.keepDays !== undefined ? String(s.keepDays) : '')
+    // Only re-sync on a fresh settings payload.
+  }, [backupsQuery.data?.settings])
+
+  const saveBackupSettings = async (patch: Partial<BackupSettingsDto>): Promise<void> => {
+    setSavingBackupSettings(true)
+    try {
+      await call('backups.settings.set', patch)
+      backupsQuery.reload()
+      toast.notify('ok', 'saved')
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setSavingBackupSettings(false)
+    }
+  }
+
+  const saveRetention = async (): Promise<void> => {
+    const keepLast = Number.parseInt(keepLastInput, 10)
+    const keepDays = Number.parseInt(keepDaysInput, 10)
+    await saveBackupSettings({
+      keepLast: Number.isFinite(keepLast) && keepLast >= 1 ? keepLast : 1,
+      // 0 (or empty) turns the age cap off — the main side drops keepDays < 1.
+      keepDays: Number.isFinite(keepDays) && keepDays >= 1 ? keepDays : 0
+    })
+  }
+
+  const backupNow = async (): Promise<void> => {
+    setRestarting(true)
+    setConfirmBackup(false)
+    try {
+      await call('backups.create', undefined)
+      // The app relaunches; this panel is torn down. Only a failure re-enables it.
+    } catch (err) {
+      setRestarting(false)
+      toast.notify('err', errMessage(err))
+    }
+  }
+
+  const restoreBackup = async (dirName: string): Promise<void> => {
+    setRestarting(true)
+    setRestoreConfirm(null)
+    try {
+      await call('backups.restore', { dirName })
+    } catch (err) {
+      setRestarting(false)
+      toast.notify('err', errMessage(err))
+    }
+  }
+
+  const exportData = async (): Promise<void> => {
+    setExporting(true)
+    try {
+      const { path } = await call('data.export', undefined)
+      if (path !== null) {
+        setExportPath(path)
+        toast.notify('ok', 'data exported')
+      } else {
+        toast.notify('info', 'export cancelled')
+      }
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const resetData = async (): Promise<void> => {
+    setRestarting(true)
+    setResetOpen(false)
+    try {
+      await call('data.reset', undefined)
+    } catch (err) {
+      setRestarting(false)
+      toast.notify('err', errMessage(err))
+    }
+  }
 
   // ── app updates ──────────────────────────────────────────────────────────────
   // The app version rides app.status (the same source the rail footer renders).
@@ -821,6 +940,206 @@ export default function SettingsPanel(): React.JSX.Element {
             </div>
           </div>
         </section>
+
+        {/* ── data & backups ───────────────────────────────────────────────── */}
+        <section className="max-w-3xl border-t border-line pt-5" data-testid="settings-backups">
+          <SectionHeader meta="a version history of your data — snapshot now, restore to any point, or start fresh">
+            data &amp; backups
+          </SectionHeader>
+          <div className="flex flex-col gap-4">
+            {/* Backup now */}
+            <div className="flex flex-wrap items-center gap-2.5">
+              {!confirmBackup ? (
+                <Button
+                  variant="primary"
+                  testId="backups-create"
+                  disabled={restarting}
+                  onClick={() => setConfirmBackup(true)}
+                >
+                  back up now
+                </Button>
+              ) : (
+                <div className="flex flex-wrap items-center gap-2.5" data-testid="backups-create-confirm">
+                  <span className="text-[12px]">
+                    creating a backup restarts the app to snapshot the memory graph safely. it takes a few seconds.
+                  </span>
+                  <Button
+                    variant="primary"
+                    testId="backups-create-confirm-yes"
+                    disabled={restarting}
+                    onClick={() => void backupNow()}
+                  >
+                    back up &amp; restart
+                  </Button>
+                  <Button disabled={restarting} onClick={() => setConfirmBackup(false)}>
+                    cancel
+                  </Button>
+                </div>
+              )}
+              {restarting && (
+                <span className="text-[12px] text-ink-mute" role="status" data-testid="backups-restarting">
+                  restarting…
+                </span>
+              )}
+            </div>
+
+            {/* Automatic backups */}
+            <div className="flex flex-col gap-3 border-t border-line pt-3">
+              <div className="flex flex-wrap items-center gap-3">
+                <Toggle
+                  label="automatic backups"
+                  testId="backups-auto-enable"
+                  checked={backupsQuery.data?.settings.enabled ?? true}
+                  disabled={savingBackupSettings || restarting || backupsQuery.data === null}
+                  onChange={(v) => void saveBackupSettings({ enabled: v })}
+                />
+                <span className="text-[13px]">{(backupsQuery.data?.settings.enabled ?? true) ? 'on' : 'off'}</span>
+                <div className="ml-auto">
+                  <Select
+                    ariaLabel="backup interval"
+                    testId="backups-interval"
+                    value={String(backupsQuery.data?.settings.intervalHours ?? 24)}
+                    onChange={(v) => void saveBackupSettings({ intervalHours: Number(v) })}
+                    options={(backupsQuery.data?.intervalChoices ?? [6, 12, 24, 168]).map((h) => ({
+                      value: String(h),
+                      label: intervalLabel(h)
+                    }))}
+                  />
+                </div>
+              </div>
+              <div className="flex flex-wrap items-end gap-3">
+                <label className="flex flex-col gap-1">
+                  <span className="text-[12px] text-ink-mute">keep last</span>
+                  <input
+                    type="number"
+                    min={1}
+                    aria-label="keep last N backups"
+                    data-testid="backups-keep-last"
+                    value={keepLastInput}
+                    onChange={(e) => setKeepLastInput(e.target.value)}
+                    className="h-8 w-24 rounded-md border border-line-strong bg-raised px-2.5 font-mono text-[12px] text-ink focus:border-accent focus:outline-none"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-[12px] text-ink-mute">keep for days (0 = off)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    aria-label="keep for days"
+                    data-testid="backups-keep-days"
+                    value={keepDaysInput}
+                    onChange={(e) => setKeepDaysInput(e.target.value)}
+                    className="h-8 w-28 rounded-md border border-line-strong bg-raised px-2.5 font-mono text-[12px] text-ink focus:border-accent focus:outline-none"
+                  />
+                </label>
+                <Button
+                  variant="primary"
+                  size="default"
+                  testId="backups-save-retention"
+                  disabled={savingBackupSettings || restarting}
+                  onClick={() => void saveRetention()}
+                >
+                  save
+                </Button>
+              </div>
+              <div className="text-[11px] text-ink-faint">
+                only automatic backups are pruned by these limits — manual backups and the safety snapshots taken
+                before a restore or reset are kept forever. automatic backups are created at app startup when one is
+                due (the memory graph can only be snapshotted safely while the app is not holding it open).
+              </div>
+            </div>
+
+            {/* Backup list */}
+            <div className="flex flex-col gap-1 border-t border-line pt-3">
+              {backupsQuery.error !== null ? (
+                <ErrorState error={backupsQuery.error} onRetry={backupsQuery.reload} />
+              ) : backupsQuery.data === null ? (
+                <div className="py-2 text-[12px] text-ink-mute">loading backups…</div>
+              ) : backupsQuery.data.backups.length === 0 ? (
+                <div className="py-2 text-[12px] text-ink-mute">
+                  no backups yet — one is created automatically on the next launch, or back up now.
+                </div>
+              ) : (
+                <div data-testid="backups-list">
+                  {backupsQuery.data.backups.map((b) => (
+                    <div key={b.dirName} className="flex flex-wrap items-center gap-3 border-b border-line py-2">
+                      <Badge status={b.kind} />
+                      {b.createdAt !== null ? (
+                        <Timestamp iso={b.createdAt} />
+                      ) : (
+                        <span className="font-mono text-[11px] text-ink-faint">{b.dirName}</span>
+                      )}
+                      <span className="font-mono text-[11px] text-ink-mute">
+                        {bytesHuman(b.bytes)} · {b.files} files
+                      </span>
+                      <div className="ml-auto">
+                        {!b.restorable ? (
+                          <span className="text-[11px] text-ink-faint">not restorable</span>
+                        ) : restoreConfirm === b.dirName ? (
+                          <div className="flex flex-wrap items-center gap-2" data-testid="backups-restore-confirm">
+                            <span className="text-[11px] text-ink-mute">
+                              restore to this point? current data is snapshotted first, then the app restarts.
+                            </span>
+                            <Button
+                              variant="primary"
+                              testId="backups-restore-confirm-yes"
+                              disabled={restarting}
+                              onClick={() => void restoreBackup(b.dirName)}
+                            >
+                              restore &amp; restart
+                            </Button>
+                            <Button disabled={restarting} onClick={() => setRestoreConfirm(null)}>
+                              cancel
+                            </Button>
+                          </div>
+                        ) : (
+                          <Button
+                            testId={`backups-restore-${b.dirName}`}
+                            disabled={restarting}
+                            onClick={() => setRestoreConfirm(b.dirName)}
+                          >
+                            restore
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Export */}
+            <div className="flex flex-wrap items-center gap-2.5 border-t border-line pt-3">
+              <Button testId="data-export" disabled={exporting || restarting} onClick={() => void exportData()}>
+                {exporting ? 'exporting…' : 'export data…'}
+              </Button>
+              {exportPath !== null && (
+                <span className="font-mono text-[11px] break-all text-ink-mute" data-testid="data-export-path">
+                  exported to {exportPath}
+                </span>
+              )}
+              <span className="text-[11px] text-ink-faint">
+                a portable copy: the graph as csv + cypher, appdata, and settings (api keys are never exported).
+              </span>
+            </div>
+
+            {/* Danger zone: reset */}
+            <div className="flex flex-col gap-2 rounded-md border border-err/40 bg-err/5 p-3" data-testid="data-reset">
+              <div className="flex items-center gap-2">
+                <span className="text-[13px] font-semibold text-err">danger zone</span>
+              </div>
+              <div className="text-[12px] text-ink-mute">
+                reset deletes all data and returns the app to defaults, including the memory graph. your backups are
+                kept — you can restore from one afterwards.
+              </div>
+              <div>
+                <Button variant="danger" testId="data-reset-open" disabled={restarting} onClick={() => setResetOpen(true)}>
+                  reset all data…
+                </Button>
+              </div>
+            </div>
+          </div>
+        </section>
       </div>
 
       {consentOpen && (
@@ -900,6 +1219,58 @@ export default function SettingsPanel(): React.JSX.Element {
             />
           </label>
           <p className="mt-2 text-[11px] text-ink-faint">encrypted with safeStorage; never shown or logged.</p>
+        </Modal>
+      )}
+
+      {resetOpen && (
+        <Modal
+          title="reset all data"
+          onClose={() => {
+            setResetOpen(false)
+            setResetText('')
+          }}
+          footer={
+            <>
+              <Button
+                onClick={() => {
+                  setResetOpen(false)
+                  setResetText('')
+                }}
+              >
+                cancel
+              </Button>
+              <Button
+                variant="danger"
+                testId="data-reset-confirm"
+                disabled={restarting || resetText !== 'RESET'}
+                onClick={() => void resetData()}
+              >
+                reset &amp; restart
+              </Button>
+            </>
+          }
+        >
+          <div className="flex flex-col gap-3 text-[13px] leading-6" data-testid="data-reset-modal">
+            <p>
+              This permanently deletes the memory graph, app data, settings, and API keys, returning the app to a
+              fresh install. <strong>Your backups are kept</strong> — you can restore from one afterwards.
+            </p>
+            <p className="text-ink-mute">
+              A snapshot of your current data is taken first (a pre-reset backup). The app restarts to complete the
+              reset.
+            </p>
+            <label className="mt-1 flex flex-col gap-1">
+              <span className="text-[12px] text-ink-mute">type RESET to confirm</span>
+              <input
+                type="text"
+                aria-label="type RESET to confirm"
+                data-testid="data-reset-input"
+                value={resetText}
+                onChange={(e) => setResetText(e.target.value)}
+                className="h-8 w-full rounded-md border border-line-strong bg-raised px-2.5 font-mono text-[12px] text-ink placeholder:text-ink-mute focus:border-accent focus:outline-none"
+              />
+            </label>
+          </div>
         </Modal>
       )}
     </>
