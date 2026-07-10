@@ -187,10 +187,34 @@ export interface IpcDeps {
    * default in dev, not a fault).
    */
   readonly updater?: UpdaterController | null
+  /**
+   * Full-stack reconnect (fix/stack-reconnect): the `app.reconnect` handler
+   * awaits this, which re-runs every null boot step and returns the recomputed
+   * AppStatusDto. Wired only by boot (index.ts rebootStack); absent in test rigs
+   * and any launch without it, where `app.reconnect` degrades to reporting the
+   * current status unchanged. No-throw by contract — failures ride `diagnostics`.
+   */
+  readonly reconnect?: () => Promise<AppStatusDto>
 }
 
 /** The name decisions are recorded under (§13 decided_by / decidedBy). */
 const DASHBOARD_USER = 'user:dashboard'
+
+/**
+ * Full prefixed channel names registered by the most recent registerIpcHandlers
+ * call. A full-stack reconnect (index.ts rebootStack) re-registers every handler
+ * over FRESH deps + diagnostics; ipcMain.handle throws on a duplicate channel, so
+ * unregisterIpcHandlers must remove the old set first. Window-control / bespoke
+ * channels are registered elsewhere (registerWindowControlIpc) and are NOT in
+ * here, so a reconnect never double-registers or removes them.
+ */
+let registeredChannels: string[] = []
+
+/** Remove every handler registered by registerIpcHandlers (reconnect re-wire). */
+export function unregisterIpcHandlers(): void {
+  for (const channel of registeredChannels) ipcMain.removeHandler(channel)
+  registeredChannels = []
+}
 
 class UnavailableError extends Error {
   constructor(what: string) {
@@ -261,6 +285,10 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     throw new UnavailableError(what)
   }
 
+  // Fresh registration: drop any channel list from a prior boot so the reconnect
+  // re-wire (unregisterIpcHandlers → registerIpcHandlers) tracks exactly this set.
+  registeredChannels = []
+
   const knowledgeDeps = (): KnowledgeIngestDeps => ({
     engine: need.engine(),
     embedder: need.ollama(),
@@ -272,7 +300,8 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     channel: C,
     fn: (req: IpcRequest<C>, event: IpcMainInvokeEvent) => Promise<IpcResponse<C>> | IpcResponse<C>
   ): void => {
-    ipcMain.handle(`${IPC_INVOKE_PREFIX}${channel}`, async (event, req): Promise<IpcResult<IpcResponse<C>>> => {
+    const full = `${IPC_INVOKE_PREFIX}${channel}`
+    ipcMain.handle(full, async (event, req): Promise<IpcResult<IpcResponse<C>>> => {
       try {
         return { ok: true, data: await fn(req as IpcRequest<C>, event) }
       } catch (err) {
@@ -280,6 +309,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         return { ok: false, code: errorCode(err), message }
       }
     })
+    registeredChannels.push(full)
   }
 
   // ── app ────────────────────────────────────────────────────────────────────
@@ -292,6 +322,23 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     mcpUrl: deps.mcpUrl,
     diagnostics: deps.diagnostics ?? []
   }))
+
+  // Full-stack reconnect: boot's rebootStack re-runs every null boot step, re-
+  // wires deps, and returns the recomputed status. No-throw by contract — a step
+  // that fails again is folded into `diagnostics`, never rejected. Absent
+  // reconnect (test rigs / a launch without it) reports the current status
+  // unchanged so the channel is always answerable.
+  register('app.reconnect', async () => {
+    if (deps.reconnect !== undefined) return deps.reconnect()
+    return {
+      version: app.getVersion(),
+      platform: process.platform,
+      userDataDir: deps.userDataDir,
+      subsystems: deps.subsystems,
+      mcpUrl: deps.mcpUrl,
+      diagnostics: deps.diagnostics ?? []
+    }
+  })
 
   // ── memory browser ─────────────────────────────────────────────────────────
 

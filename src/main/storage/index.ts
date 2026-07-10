@@ -29,7 +29,13 @@ export {
   type RelTableSpec,
   type RetrievableLabel
 } from './schema'
-export { isMutatingCypher, openRyuGraphEngine, ryuPlatformDir, type RyuGraphEngineOptions } from './ryugraph'
+export { isLockContentionError, isMutatingCypher, openRyuGraphEngine, ryuPlatformDir, type RyuGraphEngineOptions } from './ryugraph'
+export {
+  DEFAULT_LOCK_RETRY_DELAYS_MS,
+  openRyuGraphEngineWithLockRetry,
+  retryOnLockContention,
+  type LockRetryHooks
+} from './lockRetry'
 export {
   backupGraphDir,
   defaultMigrations,

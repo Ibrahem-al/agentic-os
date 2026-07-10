@@ -258,6 +258,23 @@ function RunnerFallbackChip({ status }: { status: RunnerStatusDto }): React.JSX.
 
 function SubsystemStatus(): React.JSX.Element {
   const status = useIpc('app.status', undefined)
+  const { reload } = status
+  const [reconnecting, setReconnecting] = useState(false)
+  // Full-stack reconnect: re-run every down subsystem's boot step, then refetch
+  // app.status so the strip + diagnostics reflect the recovery. app.reconnect is
+  // no-throw main-side (failures ride the refreshed diagnostics), so the catch is
+  // just belt-and-braces for a transport error.
+  const onReconnect = useCallback(async (): Promise<void> => {
+    setReconnecting(true)
+    try {
+      await call('app.reconnect', undefined)
+    } catch {
+      // The refetched status still drives the strip; nothing extra to surface.
+    } finally {
+      setReconnecting(false)
+      reload()
+    }
+  }, [reload])
   if (status.data === null) return <div className="px-4 py-3 text-[11px] text-ink-faint">…</div>
   const subs = status.data.subsystems
   const entries: readonly { key: string; label: string; up: boolean }[] = [
@@ -273,20 +290,32 @@ function SubsystemStatus(): React.JSX.Element {
   const problems = (status.data.diagnostics ?? []).filter((d) => d.level !== 'ok')
   return (
     <div className="border-t border-line px-4 py-3">
-      <ul className="flex flex-wrap gap-x-3 gap-y-1">
-        {entries.map((entry) => (
-          <li key={entry.key} className="flex items-center gap-1.5 font-mono text-[11px]">
-            <span
-              aria-hidden="true"
-              className={`inline-block size-1.5 rounded-full ${entry.up ? 'bg-ok' : 'bg-err'}`}
-            />
-            <span className={entry.up ? 'text-ink-mute' : 'text-err'}>
-              {entry.label}
-              <span className="sr-only">{entry.up ? ' up' : ' down'}</span>
-            </span>
-          </li>
-        ))}
-      </ul>
+      <div className="flex items-center justify-between gap-2">
+        <ul className="flex flex-wrap gap-x-3 gap-y-1">
+          {entries.map((entry) => (
+            <li key={entry.key} className="flex items-center gap-1.5 font-mono text-[11px]">
+              <span
+                aria-hidden="true"
+                className={`inline-block size-1.5 rounded-full ${entry.up ? 'bg-ok' : 'bg-err'}`}
+              />
+              <span className={entry.up ? 'text-ink-mute' : 'text-err'}>
+                {entry.label}
+                <span className="sr-only">{entry.up ? ' up' : ' down'}</span>
+              </span>
+            </li>
+          ))}
+        </ul>
+        {problems.length > 0 && (
+          <Button
+            testId="subsystem-reconnect"
+            onClick={() => void onReconnect()}
+            disabled={reconnecting}
+            title="re-run every down subsystem's boot step"
+          >
+            {reconnecting ? 'reconnecting…' : 'reconnect'}
+          </Button>
+        )}
+      </div>
       {problems.length > 0 && (
         <ul
           role="status"
