@@ -23,15 +23,21 @@ import {
   RULES_DIR,
   RYU_EXTENSION_VERSION_DIR,
   RYUGRAPH_VERSION_PIN,
+  BACKUP_SCHEDULER_CHECK_INTERVAL_MS,
   SPOOL_DIR,
   TRIGGER_STATE_FILENAME,
   WATCHED_FOLDERS_CONFIG_FILENAME
 } from './config'
 import {
   APPDATA_USER_VERSION,
+  backupRequestPending,
+  isAutoBackupDue,
   openAppData,
   openRyuGraphEngine,
+  performPendingBackup,
   performPendingReset,
+  performPendingRestore,
+  requestBackup,
   verifyDataManifest,
   writeDataManifest,
   type AppData,
@@ -253,6 +259,31 @@ function sweepStaleRunnerMcpConfigs(userDataDir: string): void {
   if (swept > 0) console.log(`[runner] swept ${swept} stale runner/*.mcp.json from a previous run`)
 }
 
+/**
+ * Auto-backup scheduler (Settings "Data & backups"). unref'd — never holds the
+ * process open, cleared at quit. The running app CANNOT snapshot the graph (the
+ * engine holds an OS lock on graph.ryugraph — verified), so a due tick only
+ * STAGES a `backup-requested.json` marker; the real auto-backup is the boot-time
+ * catch-up in performPendingBackup, run before the store opens. The tick is
+ * belt-and-braces (guarantees the next launch backs up even between catch-ups)
+ * and cheap: it re-reads settings + the backup list each fire.
+ */
+let backupSchedulerTimer: ReturnType<typeof setInterval> | null = null
+function startBackupScheduler(userDataDir: string): void {
+  if (backupSchedulerTimer !== null) return
+  backupSchedulerTimer = setInterval(() => {
+    try {
+      if (isAutoBackupDue(userDataDir) && !backupRequestPending(userDataDir)) {
+        requestBackup(userDataDir, 'auto')
+        console.log('[backups] auto-backup due — staged for the next launch (the graph is locked while the engine is open)')
+      }
+    } catch (err) {
+      console.warn('[backups] scheduler tick failed (ignored)', err)
+    }
+  }, BACKUP_SCHEDULER_CHECK_INTERVAL_MS)
+  backupSchedulerTimer.unref()
+}
+
 /** Native-module pipeline sanity: versions logged from Electron main. */
 function logNativeModuleVersions(): void {
   const ortPkg = require('onnxruntime-node/package.json') as { version: string }
@@ -292,6 +323,22 @@ async function bootStorage(): Promise<void> {
   } catch (err) {
     // performPendingReset is internally fail-safe; this guard is belt-and-braces.
     console.error('[storage] pending-reset handling failed — user data left intact', err)
+  }
+  //  3. restore: a Settings-UI restore request runs here (before any store
+  //     opens — the graph is unlocked). Both-markers edge: reset wins, the
+  //     restore marker is defused. Internally fail-safe (mirror of reset).
+  try {
+    performPendingRestore(userDataDir, (m) => console.log(m), { resetJustPerformed: reset.performed })
+  } catch (err) {
+    console.error('[storage] pending-restore handling failed — user data left intact', err)
+  }
+  //  4. backup: consume a staged manual/auto backup marker + run the auto-backup
+  //     boot catch-up (newest -auto older than the interval), then prune. A
+  //     backup only ADDS a directory; never throws boot down.
+  try {
+    performPendingBackup(userDataDir, (m) => console.log(m))
+  } catch (err) {
+    console.error('[storage] pending-backup handling failed (ignored)', err)
   }
 
   // ryugraph's `exports` map hides package.json from require — read it directly.
@@ -1067,6 +1114,15 @@ void app.whenReady().then(async () => {
     console.error('[ipc] dashboard IPC boot FAILED', err)
   }
 
+  // Auto-backup scheduler (Settings "Data & backups"). Independent of storage —
+  // it only stages markers over userData fs, so it runs even when the store is
+  // down (the next healthy boot performs the staged backup).
+  try {
+    startBackupScheduler(app.getPath('userData'))
+  } catch (err) {
+    console.error('[backups] scheduler start FAILED', err)
+  }
+
   registerWindowControlIpc()
   createWindow()
 
@@ -1083,6 +1139,10 @@ app.on('will-quit', (event) => {
   if (quitting) return
   quitting = true
   event.preventDefault()
+  if (backupSchedulerTimer !== null) {
+    clearInterval(backupSchedulerTimer)
+    backupSchedulerTimer = null
+  }
   // Phase-17/P0.4: kill any in-flight runner child tree FIRST — before the MCP
   // server and the queue tear down — so a live `claude` child is never stranded,
   // and the queue's "task stays running, re-runs next boot" invariant stays

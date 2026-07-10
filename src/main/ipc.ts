@@ -42,8 +42,18 @@ import type {
 } from '../shared/ipc'
 import { IPC_EVENT_INGEST_PROGRESS, IPC_EVENT_OLLAMA_PULL, IPC_INVOKE_PREFIX } from '../shared/ipc'
 import type { UpdaterController } from './updater'
-import { CLOUD_PROVIDERS, WATCHED_FOLDERS_CONFIG_FILENAME, type CloudProvider } from './config'
-import { type StorageEngine } from './storage'
+import { BACKUP_INTERVAL_HOURS_CHOICES, CLOUD_PROVIDERS, WATCHED_FOLDERS_CONFIG_FILENAME, type CloudProvider } from './config'
+import {
+  exportData,
+  listBackups,
+  loadBackupSettings,
+  requestBackup,
+  requestReset,
+  requestRestore,
+  RestoreRequestError,
+  saveBackupSettings,
+  type StorageEngine
+} from './storage'
 import {
   Keychain,
   OllamaClient,
@@ -197,6 +207,7 @@ const errorCode = (err: unknown): IpcErrorCode => {
   if (err instanceof SkillImprovementError) return err.code
   if (err instanceof OllamaError) return 'OLLAMA_ERROR'
   if (err instanceof HookInstallError) return 'INVALID_STATE'
+  if (err instanceof RestoreRequestError) return err.code
   return 'INTERNAL'
 }
 
@@ -867,5 +878,78 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     // The user already confirmed the restart in the UI; this quits + installs.
     updater.quitAndInstall()
     return updater.status()
+  })
+
+  // ── data & backups (Settings "Data & backups") ───────────────────────────────
+
+  // All backup ops are pure fs over deps.userDataDir, so they answer even when
+  // storage is down — EXCEPT data.export, which reads the live graph through the
+  // engine. Manual backup / restore / reset can only snapshot the graph while it
+  // is UNLOCKED (the engine holds an OS lock while running), so they stage a
+  // marker and relaunch; the next boot performs the graph-safe operation before
+  // opening the store — the proven performPendingReset discipline.
+  const relaunch = (): void => {
+    // Let the IpcResult flush to the renderer (it shows "restarting…") before
+    // the app quits. will-quit checkpoints + closes connections (leak-the-handle
+    // clean exit); app.relaunch() queues the fresh instance that does the work.
+    setTimeout(() => {
+      app.relaunch()
+      app.quit()
+    }, 150)
+  }
+
+  register('backups.list', () => ({
+    backups: listBackups(deps.userDataDir).map((b) => ({
+      dirName: b.dirName,
+      kind: b.kind,
+      createdAt: b.createdAt,
+      bytes: b.bytes,
+      files: b.files,
+      restorable: b.restorable
+    })),
+    settings: loadBackupSettings(deps.userDataDir),
+    intervalChoices: [...BACKUP_INTERVAL_HOURS_CHOICES]
+  }))
+
+  register('backups.create', () => {
+    requestBackup(deps.userDataDir, 'manual')
+    relaunch()
+    return { restarting: true as const }
+  })
+
+  register('backups.restore', ({ dirName }) => {
+    // Validated NOW (throws RestoreRequestError → structured NOT_FOUND/INVALID_*).
+    requestRestore(deps.userDataDir, dirName)
+    relaunch()
+    return { restarting: true as const }
+  })
+
+  register('backups.settings.get', () => loadBackupSettings(deps.userDataDir))
+
+  register('backups.settings.set', (patch) => {
+    // Merge onto current; normalizeBackupSettings (inside save) clamps every
+    // field and drops keepDays when it is < 1 (the UI sends 0 to turn it off).
+    const current = loadBackupSettings(deps.userDataDir)
+    return saveBackupSettings(deps.userDataDir, { ...current, ...patch })
+  })
+
+  register('data.export', async (_req, event) => {
+    const engine = need.engine() // export needs the live graph (logical dump)
+    const win = BrowserWindow.fromWebContents(event.sender)
+    const options = {
+      title: 'Choose a folder to export your data into',
+      properties: ['openDirectory' as const, 'createDirectory' as const]
+    }
+    const picked = win !== null ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    const parent = picked.canceled ? undefined : picked.filePaths[0]
+    if (parent === undefined) return { path: null }
+    const result = await exportData({ engine, userDataDir: deps.userDataDir }, parent, (m) => console.log(m))
+    return { path: result.dir }
+  })
+
+  register('data.reset', () => {
+    requestReset(deps.userDataDir)
+    relaunch()
+    return { restarting: true as const }
   })
 }

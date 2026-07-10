@@ -580,6 +580,47 @@ export interface InstallHookResultDto {
   readonly diff: string
 }
 
+// ── data & backups (Settings "Data & backups") ───────────────────────────────
+
+/** How a directory under `backups/` was created. */
+export type BackupKindDto =
+  | 'manual'
+  | 'auto'
+  | 'pre-reset'
+  | 'pre-restore'
+  | 'pre-migration'
+  | 'corrupt-wal'
+  | 'unknown'
+
+/** One row in the backup list. */
+export interface BackupEntryDto {
+  readonly dirName: string
+  readonly kind: BackupKindDto
+  /** ISO-8601 parsed from the directory stamp; null when unparseable. */
+  readonly createdAt: string | null
+  readonly bytes: number
+  readonly files: number
+  /** Carries a graph copy or an appdata.db → can be restored to. */
+  readonly restorable: boolean
+}
+
+/** Auto-backup preferences (rule-12 defaults live in config.ts). */
+export interface BackupSettingsDto {
+  readonly enabled: boolean
+  /** One of BACKUP_INTERVAL_HOURS_CHOICES (6 / 12 / 24 / 168). */
+  readonly intervalHours: number
+  readonly keepLast: number
+  /** Optional age cap in days; absent = keep-last only. */
+  readonly keepDays?: number
+}
+
+export interface BackupListDto {
+  readonly backups: readonly BackupEntryDto[]
+  readonly settings: BackupSettingsDto
+  /** The interval choices the UI offers (6 / 12 / 24 / 168). */
+  readonly intervalChoices: readonly number[]
+}
+
 // ── channel map ───────────────────────────────────────────────────────────────
 
 /**
@@ -673,6 +714,26 @@ export interface IpcChannels {
   'updater.check': { req: void; res: UpdaterStatusDto }
   /** Restart-to-install a downloaded update (user-confirmed in the UI first). */
   'updater.install': { req: void; res: UpdaterStatusDto }
+
+  // ── data & backups (Settings "Data & backups") ──────────────────────────────
+  /** The backup list (newest first) + current auto-backup settings. */
+  'backups.list': { req: void; res: BackupListDto }
+  /**
+   * Stage a manual backup and relaunch. The graph is OS-locked while the app
+   * runs, so the snapshot is taken at the next boot; the renderer shows
+   * "restarting…" and main relaunches. `restarting: true` acknowledges the stage.
+   */
+  'backups.create': { req: void; res: { restarting: true } }
+  /** Stage a restore-to-this-point (validated now) and relaunch (same as create). */
+  'backups.restore': { req: { dirName: string }; res: { restarting: true } }
+  /** Read the auto-backup settings. */
+  'backups.settings.get': { req: void; res: BackupSettingsDto }
+  /** Write the auto-backup settings (partial patch merged onto current). */
+  'backups.settings.set': { req: Partial<BackupSettingsDto>; res: BackupSettingsDto }
+  /** Export a portable copy of the data to a user-picked folder; null if cancelled. */
+  'data.export': { req: void; res: { path: string | null } }
+  /** Stage a reset-to-defaults (keeps every backup) and relaunch. */
+  'data.reset': { req: void; res: { restarting: true } }
 }
 
 export type IpcChannel = keyof IpcChannels

@@ -56,4 +56,33 @@ export {
   type ManifestFinding,
   type WriteManifestInfo
 } from './manifest'
-export { performPendingReset, resetMarkerPath, type ResetLogger, type ResetResult } from './reset'
+export { performPendingReset, requestReset, resetMarkerPath, type ResetLogger, type ResetResult } from './reset'
+export {
+  autoBackupDue,
+  backupMarkerPath,
+  backupRequestPending,
+  createBackup,
+  defaultBackupSettings,
+  exportData,
+  isAutoBackupDue,
+  listBackups,
+  loadBackupSettings,
+  normalizeBackupSettings,
+  performPendingBackup,
+  performPendingRestore,
+  pruneAutoBackups,
+  requestBackup,
+  requestRestore,
+  RestoreRequestError,
+  restoreMarkerPath,
+  saveBackupSettings,
+  selectAutoBackupsToDelete,
+  snapshotUserData,
+  type BackupEntry,
+  type BackupKind,
+  type BackupLogger,
+  type BackupSettings,
+  type ExportResult as DataExportResult,
+  type PendingBackupResult,
+  type RestoreResult
+} from './backups'

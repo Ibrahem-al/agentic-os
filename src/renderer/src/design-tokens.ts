@@ -82,7 +82,14 @@ export const statusColor: Readonly<Record<string, keyof typeof color>> = {
   'rolled-back': 'undo',
   // examples
   success: 'ok',
-  failure: 'err'
+  failure: 'err',
+  // data & backups (Settings "Data & backups") — 'unknown' stays neutral
+  manual: 'accent',
+  auto: 'ok',
+  'pre-reset': 'undo',
+  'pre-restore': 'undo',
+  'pre-migration': 'undo',
+  'corrupt-wal': 'warn'
 }
 
 /** Spacing grid (px). DENSITY 7: table rows 34–36, cell pad 8×10. */

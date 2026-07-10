@@ -122,6 +122,51 @@ export const PRE_RESET_BACKUP_LABEL = 'pre-reset'
  */
 export const UNINSTALL_BACKUP_DIRNAME = 'agentic-os-backups'
 
+// ── Data & backups (Settings "Data & backups") ───────────────────────────────
+/**
+ * User-facing version history of the app's data. NONE of these values are §20
+ * values — spec §20 defines no backup cadence or retention (verified). They are
+ * conservative rule-12 picks, recorded in the phase report. The directory
+ * naming reuses the existing `backups/<stamp>-<label>` convention (sibling to
+ * `<stamp>-pre-reset`, `<stamp>-pre-migration-v<N>`, `<stamp>-corrupt-wal`).
+ *
+ * A hard constraint drives the whole design: while the app runs, RyuGraph holds
+ * an OS lock on `graph/graph.ryugraph` (verified — even a raw read at offset 0
+ * fails EBUSY), so the graph directory CANNOT be file-copied live on Windows.
+ * Every graph-inclusive snapshot (manual/auto backup, restore, reset) is
+ * therefore STAGED and executed at boot, BEFORE the engine opens (the graph is
+ * unlocked there) — the same proven discipline as performPendingReset.
+ */
+/** Persisted backup preferences (kept beside settings.json in userData). */
+export const BACKUP_SETTINGS_FILENAME = 'backup-settings.json'
+/** Auto-backups on by default (rule-12). */
+export const BACKUP_DEFAULT_ENABLED = true
+/** Default auto-backup cadence: once a day (rule-12). */
+export const BACKUP_DEFAULT_INTERVAL_HOURS = 24
+/** Selectable auto-backup cadences (6h / 12h / daily / weekly) — rule-12. */
+export const BACKUP_INTERVAL_HOURS_CHOICES = [6, 12, 24, 168] as const
+/** Default retention: keep the newest 10 auto-backups (rule-12). */
+export const BACKUP_DEFAULT_KEEP_LAST = 10
+/**
+ * How often the running-app scheduler re-checks whether an auto-backup is due
+ * (rule-12). The graph cannot be snapshotted live, so a due tick STAGES a
+ * marker for the next boot; the real auto-backup is the boot-time catch-up.
+ */
+export const BACKUP_SCHEDULER_CHECK_INTERVAL_MS = 60 * 60 * 1000
+/** Backup-directory label suffixes (`backups/<stamp>-<label>`). */
+export const MANUAL_BACKUP_LABEL = 'manual'
+export const AUTO_BACKUP_LABEL = 'auto'
+/** Label for the safety snapshot restore takes of the CURRENT state first. */
+export const PRE_RESTORE_BACKUP_LABEL = 'pre-restore'
+/**
+ * Staged-intent markers written to the userData top level (consumed + removed
+ * at the next boot, before any store opens — same lifecycle as
+ * RESET_MARKER_FILENAME). A backup/restore requested from Settings writes one
+ * of these and the app relaunches; boot performs the graph-safe operation.
+ */
+export const BACKUP_MARKER_FILENAME = 'backup-requested.json'
+export const RESTORE_MARKER_FILENAME = 'restore-requested.json'
+
 // ── Models ───────────────────────────────────────────────────────────────────
 /** The only embedding model, everywhere (Ollama). */
 export const EMBEDDING_MODEL = 'bge-m3'
