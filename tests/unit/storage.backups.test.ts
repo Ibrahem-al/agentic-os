@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { openAppData } from '../../src/main/storage/appdata'
 import {
   backupMarkerPath,
+  CLEAR_ENTRIES,
   defaultBackupSettings,
   listBackups,
   loadBackupSettings,
@@ -14,6 +15,7 @@ import {
   pruneAutoBackups,
   requestBackup,
   requestRestore,
+  RESTORE_CLEAR_ENTRIES,
   RestoreRequestError,
   restoreMarkerPath,
   saveBackupSettings,
@@ -32,6 +34,12 @@ function seed(dir: string, opts: { appdataRow?: string; realAppData?: boolean } 
   }
   writeFileSync(join(dir, 'keychain.bin'), Buffer.from('secret'))
   writeFileSync(join(dir, 'settings.json'), '{"cloudProvider":"anthropic"}')
+  // Re-downloadable assets: a RESTORE must LEAVE these in place (backups never
+  // contain them); a RESET clears them — covered by storage.reset.test.ts (b).
+  mkdirSync(join(dir, 'models'), { recursive: true })
+  writeFileSync(join(dir, 'models', 'reranker.onnx'), 'm'.repeat(4000))
+  mkdirSync(join(dir, 'bin'), { recursive: true })
+  writeFileSync(join(dir, 'bin', 'deno'), 'd'.repeat(1000))
 }
 
 /** A backup directory with graph/ + appdata.db so it is restorable. */
@@ -219,6 +227,16 @@ describe('performPendingRestore (fail-safe mirror of reset)', () => {
   let dir: string
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
+  it('RESTORE_CLEAR_ENTRIES = CLEAR_ENTRIES minus the re-downloadable models/ and bin/', () => {
+    dir = mkdtempSync(join(tmpdir(), 'bk-rs-const-')) // afterEach needs a dir
+    expect(CLEAR_ENTRIES).toContain('models')
+    expect(CLEAR_ENTRIES).toContain('bin')
+    expect(RESTORE_CLEAR_ENTRIES).not.toContain('models')
+    expect(RESTORE_CLEAR_ENTRIES).not.toContain('bin')
+    // Derived, not duplicated: everything else is the SAME list.
+    expect(RESTORE_CLEAR_ENTRIES).toEqual(CLEAR_ENTRIES.filter((e) => e !== 'models' && e !== 'bin'))
+  })
+
   it('no marker → no-op', () => {
     dir = mkdtempSync(join(tmpdir(), 'bk-rs-a-'))
     seed(dir)
@@ -298,6 +316,12 @@ describe('performPendingRestore (fail-safe mirror of reset)', () => {
     // State A is now live: graph + settings copied in.
     expect(readFileSync(join(dir, 'graph', 'graph.ryugraph'), 'utf8')).toBe('state-A-graph')
     expect(readFileSync(join(dir, 'settings.json'), 'utf8')).toBe('{"cloudProvider":"openai"}')
+
+    // Re-downloadable assets are NOT cleared by a restore (RESTORE_CLEAR_ENTRIES
+    // excludes models/ and bin/ — backups never contain them, so clearing would
+    // only force a pointless re-download). Reset DOES clear them (reset test b).
+    expect(readFileSync(join(dir, 'models', 'reranker.onnx'), 'utf8')).toBe('m'.repeat(4000))
+    expect(readFileSync(join(dir, 'bin', 'deno'), 'utf8')).toBe('d'.repeat(1000))
     // appdata carries state A's row (open a scratch copy to avoid mutating live).
     const reopened = openAppData(join(dir, 'appdata.db'))
     try {

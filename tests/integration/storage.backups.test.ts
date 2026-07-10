@@ -5,7 +5,7 @@
  * conditions performPendingBackup/performPendingRestore rely on.
  */
 import { afterEach, describe, expect, it } from 'vitest'
-import { type Dirent, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { type Dirent, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { createBackup, listBackups, openRyuGraphEngine, performPendingRestore, requestRestore } from '../../src/main/storage'
@@ -84,6 +84,9 @@ describe('full restore round-trip (Electron-free)', () => {
     let app = openAppData(join(baseDir, 'appdata.db'))
     app.db.prepare('INSERT INTO tasks (id, kind) VALUES (?, ?)').run('A', 'probe')
     app.close()
+    // Re-downloadable assets a restore must NOT clear (never in backups).
+    mkdirSync(join(baseDir, 'models'), { recursive: true })
+    writeFileSync(join(baseDir, 'models', 'reranker.onnx'), 'weights')
     let engine = await openEngine()
     await engine.upsertNode('Tag', { id: 'A1', name: 'a1', is_global: true })
     await engine.upsertNode('Tag', { id: 'A2', name: 'a2', is_global: true })
@@ -123,6 +126,9 @@ describe('full restore round-trip (Electron-free)', () => {
     } finally {
       app.close()
     }
+
+    // models/ survived the restore (RESTORE_CLEAR_ENTRIES keeps re-downloadables).
+    expect(readFileSync(join(baseDir, 'models', 'reranker.onnx'), 'utf8')).toBe('weights')
 
     // A pre-restore snapshot of state B exists and still carries B.
     const preRestore = listBackups(baseDir).find((b) => b.kind === 'pre-restore')

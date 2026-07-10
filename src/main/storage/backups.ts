@@ -21,8 +21,10 @@
  * This module owns the shared snapshot primitive (`snapshotUserData`) that
  * `reset.ts` also calls — same verified copy (graph closed-file cpSync + appdata
  * VACUUM INTO + integrity_check + graph count match) — plus the clear ALLOWLIST
- * both reset and restore delete through. `backups/` is structurally never in
- * that allowlist, so historical backups always survive a reset or a restore.
+ * both reset and restore delete through (restore uses RESTORE_CLEAR_ENTRIES, the
+ * same list minus the re-downloadable models/ and bin/). `backups/` is
+ * structurally never in either list, so historical backups always survive a
+ * reset or a restore.
  *
  * Electron-free: every path is a function of `userDataDir`, the unit-test seam.
  */
@@ -147,9 +149,9 @@ export const SNAPSHOT_FILES: readonly string[] = [
 ]
 
 /**
- * The explicit clear ALLOWLIST — every user-data path a reset OR a restore
- * removes, and NOTHING else. `backups/`, `data-manifest.json` and the markers
- * are deliberately absent: backups (incl. the just-written pre-reset/pre-restore
+ * The explicit clear ALLOWLIST — every user-data path a RESET removes, and
+ * NOTHING else. `backups/`, `data-manifest.json` and the markers are
+ * deliberately absent: backups (incl. the just-written pre-reset/pre-restore
  * snapshot) must survive, the manifest is rewritten by boot, and the marker is
  * removed last. Never `rm(userDataDir)`.
  */
@@ -170,6 +172,17 @@ export const CLEAR_ENTRIES: readonly string[] = [
   TRIGGER_STATE_FILENAME,
   '.mcp.json'
 ]
+
+/**
+ * What a RESTORE clears: the shared allowlist MINUS models/ and bin/. Backups
+ * never contain them (large, checksum-pinned, re-downloadable), so clearing
+ * them on restore serves no purpose and would only cost the user a ~570 MB
+ * model re-download after every restore. Reset keeps the FULL list — reset
+ * means back-to-defaults, and a fresh install has no models/ or bin/ either.
+ */
+export const RESTORE_CLEAR_ENTRIES: readonly string[] = CLEAR_ENTRIES.filter(
+  (entry) => entry !== 'models' && entry !== 'bin'
+)
 
 /** Recursive {files, bytes} of a directory tree (for the graph copy check). */
 export function countTree(dir: string): { files: number; bytes: number } {
@@ -201,9 +214,13 @@ export function countTree(dir: string): { files: number; bytes: number } {
   return { files, bytes }
 }
 
-/** Best-effort recursive delete of each allowlist entry; never throws. */
-export function clearAllowlist(userDataDir: string, log: BackupLogger): void {
-  for (const rel of CLEAR_ENTRIES) {
+/**
+ * Best-effort recursive delete of each allowlist entry; never throws. Defaults
+ * to the full reset list; restore passes RESTORE_CLEAR_ENTRIES (models/ and
+ * bin/ kept — see that constant).
+ */
+export function clearAllowlist(userDataDir: string, log: BackupLogger, entries: readonly string[] = CLEAR_ENTRIES): void {
+  for (const rel of entries) {
     try {
       rmSync(join(userDataDir, rel), { recursive: true, force: true })
     } catch (err) {
@@ -695,12 +712,13 @@ export type RestoreResult =
  *      `.invalid-*`, no restore, data intact.
  *   4. Snapshot the CURRENT state into `backups/<stamp>-pre-restore/` (verified);
  *      a failure here → rename `.failed-*`, data UNTOUCHED.
- *   5. Clear the same allowlist reset uses, copy the chosen backup's graph/,
+ *   5. Clear RESTORE_CLEAR_ENTRIES (the reset allowlist minus models/ and bin/
+ *      — backups never contain them, so clearing them would only force a
+ *      pointless ~570 MB re-download), copy the chosen backup's graph/,
  *      appdata.db and config files into place, write restore-record.json inside
  *      the backup dir, remove the marker LAST.
- * models/ and bin/ are cleared but NOT restored (not in backups — re-downloaded
- * on next use; documented). `backups/` is never cleared, so the source backup +
- * the pre-restore snapshot both survive.
+ * `backups/` is never cleared, so the source backup + the pre-restore snapshot
+ * both survive.
  */
 export function performPendingRestore(
   userDataDir: string,
@@ -761,9 +779,11 @@ export function performPendingRestore(
     return { performed: false, reason: 'failed', detail: String(err) }
   }
 
-  // 5. Clear + copy the chosen backup into place -----------------------------
+  // 5. Clear + copy the chosen backup into place. models/ and bin/ are kept
+  // (RESTORE_CLEAR_ENTRIES) — no backup carries them, so clearing them would
+  // only cost a re-download; reset alone uses the full list.
   try {
-    clearAllowlist(userDataDir, log)
+    clearAllowlist(userDataDir, log, RESTORE_CLEAR_ENTRIES)
 
     if (graphDirHasData(join(source, 'graph'))) {
       cpSync(join(source, 'graph'), join(userDataDir, 'graph'), { recursive: true })
