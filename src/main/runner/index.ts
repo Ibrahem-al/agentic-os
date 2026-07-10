@@ -329,7 +329,15 @@ function runCapture(command: string, args: readonly string[], env: NodeJS.Proces
   })
 }
 
-/** The image/command name of a pid, or null when it does not resolve. */
+/**
+ * The image/command line of a pid, or null when it does not resolve. POSIX
+ * probes `args=` (argv), NOT `comm=`: comm is the kernel THREAD name, and
+ * Node ≥24 names its main thread "MainThread" (prctl PR_SET_NAME), so on Linux
+ * every node-based zombie — including the real `claude` CLI and the node-script
+ * seam — reported comm "MainThread" and was never matched (found on CI, where
+ * node 24 made sweepZombies kill nothing). argv's first token is the spawned
+ * executable, and a `process.title` rewrite still leaves the title in the line.
+ */
 async function processImageName(pid: number, platform: NodeJS.Platform, env: NodeJS.ProcessEnv | undefined): Promise<string | null> {
   if (platform === 'win32') {
     const out = await runCapture('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], env)
@@ -338,7 +346,8 @@ async function processImageName(pid: number, platform: NodeJS.Platform, env: Nod
     const m = /^"([^"]+)"/.exec(out.trim())
     return m !== null ? (m[1] ?? null) : null
   }
-  const out = await runCapture('ps', ['-p', String(pid), '-o', 'comm='], env)
+  // -ww: never truncate the command line (BSD ps clips at window width).
+  const out = await runCapture('ps', ['-ww', '-p', String(pid), '-o', 'args='], env)
   if (out === null) return null
   const line = out.trim().split(/\r?\n/, 1)[0]?.trim()
   return line !== undefined && line !== '' ? line : null
@@ -347,6 +356,12 @@ async function processImageName(pid: number, platform: NodeJS.Platform, env: Nod
 /** Does a process image plausibly belong to OUR resolved runner invocation? */
 function imageMatches(image: string, resolved: ResolvedBinary): boolean {
   const stripExt = (s: string): string => s.toLowerCase().replace(/\.(exe|cmd|bat)$/, '')
-  const img = stripExt(basename(image))
-  return img === stripExt(basename(resolved.command)) || img === stripExt(basename(resolved.path)) || img.includes('claude')
+  // POSIX images are full command lines; the executable is the first token.
+  // (Windows tasklist images are bare names — the split is a no-op there.)
+  const img = stripExt(basename(image.split(/\s+/, 1)[0] ?? image))
+  return (
+    img === stripExt(basename(resolved.command)) ||
+    img === stripExt(basename(resolved.path)) ||
+    image.toLowerCase().includes('claude')
+  )
 }
