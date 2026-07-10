@@ -630,6 +630,16 @@ export interface BackupListDto {
  */
 export interface IpcChannels {
   'app.status': { req: void; res: AppStatusDto }
+  /**
+   * Full-stack reconnect (fix/stack-reconnect): re-run every boot step whose
+   * singleton is null (storage → models → kernel → mcp → agents → triggers),
+   * re-wire the IPC + MCP-read deps, and return the FRESH AppStatusDto (with
+   * diagnostics). No-throw: any step that fails again lands in `diagnostics`.
+   * The dashboard offers this behind a "Reconnect" button when any subsystem is
+   * non-ok — the common case is a graph lock held by a still-quitting previous
+   * instance that has since released.
+   */
+  'app.reconnect': { req: void; res: AppStatusDto }
 
   'memory.counts': { req: void; res: readonly LabelCountDto[] }
   'memory.list': {

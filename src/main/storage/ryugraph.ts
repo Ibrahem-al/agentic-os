@@ -104,6 +104,26 @@ function isCorruptWalError(err: unknown): boolean {
 }
 
 /**
+ * Lock contention on open: another process (or a still-quitting previous one)
+ * holds the exclusive OS lock on `<graphDir>/graph.ryugraph`. Probe-verified on
+ * win32 with ryugraph 25.9.1 (scratchpad two-process probe, this branch) — the
+ * EXACT message openRyuGraphEngine surfaces is:
+ *   "IO exception: Could not set lock on file : <path>\graph.ryugraph
+ *    See the docs: https://docs.ryugraph.io/concurrency for more information."
+ * Even a read-only second open fails this way (the lock is exclusive). Kept
+ * DISTINCT from isCorruptWalError so the corrupt-WAL recovery inside open()
+ * still wins for its own errors; this only gates the boot-time open RETRY
+ * (openRyuGraphEngineWithLockRetry) — a schema-newer refusal, a missing
+ * extension, or a corrupt main db must NEVER be masked by a lock retry.
+ * `lock violation` is included as a defensive secondary anchor for any raw
+ * ERROR_LOCK_VIOLATION phrasing the driver might surface on a future build.
+ */
+export function isLockContentionError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return /could not set lock on file/i.test(message) || /lock violation/i.test(message)
+}
+
+/**
  * Move every `graph.ryugraph.wal*` file out of the graph dir into
  * `<backupsDir>/<stamp>-corrupt-wal/` — preserved for forensics, NEVER deleted
  * (the same move-don't-destroy discipline as the pre-migration backups). A

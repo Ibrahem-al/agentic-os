@@ -9,6 +9,7 @@ import {
   IPC_WINDOW_IS_MAXIMIZED,
   IPC_WINDOW_MINIMIZE,
   IPC_WINDOW_TOGGLE_MAXIMIZE,
+  type AppStatusDto,
   type BootDiagnosticDto
 } from '../shared/ipc'
 import {
@@ -34,6 +35,7 @@ import {
   isAutoBackupDue,
   openAppData,
   openRyuGraphEngine,
+  openRyuGraphEngineWithLockRetry,
   performPendingBackup,
   performPendingReset,
   performPendingRestore,
@@ -97,7 +99,7 @@ import {
   TriggerWatchers,
   type RuleLoadResult
 } from './triggers'
-import { registerIpcHandlers } from './ipc'
+import { registerIpcHandlers, unregisterIpcHandlers } from './ipc'
 import { bootUpdater, type UpdaterController } from './updater'
 import { computeBootDiagnostics } from './bootDiagnostics'
 
@@ -117,6 +119,28 @@ if (userDataOverride) app.setPath('userData', userDataOverride)
 // production; secrets there ride the OS keyring per §21 rule 7.
 if (process.platform === 'linux' && process.env['AGENTIC_OS_LINUX_PASSWORD_STORE']) {
   app.commandLine.appendSwitch('password-store', process.env['AGENTIC_OS_LINUX_PASSWORD_STORE'])
+}
+
+// Single-instance lock — the VERY FIRST main-process gate, before any whenReady
+// boot. WHY: a second launch (a double-click while the app runs, or a relaunch
+// racing a slow quit) can NEVER produce a working stack. RyuGraph holds an
+// EXCLUSIVE OS lock on graph/graph.ryugraph — probe-proven this branch: even a
+// read-only second open fails "Could not set lock on file" — and the MCP server
+// would hit EADDRINUSE on 127.0.0.1:4517. So a second instance is a guaranteed
+// dead stack: quit it immediately and hand off to the primary, which restores +
+// focuses its window on 'second-instance'. Requested AFTER the userData override
+// so the lock file lands in the active profile.
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+if (!hasSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    const [win] = BrowserWindow.getAllWindows()
+    if (win === undefined) return
+    if (win.isMinimized()) win.restore()
+    win.show()
+    win.focus()
+  })
 }
 
 let engine: Awaited<ReturnType<typeof openRyuGraphEngine>> | null = null
@@ -204,6 +228,30 @@ function currentBootDiagnostics(): BootDiagnosticDto[] {
     agentsOpen: extractionAgent !== null,
     triggersOpen: triggerInstances !== null
   })
+}
+
+/** Which boot stages produced live singletons right now (app.status shape). */
+function currentSubsystems(): AppStatusDto['subsystems'] {
+  return {
+    storage: engine !== null && appData !== null,
+    models: ollama !== null,
+    kernel: kernelInstances !== null,
+    mcp: mcpServer !== null,
+    agents: extractionAgent !== null
+  }
+}
+
+/** The live AppStatusDto (subsystems + mcpUrl + diagnostics) — used by the
+ *  reconnect result so the renderer sees fresh state after a rebootStack. */
+function currentAppStatus(): AppStatusDto {
+  return {
+    version: app.getVersion(),
+    platform: process.platform,
+    userDataDir: app.getPath('userData'),
+    subsystems: currentSubsystems(),
+    mcpUrl: mcpServer?.url ?? null,
+    diagnostics: currentBootDiagnostics()
+  }
 }
 
 /**
@@ -364,22 +412,37 @@ async function bootStorage(): Promise<void> {
     }
   }
 
-  appData = openAppData(paths.appDb)
-  console.log(`[storage] appdata.db open (WAL: traces, tasks, mcp_calls, staged_writes, spend) at ${appData.path}`)
-  if (appData.backupCreated !== null) {
-    console.log(`[storage] pre-upgrade appdata backup: ${appData.backupCreated}`)
+  // appdata.db is a SEPARATE SQLite file (no graph lock), so a lock-failed first
+  // boot can leave it open with the engine still null. Guard the open so a
+  // reconnect (rebootStack re-runs bootStorage) never double-opens the handle —
+  // it just proceeds to retry the graph engine below.
+  if (appData === null) {
+    appData = openAppData(paths.appDb)
+    console.log(`[storage] appdata.db open (WAL: traces, tasks, mcp_calls, staged_writes, spend) at ${appData.path}`)
+    if (appData.backupCreated !== null) {
+      console.log(`[storage] pre-upgrade appdata backup: ${appData.backupCreated}`)
+    }
   }
 
-  engine = await openRyuGraphEngine({
-    graphDir: paths.graphDir,
-    backupsDir: paths.backupsDir,
-    // Packaged builds ship the vendored extensions as extraResources (they are
-    // loaded by absolute path by NATIVE code and cannot live inside asar);
-    // dev/test runs load them from the repo (§21 rule 2 — never fetched).
-    extensionsDir: app.isPackaged
-      ? join(process.resourcesPath, 'extensions', RYU_EXTENSION_VERSION_DIR)
-      : join(app.getAppPath(), 'resources', 'extensions', RYU_EXTENSION_VERSION_DIR)
-  })
+  // openRyuGraphEngineWithLockRetry: if the graph is momentarily locked by a
+  // still-quitting previous instance (it checkpoints before exiting), back off
+  // and retry for ~10 s before giving up — a single transient overlap must not
+  // lose storage (and, via the cascade, MCP/agents/triggers) for the whole
+  // launch. Corrupt-WAL recovery still runs INSIDE open(); only lock contention
+  // retries here. The manual Reconnect button re-runs this with a fresh budget.
+  engine = await openRyuGraphEngineWithLockRetry(
+    {
+      graphDir: paths.graphDir,
+      backupsDir: paths.backupsDir,
+      // Packaged builds ship the vendored extensions as extraResources (they are
+      // loaded by absolute path by NATIVE code and cannot live inside asar);
+      // dev/test runs load them from the repo (§21 rule 2 — never fetched).
+      extensionsDir: app.isPackaged
+        ? join(process.resourcesPath, 'extensions', RYU_EXTENSION_VERSION_DIR)
+        : join(app.getAppPath(), 'resources', 'extensions', RYU_EXTENSION_VERSION_DIR)
+    },
+    { log: (m) => console.warn(`[storage] ${m}`) }
+  )
   const counts = await engine.cypher('MATCH (n) RETURN count(n) AS c')
   const backupNote = engine.backupCreated ? `, pre-migration backup: ${engine.backupCreated}` : ''
   console.log(
@@ -894,13 +957,7 @@ function bootIpc(): void {
           ruleErrors: triggerInstances.rules.errors
         }
       : null
-  const subsystems = {
-    storage: engine !== null && appData !== null,
-    models: ollama !== null,
-    kernel: kernelInstances !== null,
-    mcp: mcpServer !== null,
-    agents: extractionAgent !== null
-  }
+  const subsystems = currentSubsystems()
   const diagnostics = currentBootDiagnostics()
   registerIpcHandlers({
     engine,
@@ -928,6 +985,13 @@ function bootIpc(): void {
     // snapshot — provider/model/key changes take effect on the NEXT reasoning
     // call with no app restart.
     onSettingsChanged: () => providerRouter?.invalidate(),
+    // Full-stack reconnect (fix/stack-reconnect): the app.reconnect channel awaits
+    // this. rebootStack is single-flight and never throws; the fresh AppStatusDto
+    // it returns carries any re-boot failure in its diagnostics.
+    reconnect: async () => {
+      await rebootStack()
+      return currentAppStatus()
+    },
     subsystems,
     diagnostics
   })
@@ -962,6 +1026,59 @@ function bootIpc(): void {
     })
   }
   console.log('[ipc] dashboard IPC ready (typed contract, structured errors)')
+}
+
+/**
+ * Full-stack reconnect (fix/stack-reconnect) — the user-facing recovery for a
+ * dead/degraded stack (the common trigger: the graph was still locked by a
+ * previous instance at boot and has since released). Single-flight so concurrent
+ * app.reconnect calls await the SAME run.
+ *
+ * For each subsystem in dependency order, re-run its boot step ONLY when its
+ * singleton is null (so a subsystem that booted cleanly is never torn down, and
+ * no scheduler double-starts: the graph checkpoint timer rides a fresh engine
+ * only; the auto-backup timer + updater are storage-independent, started once at
+ * first boot, and untouched here). Each boot step is already null-guarded on its
+ * deps and records its own failure into bootErrors, so this NEVER throws — a step
+ * that fails again is folded into the recomputed diagnostics.
+ *
+ * After the loop, RE-WIRE the consumers that captured stale (null) deps at the
+ * first bootIpc: drop the old IPC handler set (unregisterIpcHandlers) and re-run
+ * bootIpc, which re-registers every channel over the fresh singletons + fresh
+ * diagnostics AND re-supplies the MCP read-tools' late-bound deps (setReadContext).
+ */
+let reconnectInFlight: Promise<void> | null = null
+function rebootStack(): Promise<void> {
+  reconnectInFlight ??= runRebootStack().finally(() => {
+    reconnectInFlight = null
+  })
+  return reconnectInFlight
+}
+
+async function runRebootStack(): Promise<void> {
+  console.log('[reconnect] full-stack reconnect requested —', JSON.stringify(currentSubsystems()))
+  const step = async (name: string, isDown: () => boolean, run: () => void | Promise<void>): Promise<void> => {
+    if (!isDown()) return
+    bootErrors.delete(name)
+    try {
+      await run()
+    } catch (err) {
+      recordBootError(name, err)
+      console.error(`[reconnect] ${name} re-boot FAILED`, err)
+    }
+  }
+  await step('storage', () => engine === null || appData === null, bootStorage)
+  await step('models', () => ollama === null, bootModels)
+  await step('kernel', () => kernelInstances === null, bootKernel)
+  await step('mcp', () => mcpServer === null, bootMcp)
+  await step('agents', () => extractionAgent === null, bootAgents)
+  await step('triggers', () => triggerInstances === null, bootTriggers)
+  // Re-wire with fresh deps + recomputed diagnostics. bootIpc rebuilds the deps
+  // object from the live module singletons, so app.status/memory/... stop
+  // returning UNAVAILABLE and the subsystem strip reflects the recovery.
+  unregisterIpcHandlers()
+  bootIpc()
+  console.log('[reconnect] complete —', JSON.stringify(currentSubsystems()))
 }
 
 /**
@@ -1039,6 +1156,11 @@ function createWindow(): void {
 }
 
 void app.whenReady().then(async () => {
+  // Second-instance safety net: app.quit() was already called above when the
+  // single-instance lock was not acquired, but whenReady can still resolve
+  // before the quit settles — bail so a second instance never boots into the
+  // guaranteed dead stack (graph lock + MCP port).
+  if (!hasSingleInstanceLock) return
   console.log(`[boot] ${PRODUCT_NAME} main process starting (MCP reserved at ${MCP_HOST}:${MCP_PORT})`)
   // Second half of the linux CI keystore seam (see the top-of-file switch):
   // headless runners have no keyring, and the password-store switch alone
