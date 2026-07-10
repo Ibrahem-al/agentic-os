@@ -11,7 +11,8 @@ import type {
   OllamaPullProgressDto,
   RunnerSettingsDto,
   RunnerTestConnectionDto,
-  SettingsDto
+  SettingsDto,
+  UpdaterStatusDto
 } from '../../../shared/ipc'
 import { call, IpcError, useIpc } from '../lib/ipc'
 import {
@@ -48,6 +49,12 @@ const RUNNER_MODEL_OPTIONS = ['sonnet', 'opus', 'haiku'] as const
 
 function errMessage(err: unknown): string {
   return err instanceof IpcError ? err.message : String(err)
+}
+
+/** Download rate for the updater progress line: bytes/sec → "x.y MB/s". */
+function mbPerSec(bytesPerSecond: number | undefined): string {
+  if (bytesPerSecond === undefined) return ''
+  return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`
 }
 
 /**
@@ -108,6 +115,16 @@ export default function SettingsPanel(): React.JSX.Element {
   // First-enable §10.7 egress consent (P1.10).
   const [consentOpen, setConsentOpen] = useState(false)
   const [consentAck, setConsentAck] = useState(false)
+
+  // ── app updates ──────────────────────────────────────────────────────────────
+  // The app version rides app.status (the same source the rail footer renders).
+  const appStatus = useIpc('app.status', undefined)
+  // Seed the updater snapshot from updater.status on mount, then ride the live
+  // IPC_EVENT_UPDATER_STATUS pushes (mirrors the ollama-pull progress pattern).
+  const updaterQuery = useIpc('updater.status', undefined)
+  const [updater, setUpdater] = useState<UpdaterStatusDto | null>(null)
+  const [checkingUpdate, setCheckingUpdate] = useState(false)
+  const [confirmRestart, setConfirmRestart] = useState(false)
 
   const installHook = async (): Promise<void> => {
     setInstallingHook(true)
@@ -266,6 +283,42 @@ export default function SettingsPanel(): React.JSX.Element {
     }
   }
 
+  // Seed the updater snapshot once, then let live pushes own it (a push may land
+  // before the query resolves — keep the pushed value).
+  useEffect(() => {
+    if (updaterQuery.data !== null) setUpdater((prev) => prev ?? updaterQuery.data)
+  }, [updaterQuery.data])
+
+  useEffect(() => {
+    const unsub = window.agenticOS.onUpdaterStatus((status) => setUpdater(status))
+    return unsub
+  }, [])
+
+  /** Manual "check for updates" — never throws (errors land in the snapshot/toast). */
+  const checkForUpdates = async (): Promise<void> => {
+    setCheckingUpdate(true)
+    try {
+      setUpdater(await call('updater.check', undefined))
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setCheckingUpdate(false)
+    }
+  }
+
+  /**
+   * Confirmed restart-to-install. On success the app quits and relaunches to
+   * apply the update, so this panel never re-renders; only a failure surfaces.
+   */
+  const installUpdate = async (): Promise<void> => {
+    try {
+      await call('updater.install', undefined)
+    } catch (err) {
+      setConfirmRestart(false)
+      toast.notify('err', errMessage(err))
+    }
+  }
+
   const closeKeyModal = (): void => {
     setKeyModal(null)
     setKeyValue('')
@@ -367,6 +420,12 @@ export default function SettingsPanel(): React.JSX.Element {
           ? 'background reasoning: subscription — currently falling back to the local model'
           : 'background reasoning: subscription — currently falling back to the fallback tier'
       : 'background reasoning: subscription'
+
+  // ── app updates ──────────────────────────────────────────────────────────────
+  const updState = updater?.state ?? 'idle'
+  // The check button is inert while a check or download is already in flight.
+  const updBusy = checkingUpdate || updState === 'checking' || updState === 'downloading'
+  const updPercent = Math.round(updater?.percent ?? 0)
 
   return (
     <>
@@ -659,6 +718,106 @@ export default function SettingsPanel(): React.JSX.Element {
             <div className="text-[11px] text-ink-faint">
               if the app is closed when a session ends, the hook spools the session and it is picked up at the next
               launch. the fallback for other mcp clients: 30 minutes of call-log silence.
+            </div>
+          </div>
+        </section>
+
+        {/* ── app updates ──────────────────────────────────────────────────── */}
+        <section className="max-w-3xl border-t border-line pt-5" data-testid="settings-updates">
+          <SectionHeader meta="download and install new versions of the app">updates</SectionHeader>
+          <div className="flex flex-col gap-3">
+            <div className="flex items-center gap-2.5">
+              <span className="text-[13px]">current version</span>
+              <span className="font-mono text-[12px] text-ink-mute">v{appStatus.data?.version ?? '…'}</span>
+              {updState !== 'idle' && updState !== 'disabled' && <Badge status={updState} />}
+            </div>
+
+            {/* Status line per state. */}
+            {updState === 'disabled' && (
+              <div className="text-[12px] text-ink-mute" role="status">
+                {updater?.detail ?? 'auto-update runs only in the installed (packaged) app.'}
+              </div>
+            )}
+            {updState === 'checking' && (
+              <div className="text-[12px] text-ink-mute" role="status">
+                checking github releases for a newer version…
+              </div>
+            )}
+            {updState === 'up-to-date' && (
+              <div className="text-[12px] text-ink-mute" role="status">
+                you are on the latest version{updater?.version !== undefined ? ` (v${updater.version})` : ''}.
+              </div>
+            )}
+            {updState === 'error' && (
+              <div className="font-mono text-[11px] break-words text-err" role="alert">
+                {updater?.error !== undefined && updater.error !== ''
+                  ? updater.error
+                  : 'the update check failed — try again later.'}
+              </div>
+            )}
+
+            {/* Live download progress (percent + MB/s from the push events). */}
+            {updState === 'downloading' && (
+              <div className="flex flex-col gap-1.5" role="status" data-testid="updater-progress">
+                <div className="flex items-center justify-between font-mono text-[11px] text-ink-mute">
+                  <span>downloading{updater?.version !== undefined ? ` v${updater.version}` : ''}…</span>
+                  <span>
+                    {updPercent}%{updater?.bytesPerSecond !== undefined ? ` · ${mbPerSec(updater.bytesPerSecond)}` : ''}
+                  </span>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded bg-line">
+                  <div
+                    className="h-full rounded bg-accent transition-[width] duration-120"
+                    style={{ width: `${updPercent}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {updState === 'downloaded' && (
+              <div className="text-[12px] text-ink-mute" role="status">
+                update{updater?.version !== undefined ? ` v${updater.version}` : ''} downloaded and ready to install.
+              </div>
+            )}
+
+            {/* Actions: hidden entirely when auto-update is unavailable (dev build). */}
+            {updState !== 'disabled' && (
+              <div className="flex items-center gap-2.5">
+                {updState !== 'downloaded' ? (
+                  <Button
+                    variant="primary"
+                    testId="settings-check-update"
+                    disabled={updBusy}
+                    onClick={() => void checkForUpdates()}
+                  >
+                    {updBusy ? 'checking…' : 'check for updates'}
+                  </Button>
+                ) : !confirmRestart ? (
+                  <Button
+                    variant="primary"
+                    testId="settings-restart-update"
+                    onClick={() => setConfirmRestart(true)}
+                  >
+                    restart to update
+                  </Button>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-2.5" data-testid="updater-restart-confirm">
+                    <span className="text-[12px]">
+                      restart now to install{updater?.version !== undefined ? ` v${updater.version}` : ''}?
+                    </span>
+                    <Button variant="primary" testId="settings-restart-confirm" onClick={() => void installUpdate()}>
+                      restart
+                    </Button>
+                    <Button testId="settings-restart-cancel" onClick={() => setConfirmRestart(false)}>
+                      not now
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
+            <div className="text-[11px] text-ink-faint">
+              updates install in the background and finish applying the next time the app restarts. downloading a
+              new version happens automatically; use restart to update to apply it now.
             </div>
           </div>
         </section>

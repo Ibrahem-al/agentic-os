@@ -37,9 +37,11 @@ import type {
   SkillImprovementEntryDto,
   SkillSummaryDto,
   StagedWriteDto,
+  UpdaterStatusDto,
   WatchedFolderDto
 } from '../shared/ipc'
 import { IPC_EVENT_INGEST_PROGRESS, IPC_EVENT_OLLAMA_PULL, IPC_INVOKE_PREFIX } from '../shared/ipc'
+import type { UpdaterController } from './updater'
 import { CLOUD_PROVIDERS, WATCHED_FOLDERS_CONFIG_FILENAME, type CloudProvider } from './config'
 import { type StorageEngine } from './storage'
 import {
@@ -167,6 +169,14 @@ export interface IpcDeps {
    * TODAY).
    */
   readonly router?: ProviderRouter | null
+  /**
+   * The auto-updater controller (src/main/updater.ts) backing `updater.status`
+   * / `updater.check` / `updater.install` and the IPC_EVENT_UPDATER_STATUS
+   * pushes. Optional/absent in test rigs and any launch where the updater did
+   * not boot; the channels then return the 'disabled' snapshot (off is the
+   * default in dev, not a fault).
+   */
+  readonly updater?: UpdaterController | null
 }
 
 /** The name decisions are recorded under (§13 decided_by / decidedBy). */
@@ -835,5 +845,27 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     const runner = deps.runner ?? raiseUnavailable('the subscription runner')
     const result = await runner.testConnection()
     return { ok: result.ok, message: testConnectionMessage(result) }
+  })
+
+  // ── app updater (Settings "Updates" section) ─────────────────────────────────
+
+  // Absent updater (test rigs / a launch where it did not boot) ⇒ the disabled
+  // snapshot. The controller itself never throws across IPC — check() errors
+  // land in the snapshot, quitAndInstall() is a no-op unless state 'downloaded'.
+  const disabledUpdaterStatus: UpdaterStatusDto = {
+    state: 'disabled',
+    detail: 'auto-update runs only in the installed (packaged) app'
+  }
+
+  register('updater.status', () => deps.updater?.status() ?? disabledUpdaterStatus)
+
+  register('updater.check', () => deps.updater?.check() ?? disabledUpdaterStatus)
+
+  register('updater.install', () => {
+    const updater = deps.updater
+    if (updater === null || updater === undefined) return disabledUpdaterStatus
+    // The user already confirmed the restart in the UI; this quits + installs.
+    updater.quitAndInstall()
+    return updater.status()
   })
 }
