@@ -191,6 +191,33 @@ describe('phase-18 staging + control tools (real MCP client)', () => {
     expect(reply.body.error.code).toBe('INVALID_INPUT')
   })
 
+  it('propose_extraction rejects props the §18 schema can’t write, self-correcting + staging nothing', async () => {
+    // The exact live bug: a Skill proposed with description/kind/source and no
+    // instructions. Staging must refuse it up front (not silently accept then
+    // fail at approve), with a message the agent can act on.
+    const reply = await call('propose_extraction', {
+      op: 'merge',
+      node: {
+        label: 'Skill',
+        id: 'skill-ui-ux-pro-max',
+        props: { description: 'UI/UX', kind: 'claude-code-skill', name: 'ui-ux-pro-max', project_count: 3, source: '.claude/skills/ui-ux' }
+      },
+      reason: 'record the skill'
+    })
+    expect(reply.isError).toBe(true)
+    expect(reply.body.error.code).toBe('INVALID_INPUT')
+    const msg = String(reply.body.error.message)
+    expect(msg).toContain('Skill')
+    expect(msg).toContain('description')
+    expect(msg).toContain('instructions')
+    expect(msg).toContain('ingest_codebase')
+    // Nothing was staged — the boundary rejected it before the INSERT.
+    const staged = db()
+      .prepare("SELECT count(*) AS c FROM staged_writes WHERE target_id = 'skill-ui-ux-pro-max'")
+      .get() as { c: number }
+    expect(staged.c).toBe(0)
+  })
+
   const SUBMIT = {
     session_id: 'sess-sub',
     components: [{ name: 'PaymentService', type: 'service', depends_on: ['Ledger'], evidence: 'built payments', confidence: 0.8 }],

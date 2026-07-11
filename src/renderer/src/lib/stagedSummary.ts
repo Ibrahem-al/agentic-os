@@ -122,6 +122,20 @@ function sessionRef(row: StagedWriteDto, opts: StagedSummaryOptions | undefined)
 }
 
 /**
+ * The plain "can't be applied" verdict recorded on a row whose staged payload
+ * failed §18 property validation at approve time (null when the row is clean).
+ * The backend writes `{ invalidPayload: true, verdict }` into validation_json
+ * (approveStagedWrite); the review panel shows this verdict as a plain warning
+ * and de-emphasizes Approve. Raw technical detail stays behind the diff
+ * disclosure — this is the human-readable lead.
+ */
+export function invalidPayloadVerdictOf(row: StagedWriteDto): string | null {
+  const v = row.validation
+  if (v === null || v['invalidPayload'] !== true) return null
+  return asString(v['verdict'])
+}
+
+/**
  * Human title for a proposer id — the plain group header the addendum asks for
  * ("Proposed by Claude" / "From the extraction agent" / "Added by you"). The raw
  * id stays in the caller's title attribute.

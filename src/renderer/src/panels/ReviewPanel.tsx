@@ -31,7 +31,7 @@ import type { InspectTarget, PanelProps } from '../App'
 import { call, useIpc } from '../lib/ipc'
 import { truncate, usd } from '../lib/format'
 import { dayKey, lastNDays, plainStatus, plural } from '../lib/plain'
-import { plainProposerTitle, summarizeStagedWrite } from '../lib/stagedSummary'
+import { invalidPayloadVerdictOf, plainProposerTitle, summarizeStagedWrite } from '../lib/stagedSummary'
 import type { SourceRef } from '../lib/stagedSummary'
 import {
   Badge,
@@ -166,6 +166,12 @@ const STAGED_COLUMNS: readonly Column<StagedWriteDto>[] = [
         <span className="font-mono text-[11px] text-ink-mute">
           {row.kind} · proposed by {row.proposedBy}
         </span>
+        {invalidPayloadVerdictOf(row) !== null && (
+          <span data-testid="staged-row-invalid" className="flex items-center gap-1 text-[11px] text-warn">
+            <Icon name="info" size={12} className="shrink-0" />
+            Can’t be applied as-is — open to see why.
+          </span>
+        )}
       </div>
     )
   },
@@ -310,6 +316,15 @@ function StagedWriteModal({
   const blocked = requiresEmbedder(row) && ollamaReady === false
   const plain = plainStatus(row.status)
 
+  // A row whose staged payload can't pass §18 property validation carries a
+  // plain-language verdict (approveStagedWrite records it). When present we lead
+  // with it, de-emphasize Approve (still functional — the operator may retry) and
+  // suppress the "approved but not saved yet" / raw "Saving failed" notes; the
+  // raw op-by-op change stays in the Technical-changes disclosure below.
+  const invalidVerdict = invalidPayloadVerdictOf(row)
+  const approveVariant = invalidVerdict !== null ? 'ghost' : 'primary'
+  const approveTitle = invalidVerdict !== null ? invalidVerdict : blocked ? OLLAMA_BLOCKED_TITLE : undefined
+
   async function approve(): Promise<void> {
     setBusy(true)
     try {
@@ -346,10 +361,10 @@ function StagedWriteModal({
           Decline
         </Button>
         <Button
-          variant="primary"
+          variant={approveVariant}
           testId="staged-approve"
           disabled={busy || blocked}
-          {...(blocked ? { title: OLLAMA_BLOCKED_TITLE } : {})}
+          {...(approveTitle !== undefined ? { title: approveTitle } : {})}
           onClick={() => void approve()}
         >
           Approve
@@ -360,10 +375,10 @@ function StagedWriteModal({
       // between the audited commit and the status flip, or an earlier commit
       // error). Approve is re-drivable, so the same button finishes it.
       <Button
-        variant="primary"
+        variant={approveVariant}
         testId="staged-approve"
         disabled={busy || blocked}
-        {...(blocked ? { title: OLLAMA_BLOCKED_TITLE } : {})}
+        {...(approveTitle !== undefined ? { title: approveTitle } : {})}
         onClick={() => void approve()}
       >
         Finish committing
@@ -380,7 +395,17 @@ function StagedWriteModal({
         <Badge status={row.status} title={plain.explain} />
       </div>
 
-      {row.status === 'approved' && (
+      {invalidVerdict !== null && (
+        <div
+          role="alert"
+          data-testid="staged-invalid-payload"
+          className="mb-3 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-5 text-ink"
+        >
+          {invalidVerdict}
+        </div>
+      )}
+
+      {row.status === 'approved' && invalidVerdict === null && (
         <div
           role="note"
           data-testid="staged-approved-hint"
@@ -456,7 +481,7 @@ function StagedWriteModal({
         )}
       </Disclosure>
 
-      {row.status === 'approved' && commitError !== null && (
+      {row.status === 'approved' && invalidVerdict === null && commitError !== null && (
         <div className="mt-3 rounded-md border border-err/40 bg-err/10 px-3 py-2" role="alert">
           <div className="text-[12px] font-medium text-err">Saving failed</div>
           <div className="mt-1 text-[12px]">{commitError}</div>

@@ -311,6 +311,145 @@ describe('extraction payload flow (§17 low-confidence items)', () => {
   })
 })
 
+// Post-release fix: §18 property validation at the commit choke point. A row
+// carrying props the schema can't write (the user's live Skill bug) must fail
+// approve with a plain INVALID_PAYLOAD verdict — never the raw engine error —
+// and leave the graph untouched. Legit extraction shapes still commit.
+describe('staged-extraction §18 property validation at commit (INVALID_PAYLOAD)', () => {
+  const userSkillPayload = {
+    op: 'merge',
+    node: {
+      label: 'Skill',
+      id: 'skill-ui-ux-pro-max',
+      props: {
+        description: 'A pro UI/UX skill',
+        kind: 'claude-code-skill',
+        name: 'ui-ux-pro-max',
+        project_count: 3,
+        source: '.claude/skills/ui-ux'
+      }
+    },
+    embedOnCommit: false,
+    edges: [],
+    tagCreates: [],
+    provenance: { extracted_by: 'extraction@0.0.1/llm-subscription', confidence: 1 },
+    evidence: 'found a skill folder',
+    reason: 'record the skill',
+    session: 'session-s9'
+  }
+
+  it('the exact user shape: approve returns a friendly verdict, row stays staged, graph untouched', async () => {
+    const id = stageExtraction(userSkillPayload, 'Skill', 'skill-ui-ux-pro-max')
+    const jobsBefore = store.engine.lane.enqueuedCount
+
+    await expect(approveStagedWrite(deps, id, { decidedBy: 'tester' })).rejects.toMatchObject({
+      code: 'INVALID_PAYLOAD'
+    })
+
+    // No raw engine string — a plain-language verdict is stored + returned.
+    const row = getStagedWrite(appData.db, id)!
+    expect(row.status).toBe('staged') // still declinable; never marked approved
+    expect(row.validation).toMatchObject({ invalidPayload: true })
+    const verdict = String(row.validation?.['verdict'])
+    expect(verdict).toBe(
+      "This proposal can't be applied: a Skill doesn't have the properties description, kind, project_count, source, " +
+        "and it's missing the required instructions. Decline it — if the skill is real, re-ingest the project and " +
+        'approve the properly-formed version.'
+    )
+    expect(verdict).not.toMatch(/writable property|upsertNode/) // not the raw engine error
+
+    // Nothing was committed (zero lane jobs, no such Skill node).
+    expect(store.engine.lane.enqueuedCount).toBe(jobsBefore)
+    const skill = await store.engine.cypher(`MATCH (s:Skill {id: 'skill-ui-ux-pro-max'}) RETURN count(s) AS c`)
+    expect(Number(skill[0]!['c'])).toBe(0)
+  })
+
+  it('a missing-only required field is caught (Knowledge create with no content)', async () => {
+    const id = stageExtraction(
+      {
+        op: 'create',
+        node: { label: 'Knowledge', id: 'know-empty', props: { extracted_by: 'extraction@0.0.1/llm-local', confidence: 0.4 } },
+        embedOnCommit: false,
+        edges: [],
+        tagCreates: [],
+        provenance: { extracted_by: 'extraction@0.0.1/llm-local', confidence: 0.4 },
+        evidence: 'x',
+        reason: 'y',
+        session: 'session-s9'
+      },
+      'Knowledge',
+      'know-empty'
+    )
+    await expect(approveStagedWrite(deps, id, { decidedBy: 'tester' })).rejects.toMatchObject({ code: 'INVALID_PAYLOAD' })
+    expect(String(getStagedWrite(appData.db, id)!.validation?.['verdict'])).toContain('content')
+  })
+
+  it('an illegal edge (from,to) pair is caught (APPLIES_TO Preference→Session)', async () => {
+    const id = stageExtraction(
+      {
+        op: 'create',
+        node: { label: 'Preference', id: 'pref-badedge', props: { statement: 'x', extracted_by: 'extraction@0.0.1/llm-local', confidence: 0.4 } },
+        embedOnCommit: false,
+        edges: [
+          {
+            type: 'APPLIES_TO',
+            from: { label: 'Preference', id: 'pref-badedge' },
+            to: { label: 'Session', id: 'session-s9' },
+            props: { extracted_by: 'extraction@0.0.1/llm-local', confidence: 0.4 }
+          }
+        ],
+        tagCreates: [],
+        provenance: { extracted_by: 'extraction@0.0.1/llm-local', confidence: 0.4 },
+        evidence: 'x',
+        reason: 'y',
+        session: 'session-s9'
+      },
+      'Preference',
+      'pref-badedge'
+    )
+    await expect(approveStagedWrite(deps, id, { decidedBy: 'tester' })).rejects.toMatchObject({ code: 'INVALID_PAYLOAD' })
+    expect(String(getStagedWrite(appData.db, id)!.validation?.['verdict'])).toContain('APPLIES_TO')
+    const rows = await store.engine.cypher(`MATCH (p:Preference {id: 'pref-badedge'}) RETURN count(p) AS c`)
+    expect(Number(rows[0]!['c'])).toBe(0) // graph untouched
+  })
+
+  it('a legitimate Correction create (content only) still commits', async () => {
+    const id = stageExtraction(
+      {
+        op: 'create',
+        node: { label: 'Correction', id: 'corr-legit-1', props: { content: 'do not use var' } },
+        embedOnCommit: false,
+        edges: [
+          {
+            type: 'OBSERVED_IN',
+            from: { label: 'Correction', id: 'corr-legit-1' },
+            to: { label: 'Session', id: 'session-s9' },
+            props: { extracted_by: 'extraction@0.0.1/llm-local', confidence: 0.4 }
+          }
+        ],
+        tagCreates: [],
+        provenance: { extracted_by: 'extraction@0.0.1/llm-local', confidence: 0.4 },
+        evidence: 'they used var',
+        reason: 'below the gate',
+        session: 'session-s9'
+      },
+      'Correction',
+      'corr-legit-1'
+    )
+    const result = await approveStagedWrite(deps, id, { decidedBy: 'tester' })
+    expect(getStagedWrite(appData.db, id)!.status).toBe('committed')
+    const rows = await store.engine.cypher(`MATCH (c:Correction {id: 'corr-legit-1'}) RETURN c.content AS content`)
+    expect(rows[0]?.['content']).toBe('do not use var')
+    expect(audit.getAction(result.auditActionId)!.reversible).toBe(true)
+  })
+
+  it('reject is unaffected by the invalid payload — the row still declines cleanly', () => {
+    const id = stageExtraction({ ...userSkillPayload, node: { ...userSkillPayload.node, id: 'skill-reject-me' } }, 'Skill', 'skill-reject-me')
+    rejectStagedWrite(appData.db, id, { decidedBy: 'tester', reason: 'not a real skill' })
+    expect(getStagedWrite(appData.db, id)!.status).toBe('rejected')
+  })
+})
+
 // P1.7 (§9.2): the approve UI preflights OllamaClient.status() only when a row
 // actually needs an embedder at commit — an extraction CREATE with embedOnCommit.
 describe('requiresEmbedder preflight flag (P1.7 / §9.2)', () => {

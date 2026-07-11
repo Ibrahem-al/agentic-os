@@ -59,7 +59,15 @@ import {
 } from '../agents/skills/lifecycle'
 import { SkillImprovementError } from '../agents/skills/types'
 import { MemoryEditError, mergeDuplicates } from '../memory'
-import { EDGE_TYPES, NODE_LABELS, type EdgeType, type NodeLabel, type StorageEngine } from '../storage'
+import {
+  EDGE_TYPES,
+  NODE_LABELS,
+  relTable,
+  writableNodeProperties,
+  type EdgeType,
+  type NodeLabel,
+  type StorageEngine
+} from '../storage'
 import type { AuditLog } from './audit'
 
 export type StagedWriteStatus = 'staged' | 'approved' | 'rejected' | 'committed'
@@ -144,6 +152,188 @@ const assertEdgeType = (type: unknown, context: string): EdgeType => {
     throw new StagedWriteError('INVALID_PAYLOAD', `${context}: unknown edge type '${String(type)}'`)
   }
   return type as EdgeType
+}
+
+// ── staged-extraction §18 property validation (§13 "staged and validated") ────
+//
+// The §18 schema is the contract for what a node CAN carry. Both extraction
+// proposers — the internal agent's write step AND Claude's propose_extraction
+// over MCP — funnel a proposal through this: the MCP tool validates at PROPOSE
+// time so the caller can self-correct (§15), and approveStagedWrite validates
+// again at COMMIT time (the shared choke point for both proposers) so a row
+// staged before this guard existed fails with a plain verdict rather than the
+// raw engine `"description" is not a writable property` error.
+
+/**
+ * Node props the engine owns — never accepted from a proposer. `embedding` is
+ * computed at commit for retrievable labels; id/timestamps are engine-stamped.
+ * NOT here: extracted_by/confidence — those are provenance the extraction agent
+ * legitimately stamps onto provenance-label props (§21 rule 4), and
+ * writableNodeProperties already lists them for the labels that carry them.
+ */
+const SERVER_OWNED_NODE_KEYS: ReadonlySet<string> = new Set(['id', 'created_at', 'updated_at', 'embedding'])
+
+/**
+ * Per-label props a to-be-written node MUST carry (non-empty string). Derived
+ * from the committers + retrieval render + the memory/edit create paths — a node
+ * missing these is broken/empty:
+ *  - Skill: name + instructions (importSkill / skillEmbedText — a Skill IS
+ *    standing instructions);
+ *  - Preference: statement; Knowledge: content; Component: name; Project: name;
+ *  - Correction: content; MCP/Plugin/Tag: name; Document: source;
+ *  - Example: content; SkillVersion: instructions.
+ * Labels absent here impose no required-prop check (the writable-prop check
+ * still runs). Enforced whenever a node with props is written (create OR a
+ * merge that carries a node) — the internal agent's merges carry `node: null`,
+ * so this only ever bites a malformed create/merge-with-node.
+ */
+const REQUIRED_NODE_PROPS: Partial<Record<NodeLabel, readonly string[]>> = {
+  Skill: ['name', 'instructions'],
+  Preference: ['statement'],
+  Knowledge: ['content'],
+  Component: ['name'],
+  Project: ['name'],
+  Correction: ['content'],
+  MCP: ['name'],
+  Plugin: ['name'],
+  Tag: ['name'],
+  Document: ['source'],
+  Example: ['content'],
+  SkillVersion: ['instructions']
+}
+
+export interface StagedNodePropIssue {
+  readonly label: NodeLabel
+  /** Props not writable for the label (or engine-owned), sorted. */
+  readonly offending: readonly string[]
+  /** Required props absent/empty, in schema order. */
+  readonly missing: readonly string[]
+}
+
+export interface ExtractionStagingIssue {
+  readonly node: StagedNodePropIssue | null
+  /** Edge (from→to) pairs that violate §18 REL_TABLES, human-readable. */
+  readonly edges: readonly string[]
+}
+
+/** The minimal shape both proposers present (the MCP tool builds it; commit decodes it). */
+export interface ExtractionStagingShape {
+  readonly node: { readonly label: NodeLabel; readonly props: Record<string, unknown> } | null
+  readonly edges: readonly {
+    readonly type: EdgeType
+    readonly from: { readonly label: NodeLabel }
+    readonly to: { readonly label: NodeLabel }
+  }[]
+}
+
+/**
+ * Validate a staged extraction against the §18 schema at the PROPERTY level:
+ * node props ⊆ writable(label) minus engine-owned keys, per-label required props
+ * present, and every edge a REL_TABLES-legal (from,to) pair. Returns null when
+ * clean. Labels/edge types are validated upstream (zod on the MCP path,
+ * assertLabel/assertEdgeType at decode) — this adds the property-level check
+ * that was missing at the proposal boundary.
+ */
+export function validateExtractionStaging(shape: ExtractionStagingShape): ExtractionStagingIssue | null {
+  let node: StagedNodePropIssue | null = null
+  if (shape.node !== null) {
+    const { label, props } = shape.node
+    const writable = writableNodeProperties(label)
+    const offending = Object.keys(props)
+      .filter((key) => SERVER_OWNED_NODE_KEYS.has(key) || !writable.has(key))
+      .sort()
+    const required = REQUIRED_NODE_PROPS[label] ?? []
+    const missing = required.filter((key) => {
+      const value = props[key]
+      return typeof value !== 'string' || value.trim() === ''
+    })
+    if (offending.length > 0 || missing.length > 0) node = { label, offending, missing }
+  }
+  const edges: string[] = []
+  for (const edge of shape.edges) {
+    const legal = relTable(edge.type).pairs.some(([f, t]) => f === edge.from.label && t === edge.to.label)
+    if (!legal) edges.push(`a ${edge.type} edge can't connect ${edge.from.label} → ${edge.to.label} (§18)`)
+  }
+  if (node === null && edges.length === 0) return null
+  return { node, edges }
+}
+
+const listProps = (items: readonly string[]): string => items.join(', ')
+
+/**
+ * Agent-facing message for propose_extraction: names the label, the offending
+ * keys, the missing required keys, and points Skill creation at ingest_codebase
+ * — so the proposing agent can self-correct (§15, no pause-and-notify).
+ */
+export function extractionStagingErrorMessage(tool: string, issue: ExtractionStagingIssue): string {
+  const parts: string[] = []
+  if (issue.node !== null) {
+    const { label, offending, missing } = issue.node
+    const clauses: string[] = []
+    if (offending.length > 0) {
+      clauses.push(
+        `${offending.length === 1 ? 'the property' : 'the properties'} ${listProps(offending)} ${offending.length === 1 ? 'is' : 'are'} not writable on a ${label} node`
+      )
+    }
+    if (missing.length > 0) {
+      clauses.push(`the required ${listProps(missing)} ${missing.length === 1 ? 'is' : 'are'} missing`)
+    }
+    const allowed = [...writableNodeProperties(label).keys()].filter((k) => k !== 'embedding')
+    parts.push(`a ${label} node accepts only ${listProps(allowed)} (§18) — ${clauses.join(', and ')}`)
+    if (label === 'Skill') {
+      parts.push(
+        'a Skill is standing instructions, not free-form props: create one by ingesting the project with ingest_codebase (it extracts a proper SKILL.md), or supply name + instructions'
+      )
+    }
+  }
+  for (const edge of issue.edges) parts.push(edge)
+  return `${tool}: this proposal does not match the §18 memory schema — ${parts.join('. ')}`
+}
+
+/**
+ * User-facing verdict stored in validation_json + returned as the INVALID_PAYLOAD
+ * IpcResult when a row can't be applied (a pre-existing malformed row). Plain
+ * language: no schema jargon, an explicit "decline it" and a repair path.
+ */
+export function invalidPayloadVerdict(issue: ExtractionStagingIssue): string {
+  const clauses: string[] = []
+  let isSkill = false
+  if (issue.node !== null) {
+    const { label, offending, missing } = issue.node
+    isSkill = label === 'Skill'
+    const article = /^[AEIOU]/.test(label) ? 'an' : 'a'
+    if (offending.length > 0) {
+      clauses.push(
+        `${article} ${label} doesn't have the ${offending.length === 1 ? 'property' : 'properties'} ${listProps(offending)}`
+      )
+    }
+    if (missing.length > 0) clauses.push(`it's missing the required ${listProps(missing)}`)
+  }
+  for (const edge of issue.edges) clauses.push(edge)
+  const body = clauses.length > 0 ? clauses.join(', and ') : 'it does not match the memory schema'
+  const tail = isSkill
+    ? 'Decline it — if the skill is real, re-ingest the project and approve the properly-formed version.'
+    : 'Decline it and ask the agent to re-propose it with the correct properties.'
+  return `This proposal can't be applied: ${body}. ${tail}`
+}
+
+/**
+ * Pre-commit check for an 'extraction' row (approve path): a plain verdict when
+ * the payload violates the §18 property schema, else null. A structural decode
+ * failure returns null — the commit path's existing checks surface those as-is.
+ */
+function precheckExtractionRow(row: StagedWriteRow): string | null {
+  let payload: ExtractionPayload
+  try {
+    payload = extractionPayload(row)
+  } catch {
+    return null
+  }
+  const issue = validateExtractionStaging({
+    node: payload.node === null ? null : { label: payload.node.label, props: payload.node.props },
+    edges: payload.edges
+  })
+  return issue === null ? null : invalidPayloadVerdict(issue)
 }
 
 // ── queries ───────────────────────────────────────────────────────────────────
@@ -306,6 +496,25 @@ export async function approveStagedWrite(
   if (row.status !== 'staged' && row.status !== 'approved') {
     throw new StagedWriteError('INVALID_STATE', `staged write ${id} is '${row.status}' — only staged/approved rows can commit`)
   }
+
+  // Pre-commit §18 property validation (extraction kind) — the shared choke
+  // point both proposers funnel through. A row carrying props the schema can't
+  // write (e.g. the user's Skill with description/kind/source and no
+  // instructions) is caught HERE with a plain verdict rather than surfacing the
+  // raw engine error at upsert. The row is left as it was (still declinable;
+  // the review panel de-emphasizes Approve), with the verdict recorded so the
+  // panel can show it. Well-formed rows — the internal agent's and valid MCP
+  // proposals — pass through untouched.
+  if (row.kind === 'extraction') {
+    const verdict = precheckExtractionRow(row)
+    if (verdict !== null) {
+      deps.db
+        .prepare(`UPDATE staged_writes SET validation_json = ? WHERE id = ?`)
+        .run(JSON.stringify({ decidedBy: options.decidedBy, invalidPayload: true, verdict }), id)
+      throw new StagedWriteError('INVALID_PAYLOAD', verdict)
+    }
+  }
+
   if (row.status === 'staged') {
     deps.db
       .prepare(

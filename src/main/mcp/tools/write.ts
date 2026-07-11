@@ -26,7 +26,12 @@ import {
 } from '../../agents'
 import { normalizeMd } from '../../agents/skills/candidate'
 import { DEDUPE_MERGE_LABELS, MemoryEditError, planDedupeMerge } from '../../memory'
-import { stageDedupeMerge, type DedupeMergePayload } from '../../security'
+import {
+  extractionStagingErrorMessage,
+  stageDedupeMerge,
+  validateExtractionStaging,
+  type DedupeMergePayload
+} from '../../security'
 import { enqueueExtractionContinuation, extractionContinuationTaskId } from '../../triggers'
 import { stableStringify } from '../callLog'
 import { ToolError, parse, jsonSchema, type McpToolDef, type ToolContext } from './shared'
@@ -180,6 +185,20 @@ async function proposeExtraction(args: unknown, ctx: ToolContext): Promise<unkno
     evidence: input.evidence ?? '',
     reason: input.reason,
     session: input.session ?? ''
+  }
+  // §18 property validation at the proposal boundary (§13 "staged and
+  // validated"): a node's props must be writable for its label and carry the
+  // per-label required fields, and every edge must be a schema-legal pair. This
+  // is what was missing — staging silently accepted a Skill with props the
+  // schema can't write, and the failure only surfaced (raw) at approve time.
+  // Returning it as a clean INVALID_INPUT here lets the proposing agent
+  // self-correct (§15).
+  const issue = validateExtractionStaging({
+    node: stampedNode === null ? null : { label: stampedNode.label, props: stampedNode.props },
+    edges: payload.edges
+  })
+  if (issue !== null) {
+    throw new ToolError('INVALID_INPUT', extractionStagingErrorMessage('propose_extraction', issue))
   }
   const targetLabel = stampedNode?.label ?? edges[0]?.from.label ?? null
   const targetId = stampedNode?.id ?? edges[0]?.from.id ?? null

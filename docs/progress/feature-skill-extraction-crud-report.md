@@ -225,3 +225,80 @@ docker conformance probes) did **not** fire this run; each is green in isolation
 - Any **new staged-write kind** should get a `stagedSummary.ts` template (it degrades gracefully, but the
   generic sentence is worse than a tailored one) and, if it writes the graph, must ride `audit.graphWrite`
   so History/undo keeps working.
+
+---
+
+## Post-release fix — validate staged-write props at proposal time; friendly commit-time verdicts
+
+**Bug (reproduced live).** An external Claude session called `propose_extraction` to stage
+`~ MERGE Skill skill-ui-ux-pro-max` with props `{ description, kind, name, project_count, source }` —
+properties the `Skill` node table does not have (§18: Skill = name, instructions, current_version) and
+**missing** the required `instructions`. Staging accepted it silently (no property-level check existed at
+the proposal boundary); the user's APPROVE then failed with the **raw engine error** `upsertNode(Skill):
+"description" is not a writable property`. Spec §13 promises staged writes are "staged and **validated**" —
+that validation was structural only (labels/edge-types), never property-level.
+
+**Root cause confirmed.** Neither `proposeExtraction` (MCP, `src/main/mcp/tools/write.ts`) nor the
+commit path (`commitExtraction` in `src/main/security/stagedWrites.ts`) checked node props against
+`writableNodeProperties(label)` or per-label required fields. `commitExtraction` upserted whatever props
+the row carried, so the first schema violation surfaced as the engine's raw column error at approve time.
+
+**Fix — one shared validator, wired at both boundaries.** New `validateExtractionStaging(shape)` in
+`stagedWrites.ts` is the single §18 property gate both proposers funnel through:
+- **proposal boundary** (`proposeExtraction`): validates the built payload and, on failure, throws a clean
+  `ToolError('INVALID_INPUT', …)` naming the label, the offending keys, the missing required keys, and
+  pointing Skill creation at `ingest_codebase` — so the proposing agent self-corrects (§15). Nothing is
+  staged.
+- **commit boundary** (`approveStagedWrite`, extraction kind): pre-checks the row before the status flip.
+  On failure it stores a plain-language verdict in `validation_json` (`{ invalidPayload: true, verdict }`)
+  and throws `StagedWriteError('INVALID_PAYLOAD', verdict)` — the raw engine string never surfaces. The row
+  stays `staged` (still declinable). This is the shared choke point that covers pre-existing bad rows like
+  the user's live one, plus the internal extraction agent's rows.
+
+The internal agent's own write step (`agents/extraction/write.ts`) was intentionally **not** modified:
+its payloads are code-constructed (Component `{name,type,+prov}`, Preference `{statement,+prov}`,
+Correction `{content}`) and pass the validator unchanged (proven by test), and adding a throw after its
+already-committed graph lane job risked tombstoning a session on resume. The commit boundary validates its
+rows at approve time regardless.
+
+**Validation rules as shipped** (`validateExtractionStaging`):
+- **props ⊆ writable(label)** minus engine-owned keys. Offending = any prop not in
+  `writableNodeProperties(label)`, plus the server-owned set `{ id, created_at, updated_at, embedding }`
+  (embedding is computed at commit). `extracted_by`/`confidence` are **allowed** — they are provenance the
+  agent stamps onto provenance-label props (§21 rule 4) and are already in the writable map.
+- **required props** (non-empty string) for any node that will be written (create OR merge-with-node;
+  internal merges carry `node: null` so they never trip it): Skill → name + instructions; Preference →
+  statement; Knowledge → content; Component → name; Project → name; Correction → content; MCP/Plugin/Tag →
+  name; Document → source; Example → content; SkillVersion → instructions.
+- **edges**: each `(from,to)` must be a `REL_TABLES`-legal pair (mirrors `memory/edit.ts` `assertEdgePair`).
+
+**Exact user-facing copy** (stored in `validation_json.verdict`, returned as the INVALID_PAYLOAD message,
+shown by ReviewPanel):
+> This proposal can't be applied: a Skill doesn't have the properties description, kind, project_count,
+> source, and it's missing the required instructions. Decline it — if the skill is real, re-ingest the
+> project and approve the properly-formed version.
+
+**Renderer** (`ReviewPanel.tsx` + `lib/stagedSummary.ts`): new pure `invalidPayloadVerdictOf(row)` reads
+the verdict off `validation_json`. When present the modal leads with a plain warning box
+(`data-testid="staged-invalid-payload"`), the row shows a one-line warning
+(`data-testid="staged-row-invalid"`), Approve is de-emphasized to a `ghost` variant with the verdict as
+its tooltip (still functional, all testids preserved), and the "approved but not saved" / raw "Saving
+failed" notes are suppressed in favor of the verdict. Raw op-by-op detail stays behind the existing
+Technical-changes disclosure. Decline is unchanged.
+
+**Files touched.** `src/main/security/stagedWrites.ts` (validator + formatters + approve pre-check),
+`src/main/security/index.ts` (exports), `src/main/mcp/tools/write.ts` (propose_extraction boundary),
+`src/renderer/src/lib/stagedSummary.ts` (`invalidPayloadVerdictOf`), `src/renderer/src/panels/ReviewPanel.tsx`
+(warning UI + de-emphasized Approve). Tests: `tests/unit/stagedExtractionValidation.test.ts` (new),
+`tests/unit/invalidPayloadVerdict.test.ts` (new), `tests/integration/security.staged.test.ts` (+5 cases),
+`tests/integration/mcp.tools.phase18.test.ts` (+1 case). No change to the MCP tool registry surface.
+
+**Verification.** `npm run typecheck` + `npm run lint` clean. New unit + integration files green in
+isolation. FULL `npm test` = 1024 passed / 21 skipped / 1 failed, the failure being
+`runner.completion.test.ts` "kills a hung fake … process TREE" — a Windows process-tree timing flake
+unrelated to this change (passes in isolation; my diff touches only security/mcp/renderer). The e2e
+`dashboard.review.spec.ts` was **not** run: port 4517 was held by the user's live app at the time, and that
+spec launches a full app binding the same fixed 4517 — running it would have collided with the live
+session (the same reason golden-path is off-limits). The renderer decision logic is covered by
+`invalidPayloadVerdict.test.ts` and the web typecheck; the happy path is behaviorally unchanged
+(warning UI is gated on a non-null verdict).
