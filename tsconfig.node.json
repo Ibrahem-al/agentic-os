@@ -23,7 +23,13 @@
     "tests/integration/**/*.ts",
     "tests/e2e/**/*.ts",
     "tests/fixtures/**/*.ts",
-    "playwright.config.ts"
+    "playwright.config.ts",
+    // DOM-free renderer libs unit-tested from tests/unit (pure functions over
+    // shared DTOs) — listed so the composite project can typecheck their test
+    // imports (TS6307). NOT a general renderer include: files here avoid DOM/React.
+    "src/renderer/src/lib/plain.ts",
+    "src/renderer/src/lib/stagedSummary.ts",
+    "src/renderer/src/lib/nodeSummary.ts"
   ],
   "exclude": [
     "tests/fixtures/mini-repo",

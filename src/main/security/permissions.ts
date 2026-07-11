@@ -122,6 +122,18 @@ export const CONTROL_TOOLS = new Set([
   'ingest_document',
   'ingest_codebase'
 ])
+/**
+ * Dashboard-maintenance tools (memory dedup — user-directed extension): they
+ * behave like read/staging (no graph side effect — the scanner reads,
+ * propose_dedupe_merge only STAGES), so they AUTO-ALLOW on the interactive
+ * `mcp:` session. They are deliberately EXCLUDED from the runner surface
+ * (`mcp-runner:` profile + the server-side RUNNER_SESSION_ALLOWLIST), so a
+ * headless background reasoner can never trigger them — de-duplicating a user's
+ * long-lived memory is a human-in-the-loop chore, not autonomous background
+ * work. Kept a SEPARATE tier from READ_TOOLS/STAGING_TOOLS precisely so the
+ * runner allowlist (derived from those two) stays unchanged.
+ */
+export const DASHBOARD_TOOLS = new Set(['list_duplicate_memories', 'propose_dedupe_merge'])
 
 export class PermissionEngine implements PermissionChecker {
   private readonly db: BetterSqlite3.Database
@@ -232,8 +244,9 @@ export class PermissionEngine implements PermissionChecker {
         if (!cap.tools.includes(action.name) && !cap.tools.includes('*')) {
           return this.block(action, `tool '${action.name}' is not in the agent's declared tools`)
         }
-        // Reads + staging (§21 rule 6 — staging IS the approval flow) auto-allow.
-        if (READ_TOOLS.has(action.name) || STAGING_TOOLS.has(action.name)) {
+        // Reads + staging (§21 rule 6 — staging IS the approval flow) auto-allow;
+        // dashboard-maintenance tools (dedup scan/propose) are read/staging-tier too.
+        if (READ_TOOLS.has(action.name) || STAGING_TOOLS.has(action.name) || DASHBOARD_TOOLS.has(action.name)) {
           return { allowed: true, reason: 'read/staging MCP tool — auto-allowed (§13/§21 rule 6)' }
         }
         // Control tools carry real side effects — write-tier gated.
@@ -409,9 +422,10 @@ export function registerInternalAgents(engine: PermissionEngine): void {
       ...EMPTY_CAPABILITIES,
       // The full planned surface: with the P0.6 cap.tools check now enforced,
       // the interactive session must declare every tool it may call. Reads +
-      // staging auto-allow; the control tools ride the write standing-grant —
-      // so the 7 phase-05 tools (and every later one) behave exactly as today.
-      tools: [...READ_TOOLS, ...STAGING_TOOLS, ...CONTROL_TOOLS]
+      // staging (and the dashboard-maintenance dedup tools) auto-allow; the
+      // control tools ride the write standing-grant — so the 7 phase-05 tools
+      // (and every later one) behave exactly as today.
+      tools: [...READ_TOOLS, ...STAGING_TOOLS, ...CONTROL_TOOLS, ...DASHBOARD_TOOLS]
     },
     gates: { write: 'allow' }
   })

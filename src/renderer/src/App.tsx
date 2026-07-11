@@ -5,7 +5,7 @@
  * are plain-English per the redesign brief; testids are unchanged.
  */
 import { useCallback, useEffect, useState } from 'react'
-import type { RunnerStatusDto } from '../../shared/ipc'
+import type { IpcNodeLabel, RunnerStatusDto } from '../../shared/ipc'
 import { call, useIpc } from './lib/ipc'
 import { plainStatus } from './lib/plain'
 import { Badge, Button, ToastProvider } from './ui/kit'
@@ -30,12 +30,26 @@ import SettingsPanel from './panels/SettingsPanel'
  */
 type PanelKey = 'home' | 'memory' | 'review' | 'audit' | 'spend' | 'tasks' | 'traces' | 'skills' | 'ingest' | 'settings'
 
+/** A cross-panel deep-link target for the Memory inspector (addendum R3). */
+export interface InspectTarget {
+  readonly label: IpcNodeLabel
+  readonly id: string
+}
+
 /**
  * Shared panel prop bag. Home needs to route the user to a deeper panel; the
  * other panels may ignore it (their `() => JSX` signatures stay assignable).
+ *
+ * R3 deep link: `onInspect(target)` routes to Memory AND opens a node's
+ * inspector (used by Approvals source chips); `inspect` is the pending one-shot
+ * target App hands to MemoryPanel, which consumes it and calls `onInspectConsumed`.
+ * All three are optional so every other panel ignores them unchanged.
  */
 export interface PanelProps {
   onNavigate: (key: PanelKey) => void
+  onInspect?: (target: InspectTarget) => void
+  inspect?: InspectTarget | null
+  onInspectConsumed?: () => void
 }
 
 interface PanelDef {
@@ -406,10 +420,19 @@ function NavItem({
 
 export default function App(): React.JSX.Element {
   const [active, setActive] = useState<PanelKey>('home')
+  // R3 one-shot deep-link target: set by onInspect, consumed + cleared by MemoryPanel.
+  const [inspectTarget, setInspectTarget] = useState<InspectTarget | null>(null)
   const pending = usePolledCount(fetchPendingCount)
   const drift = usePolledCount(fetchDriftCount)
   const { status: runnerStatus, refresh: refreshRunner } = useRunnerStatus()
   const ActivePanel = PANELS[active].component
+
+  // Route to Memory and open a node's inspector (Approvals source chips, etc.).
+  const onInspect = useCallback((target: InspectTarget) => {
+    setInspectTarget(target)
+    setActive('memory')
+  }, [])
+  const onInspectConsumed = useCallback(() => setInspectTarget(null), [])
 
   // Retry = one live re-check (the canary) then re-read the snapshot.
   const retryRunner = useCallback(async (): Promise<void> => {
@@ -473,7 +496,12 @@ export default function App(): React.JSX.Element {
           </nav>
           <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
             {runnerBanner}
-            <ActivePanel onNavigate={setActive} />
+            <ActivePanel
+              onNavigate={setActive}
+              onInspect={onInspect}
+              inspect={active === 'memory' ? inspectTarget : null}
+              onInspectConsumed={onInspectConsumed}
+            />
           </main>
         </div>
       </div>

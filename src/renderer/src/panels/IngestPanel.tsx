@@ -37,7 +37,8 @@ const PHASE_LABEL: Record<IngestProgressEventDto['phase'], string> = {
   walking: 'Looking at files',
   parsing: 'Reading code',
   writing: 'Saving to memory',
-  knowledge: 'Writing notes'
+  knowledge: 'Writing notes',
+  skills: 'Finding skills'
 }
 
 /** Plain headline sentence for a finished document ingest. */
@@ -389,6 +390,25 @@ export default function IngestPanel({ onNavigate }: PanelProps): React.JSX.Eleme
                   {codeResult.projectCreated && <span className="text-[12px] text-ink-mute">new project</span>}
                 </div>
 
+                {/* Stage-3 skill extraction: nothing goes live here — staged skills
+                    and revisions wait for a human in Approvals. */}
+                {codeResult.skills.staged + codeResult.skills.revisions > 0 && (
+                  <p className="text-[12px]" data-testid="ingest-code-skills">
+                    <span className="text-ink">
+                      {plural(codeResult.skills.staged + codeResult.skills.revisions, 'skill')} found
+                    </span>
+                    <span className="text-ink-mute"> — waiting in </span>
+                    <TextLink onClick={() => onNavigate('review')}>Approvals</TextLink>
+                    <span className="text-ink-mute">.</span>
+                  </p>
+                )}
+                {codeResult.skills.skippedExisting > 0 && (
+                  <p className="text-[12px] text-ink-mute">
+                    {plural(codeResult.skills.skippedExisting, 'skill')} already imported before, so{' '}
+                    {codeResult.skills.skippedExisting === 1 ? 'it was' : 'they were'} skipped.
+                  </p>
+                )}
+
                 <Disclosure summary="Details">
                   <KV
                     entries={[
@@ -403,7 +423,17 @@ export default function IngestPanel({ onNavigate }: PanelProps): React.JSX.Eleme
                       { k: 'Connections', v: num(codeResult.dependsOn.total) },
                       { k: 'Notes written', v: num(codeResult.knowledgeDocuments) },
                       { k: 'Notes removed', v: num(codeResult.knowledgePruned) },
-                      { k: 'Skipped', v: num(codeResult.skipped) }
+                      { k: 'Skipped', v: num(codeResult.skipped) },
+                      ...(codeResult.skills.discovered > 0 || codeResult.skills.skippedExisting > 0
+                        ? [
+                            { k: 'Skills found', v: num(codeResult.skills.discovered) },
+                            {
+                              k: 'Skills waiting for review',
+                              v: num(codeResult.skills.staged + codeResult.skills.revisions)
+                            },
+                            { k: 'Already imported before', v: num(codeResult.skills.skippedExisting) }
+                          ]
+                        : [])
                     ]}
                   />
                   {codeResult.knowledgeFailed.length > 0 && (

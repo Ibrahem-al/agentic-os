@@ -88,6 +88,10 @@ async function ingestCodebaseTool(args: unknown, ctx: ToolContext): Promise<unkn
         engine: ctx.engine,
         embedder: ctx.retrieval.embedder,
         llm: ctx.llm,
+        // appdata.db ⇒ the Stage-3 skill-extraction pass stages `skill-import`
+        // rows (still human-gated; NO new MCP tool, the runner allowlist is
+        // unchanged). The skills block rides through on the spread below.
+        db: ctx.db,
         ...(ctx.router !== undefined ? { router: ctx.router } : {}),
         ...(ctx.scanner !== undefined ? { scanner: ctx.scanner } : {}),
         ...(ctx.audit !== undefined ? { audit: { log: ctx.audit, agentId: `mcp:${ctx.sessionId}` } } : {})

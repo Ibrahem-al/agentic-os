@@ -27,7 +27,9 @@ import type BetterSqlite3 from 'better-sqlite3'
 import {
   EDGE_TYPES,
   NODE_LABELS,
+  REL_TABLES,
   isMutatingCypher,
+  writableNodeProperties,
   type EdgeProps,
   type EdgeType,
   type NodeLabel,
@@ -61,6 +63,24 @@ export type GraphInverseOp =
       readonly props: Readonly<Record<string, unknown>>
     }
   | { readonly op: 'delete-edge'; readonly type: EdgeType; readonly from: NodeRef; readonly to: NodeRef }
+  | {
+      readonly op: 'restore-node'
+      readonly label: NodeLabel
+      /**
+       * Full node pre-image: id + every set writable property (embedding
+       * included). Re-created via upsertNode on undo; created_at/updated_at are
+       * re-stamped (engine-owned), exactly as restore-props already restamps.
+       */
+      readonly props: Readonly<Record<string, unknown>>
+    }
+  | {
+      readonly op: 'restore-edge'
+      readonly type: EdgeType
+      readonly from: NodeRef
+      readonly to: NodeRef
+      /** Edge props at delete time (extracted_by/confidence); omitted when unset. */
+      readonly props?: Readonly<EdgeProps>
+    }
 
 export interface AuditActionRow {
   readonly id: string
@@ -184,6 +204,28 @@ export class AuditLog implements AuditHook {
             // invert; a newly created edge is deleted on undo.
             if (!exists) inverse.push({ op: 'delete-edge', type, from, to })
             return tx.createEdge(type, from, to, props)
+          },
+          deleteNode: async (label, id) => {
+            // Capture the full pre-image BEFORE the DETACH delete: the node's
+            // properties (embedding included) plus every incident edge, so undo
+            // can rebuild the node and reconnect it. Ordering matters — the
+            // node restore must apply BEFORE its edge restores (createEdge needs
+            // both endpoints to exist). undo replays newest-pushed-first (the
+            // whole inverse array is reversed at finish), so push the incident
+            // edges FIRST and the node restore LAST: after the reversal the
+            // node is restored first, then its edges. A missing node → nothing
+            // captured, nothing to delete.
+            const node = await nodePreImageForDelete(tx, label, id)
+            if (node !== null) {
+              inverse.push(...(await incidentEdgesOf(tx, label, id)))
+              inverse.push(node)
+            }
+            return tx.deleteNode(label, id)
+          },
+          deleteEdge: async (type, from, to) => {
+            const op = await edgePreImageForDelete(tx, type, from, to)
+            if (op !== null) inverse.push(op)
+            return tx.deleteEdge(type, from, to)
           }
         }
         return fn(recording)
@@ -291,8 +333,13 @@ export class AuditLog implements AuditHook {
     await engine.withWrite(async (tx) => {
       for (const op of ops) {
         if (op.op === 'delete-node') {
-          const label = assertLabel(op.label)
-          await tx.cypher(`MATCH (n:${label} {id: $id}) DETACH DELETE n`, { id: op.id })
+          // Structured delete rather than raw DETACH DELETE cypher: identical
+          // semantics, but deleteNode also runs the engine's emptied-vector-
+          // index rebuild — undoing the CREATE of a label's last retrievable
+          // node must not leave its HNSW index degenerate (ryugraph 25.9.1
+          // emptied-index caveat; see deleteNodeInLane). Found by the Stage-2
+          // memory.edit create→undo round-trip tests.
+          await tx.deleteNode(assertLabel(op.label), op.id)
         } else if (op.op === 'restore-props') {
           const label = assertLabel(op.label)
           const entries = Object.entries(op.props)
@@ -307,14 +354,34 @@ export class AuditLog implements AuditHook {
             if (!PROP_NAME_RE.test(key)) throw new Error(`unsafe property name '${key}' in inverse op`)
             await tx.cypher(`MATCH (n:${label} {id: $id}) SET n.${key} = NULL`, { id: op.id })
           }
-        } else {
-          const type = assertEdgeType(op.type)
-          const from = assertLabel(op.from.label)
-          const to = assertLabel(op.to.label)
-          await tx.cypher(
-            `MATCH (a:${from} {id: $from})-[r:${type}]->(b:${to} {id: $to}) DELETE r`,
-            { from: op.from.id, to: op.to.id }
+        } else if (op.op === 'restore-node') {
+          const label = assertLabel(op.label)
+          for (const key of Object.keys(op.props)) {
+            if (!PROP_NAME_RE.test(key)) throw new Error(`unsafe property name '${key}' in inverse op`)
+          }
+          // Re-create the DETACH-deleted node from its full pre-image. The node
+          // is gone, so upsertNode takes the CREATE branch — the embedding is set
+          // inline and the HNSW/FTS indexes auto-maintain; created_at/updated_at
+          // are re-stamped (engine-owned), as restore-props already does.
+          await tx.upsertNode(label, { ...op.props } as NodeProps)
+        } else if (op.op === 'delete-edge') {
+          // Structured twin of the delete-node arm above (same engine path a
+          // forward deleteEdge takes; no index implications, just symmetry).
+          await tx.deleteEdge(
+            assertEdgeType(op.type),
+            { label: assertLabel(op.from.label), id: op.from.id },
+            { label: assertLabel(op.to.label), id: op.to.id }
           )
+        } else {
+          // restore-edge: reconnect a deleted edge via the structured createEdge.
+          // Both endpoints were restored earlier in THIS rollback (the recorder
+          // pushes each incident edge before its node so the reversal restores
+          // the node first — see graphWrite's recording deleteNode), or were
+          // never deleted, so the MERGE endpoints exist.
+          const type = assertEdgeType(op.type)
+          const from: NodeRef = { label: assertLabel(op.from.label), id: op.from.id }
+          const to: NodeRef = { label: assertLabel(op.to.label), id: op.to.id }
+          await tx.createEdge(type, from, to, op.props)
         }
       }
     })
@@ -490,4 +557,98 @@ async function edgeExists(tx: WriteTx, type: EdgeType, from: NodeRef, to: NodeRe
     { from: from.id, to: to.id }
   )
   return Number(rows[0]?.['c'] ?? 0) > 0
+}
+
+/**
+ * Full pre-image of a node about to be DETACH-deleted: id + every SET writable
+ * property (embedding included), so undo can re-create it byte-for-byte at
+ * column precision. Returns null when the node does not exist (nothing to
+ * delete → nothing to record). created_at/updated_at are engine-owned and
+ * re-stamped on restore.
+ */
+async function nodePreImageForDelete(tx: WriteTx, label: NodeLabel, id: string): Promise<GraphInverseOp | null> {
+  const names = [...writableNodeProperties(label).keys()]
+  for (const key of names) {
+    if (!PROP_NAME_RE.test(key)) throw new Error(`unsafe property name '${key}' in node pre-image`)
+  }
+  const returns = names.length > 0 ? names.map((k) => `n.${k} AS ${k}`).join(', ') : 'n.id AS __exists'
+  const rows = await tx.cypher(`MATCH (n:${label} {id: $id}) RETURN ${returns} LIMIT 1`, { id })
+  if (rows.length === 0) return null
+  const props: Record<string, unknown> = { id }
+  for (const key of names) {
+    const value = rows[0]?.[key]
+    if (value === null || value === undefined) continue
+    // Dates → ISO strings (JSON-stable; upsertNode accepts ISO for TIMESTAMP).
+    props[key] = value instanceof Date ? value.toISOString() : value
+  }
+  return { op: 'restore-node', label, props }
+}
+
+/**
+ * Every edge incident to a node (both directions), as restore-edge inverse ops.
+ * Enumerated over the §18 schema pairs (the driver has no generic label()/type()
+ * projection — the export job walks pairs the same way): for each rel type where
+ * the node's label is a FROM endpoint, capture its outgoing edges; where it is a
+ * TO endpoint, its incoming edges. DETACH DELETE removes all of these, so undo
+ * must recreate each one.
+ */
+async function incidentEdgesOf(tx: WriteTx, label: NodeLabel, id: string): Promise<GraphInverseOp[]> {
+  const ops: GraphInverseOp[] = []
+  for (const spec of REL_TABLES) {
+    for (const [fromLabel, toLabel] of spec.pairs) {
+      if (fromLabel === label) {
+        const rows = await tx.cypher(
+          `MATCH (n:${label} {id: $id})-[r:${spec.type}]->(b:${toLabel})
+           RETURN b.id AS other, r.extracted_by AS extracted_by, r.confidence AS confidence`,
+          { id }
+        )
+        for (const row of rows) {
+          ops.push(restoreEdgeOp(spec.type, { label, id }, { label: toLabel, id: String(row['other']) }, row))
+        }
+      }
+      if (toLabel === label) {
+        const rows = await tx.cypher(
+          `MATCH (a:${fromLabel})-[r:${spec.type}]->(n:${label} {id: $id})
+           RETURN a.id AS other, r.extracted_by AS extracted_by, r.confidence AS confidence`,
+          { id }
+        )
+        for (const row of rows) {
+          ops.push(restoreEdgeOp(spec.type, { label: fromLabel, id: String(row['other']) }, { label, id }, row))
+        }
+      }
+    }
+  }
+  return ops
+}
+
+/** Pre-image of a single edge about to be deleted; null when the edge is absent. */
+async function edgePreImageForDelete(
+  tx: WriteTx,
+  type: EdgeType,
+  from: NodeRef,
+  to: NodeRef
+): Promise<GraphInverseOp | null> {
+  const rows = await tx.cypher(
+    `MATCH (a:${from.label} {id: $from})-[r:${type}]->(b:${to.label} {id: $to})
+     RETURN r.extracted_by AS extracted_by, r.confidence AS confidence LIMIT 1`,
+    { from: from.id, to: to.id }
+  )
+  if (rows.length === 0) return null
+  return restoreEdgeOp(type, from, to, rows[0] as Record<string, unknown>)
+}
+
+/** Build a restore-edge op, carrying only the edge props that were actually set. */
+function restoreEdgeOp(type: EdgeType, from: NodeRef, to: NodeRef, row: Record<string, unknown>): GraphInverseOp {
+  const props = edgePropsFrom(row)
+  return props === undefined ? { op: 'restore-edge', type, from, to } : { op: 'restore-edge', type, from, to, props }
+}
+
+/** The stamped edge props (extracted_by/confidence) from a query row, or undefined when unset. */
+function edgePropsFrom(row: Record<string, unknown>): EdgeProps | undefined {
+  const props: { extracted_by?: string; confidence?: number } = {}
+  const extractedBy = row['extracted_by']
+  if (typeof extractedBy === 'string') props.extracted_by = extractedBy
+  const confidence = row['confidence']
+  if (typeof confidence === 'number') props.confidence = confidence
+  return Object.keys(props).length > 0 ? props : undefined
 }

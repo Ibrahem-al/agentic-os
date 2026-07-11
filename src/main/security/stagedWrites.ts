@@ -2,7 +2,7 @@
  * Staged-writes lifecycle (§13, phase 09): propose → human-readable diff →
  * approve (commit via the single write lane, audited) / reject.
  *
- * Three proposers feed `staged_writes` (appdata.db):
+ * Five proposers feed `staged_writes` (appdata.db):
  *  - `propose_correction` (kind 'propose_correction', proposer
  *    `claude-mcp:<session>`): payload `{ patch, reason }` against an existing
  *    node — Claude's ONLY write path (§21 rule 6).
@@ -17,6 +17,20 @@
  *    audited retire of the already-recorded candidate version (this kind's
  *    candidate is a first-class graph record before review — recorded
  *    deviation from the other kinds' "rejection touches nothing").
+ *  - codebase skill extraction (kind 'skill-import', feature A / Stage 3): a
+ *    SKILL.md / .claude command / LLM-proposed skill discovered while ingesting
+ *    a repo. A skill becomes standing instructions served over get_skill, so it
+ *    is DATA that must pass the injection scanner and a human before it goes
+ *    live (§21 rule 5). Approve, mode create = one audited base-Skill import
+ *    (importSkill; embedding computed at commit — P1.7); mode revision = a
+ *    stamped candidate SkillVersion, NEVER auto-adopted. Reject leaves no
+ *    residue beyond the log (nothing was ever written to the graph).
+ *  - memory dedupe (kind 'dedupe-merge', proposer `claude-mcp:<session>` via the
+ *    propose_dedupe_merge tool): a proposed MERGE of duplicate memory nodes
+ *    (Preference/Knowledge/Tag) onto a keeper. Claude never merges directly
+ *    (§21 rule 6); approval runs the SAME audited mergeDuplicates the dashboard
+ *    uses (re-points edges + deletes the removed nodes — undoable). Reject
+ *    leaves no residue beyond the log.
  *
  * Approval commits through ONE audited write-lane job (§21 rules 1 + 4 —
  * extraction payload edges carry their provenance stamps verbatim; the audit
@@ -27,16 +41,24 @@
  * updated). A commit failure leaves the row 'approved' with the error in
  * validation_json; calling approve() again retries the commit.
  */
+import { randomUUID } from 'node:crypto'
 import type BetterSqlite3 from 'better-sqlite3'
+import { PROJECT_SKILL_EXTRACTION_PROVENANCE } from '../config'
 import {
   SKILL_IMPROVEMENT_STAGED_KIND,
+  candidateVersionIdOf,
   cleanupRejectedSkillImprovement,
   commitSkillImprovementApproval,
   decodeSkillImprovementPayload,
+  diffLines,
+  importSkill,
+  recordCandidateVersion,
   renderSkillImprovementDiff,
+  skillEmbedText,
   type SkillLifecycleDeps
 } from '../agents/skills/lifecycle'
 import { SkillImprovementError } from '../agents/skills/types'
+import { MemoryEditError, mergeDuplicates } from '../memory'
 import { EDGE_TYPES, NODE_LABELS, type EdgeType, type NodeLabel, type StorageEngine } from '../storage'
 import type { AuditLog } from './audit'
 
@@ -154,6 +176,12 @@ export function getStagedWrite(db: BetterSqlite3.Database, id: string): StagedWr
  * extractions are always false.
  */
 export function stagedWriteRequiresEmbedder(row: Pick<StagedWriteRow, 'kind' | 'payload'>): boolean {
+  if (row.kind === SKILL_IMPORT_STAGED_KIND) {
+    // A create commits a fresh Skill whose embedding is computed at commit time
+    // (P1.7 — like an extraction create); a revision only records a candidate
+    // SkillVersion (no Skill re-embed), so it needs no embedder.
+    return row.payload['mode'] === 'create'
+  }
   if (row.kind !== 'extraction') return false
   const p = row.payload
   return p['op'] === 'create' && p['embedOnCommit'] === true && p['node'] !== null && p['node'] !== undefined
@@ -218,6 +246,44 @@ export async function renderStagedWriteDiff(
     return lines.join('\n')
   }
 
+  if (row.kind === SKILL_IMPORT_STAGED_KIND) {
+    const payload = decodeSkillImportPayload(row.payload, `staged write ${row.id}`)
+    lines.push(
+      payload.mode === 'create'
+        ? `+ NEW SKILL '${payload.name}' from project ${payload.projectName || payload.projectId}`
+        : `~ REVISION candidate for skill '${payload.name}' (${payload.skillId}) — recorded, NOT auto-adopted`,
+      `source: ${payload.source}`,
+      `confidence: ${payload.confidence} (${payload.proposal ? 'LLM proposal' : 'artifact'})`
+    )
+    if (payload.injectionFlagged) {
+      lines.push('⚠ the injection scanner flagged this content — it is stored as inert data; review before approving')
+    }
+    if (payload.mode === 'revision') {
+      const cur = await deps.engine.cypher('MATCH (s:Skill {id: $id}) RETURN s.instructions AS ins LIMIT 1', {
+        id: payload.skillId
+      })
+      const active = typeof cur[0]?.['ins'] === 'string' ? String(cur[0]!['ins']) : ''
+      lines.push('', 'instructions diff (active → candidate):', ...diffLines(active, payload.instructions))
+    } else {
+      lines.push('', 'instructions:', ...payload.instructions.split('\n').map((l) => `  ${l}`))
+    }
+    return lines.join('\n')
+  }
+
+  if (row.kind === DEDUPE_MERGE_STAGED_KIND) {
+    const payload = decodeDedupeMergePayload(row.payload, `staged write ${row.id}`)
+    // Plain sentences (§13 "user-visible diff"): keep one, remove the rest.
+    lines.push(
+      `Merge ${payload.removeIds.length} duplicate ${payload.label}${payload.removeIds.length === 1 ? '' : 's'} into one.`,
+      `Keep '${payload.keepDisplay}' (${payload.keepId}).`,
+      `Remove ${payload.removeIds.length} duplicate${payload.removeIds.length === 1 ? '' : 's'}:`
+    )
+    for (const removal of payload.displays) lines.push(`  - '${removal.display}' (${removal.id})`)
+    lines.push("Each removed node's edges move onto the kept node; this is undoable from History.")
+    if (payload.rationale !== '') lines.push(`rationale: ${payload.rationale}`)
+    return lines.join('\n')
+  }
+
   lines.push(`(unknown kind — raw payload) ${JSON.stringify(row.payload)}`)
   return lines.join('\n')
 }
@@ -257,7 +323,11 @@ export async function approveStagedWrite(
           ? await commitExtraction(deps, row)
           : row.kind === SKILL_IMPROVEMENT_STAGED_KIND
             ? await commitSkillImprovement(deps, row, options.decidedBy)
-            : raise(new StagedWriteError('INVALID_PAYLOAD', `staged write ${id} has unknown kind '${row.kind}'`))
+            : row.kind === SKILL_IMPORT_STAGED_KIND
+              ? await commitSkillImport(deps, row)
+              : row.kind === DEDUPE_MERGE_STAGED_KIND
+                ? await commitDedupeMerge(deps, row)
+                : raise(new StagedWriteError('INVALID_PAYLOAD', `staged write ${id} has unknown kind '${row.kind}'`))
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     deps.db
@@ -397,6 +467,222 @@ async function commitSkillImprovement(deps: StagedWritesDeps, row: StagedWriteRo
     if (err instanceof SkillImprovementError) {
       const code = err.code === 'NOT_FOUND' ? 'COMMIT_FAILED' : err.code === 'INVALID_INPUT' ? 'INVALID_PAYLOAD' : 'COMMIT_FAILED'
       throw new StagedWriteError(code, err.message)
+    }
+    throw err
+  }
+}
+
+// ── the 'skill-import' staged-write kind (feature A / Stage 3) ────────────────
+
+/** staged_writes.kind for a project skill discovered during codebase ingest. */
+export const SKILL_IMPORT_STAGED_KIND = 'skill-import'
+
+export interface SkillImportPayload {
+  /** Skill display name (SKILL.md frontmatter name, or `cmd-<file>` for a command). */
+  readonly name: string
+  /** Full SKILL.md text / command body (verbatim) — the skill's instructions. */
+  readonly instructions: string
+  /** Where it was found (repo-relative path, or `llm-proposal:<name>`). */
+  readonly source: string
+  readonly projectId: string
+  readonly projectName: string
+  /** sha256 of `${name}\n\n${instructions}` — the re-ingest dedup key. */
+  readonly contentHash: string
+  /** True for an LLM proposal (confidence 0.6), false for a deterministic artifact (1.0). */
+  readonly proposal: boolean
+  /** create = new Skill; revision = same-name Skill exists → candidate version only. */
+  readonly mode: 'create' | 'revision'
+  /** create: the new `skl-…` id; revision: the existing Skill's id. */
+  readonly skillId: string
+  readonly confidence: number
+  /** The injection scanner flagged the instructions (advisory — never blocks). */
+  readonly injectionFlagged: boolean
+}
+
+export function decodeSkillImportPayload(payload: Record<string, unknown>, context: string): SkillImportPayload {
+  const str = (key: string): string => {
+    const value = payload[key]
+    if (typeof value !== 'string' || value === '') {
+      throw new StagedWriteError('INVALID_PAYLOAD', `${context}: field '${key}' must be a non-empty string`)
+    }
+    return value
+  }
+  const mode = payload['mode'] === 'revision' ? 'revision' : 'create'
+  return {
+    name: str('name'),
+    instructions: str('instructions'),
+    source: typeof payload['source'] === 'string' ? payload['source'] : '',
+    projectId: str('projectId'),
+    projectName: typeof payload['projectName'] === 'string' ? payload['projectName'] : '',
+    contentHash: typeof payload['contentHash'] === 'string' ? payload['contentHash'] : '',
+    proposal: payload['proposal'] === true,
+    mode,
+    skillId: str('skillId'),
+    confidence: typeof payload['confidence'] === 'number' ? payload['confidence'] : mode === 'create' ? 1 : 0.6,
+    injectionFlagged: payload['injectionFlagged'] === true
+  }
+}
+
+/**
+ * Content hashes of every skill-import row NOT rejected (staged/approved/
+ * committed) — the re-ingest dedup source: an identical SKILL.md already
+ * staged-or-live is skipped, but a previously REJECTED one may be re-proposed.
+ */
+export function stagedSkillImportHashes(db: BetterSqlite3.Database): Set<string> {
+  const rows = db
+    .prepare(`SELECT payload_json FROM staged_writes WHERE kind = ? AND status IN ('staged', 'approved', 'committed')`)
+    .all(SKILL_IMPORT_STAGED_KIND) as { payload_json: string }[]
+  const hashes = new Set<string>()
+  for (const row of rows) {
+    try {
+      const payload = JSON.parse(row.payload_json) as Record<string, unknown>
+      if (typeof payload['contentHash'] === 'string' && payload['contentHash'] !== '') hashes.add(payload['contentHash'])
+    } catch {
+      // a malformed row can't match a fresh candidate's hash — skip it
+    }
+  }
+  return hashes
+}
+
+/** Insert a skill-import staged row (random id — a rejected same-hash row may re-stage). */
+export function stageSkillImport(db: BetterSqlite3.Database, proposedBy: string, payload: SkillImportPayload): string {
+  const id = `sw-skimport-${randomUUID().slice(0, 16)}`
+  db.prepare(
+    `INSERT INTO staged_writes (id, proposed_by, kind, target_label, target_id, payload_json)
+     VALUES (?, ?, ?, 'Skill', ?, ?)`
+  ).run(id, proposedBy, SKILL_IMPORT_STAGED_KIND, payload.skillId, JSON.stringify(payload))
+  return id
+}
+
+/**
+ * Approve committer: mode create → one audited base-Skill import (importSkill;
+ * Skill + active SkillVersion + HAS_VERSION + Project USES, embedding computed
+ * HERE at commit — P1.7, provenance `project-skill-extraction@0.0.1` on the
+ * edges). Mode revision → a stamped candidate SkillVersion (recordCandidateVersion,
+ * status candidate) — NEVER auto-adopted; the user adopts it from the Skills
+ * panel / improvement loop. The commit is attributed to the ingest proposer.
+ */
+async function commitSkillImport(deps: StagedWritesDeps, row: StagedWriteRow): Promise<string> {
+  const payload = decodeSkillImportPayload(row.payload, `staged write ${row.id}`)
+  const provenance = { extracted_by: PROJECT_SKILL_EXTRACTION_PROVENANCE, confidence: payload.confidence }
+
+  if (payload.mode === 'revision') {
+    const versionId = candidateVersionIdOf(payload.skillId, payload.instructions)
+    const { auditActionId } = await recordCandidateVersion(skillLifecycleDeps(deps), {
+      skillId: payload.skillId,
+      candidateVersionId: versionId,
+      instructions: payload.instructions,
+      benchmarkScore: null,
+      status: 'candidate',
+      agentId: row.proposedBy,
+      extractedBy: PROJECT_SKILL_EXTRACTION_PROVENANCE,
+      edgeConfidence: payload.confidence,
+      description: `skill-import: record revision candidate ${versionId} for skill ${payload.skillId} ('${payload.name}') — NOT auto-adopted`
+    })
+    return auditActionId
+  }
+
+  if (deps.embedder === undefined) {
+    throw new StagedWriteError(
+      'COMMIT_FAILED',
+      `staged write ${row.id} creates a Skill (embedded at commit) but no embedder is configured (is Ollama running?)`
+    )
+  }
+  const vectors = await deps.embedder.embed([skillEmbedText(payload.name, payload.instructions)])
+  const embedding = vectors[0]
+  if (embedding === undefined) throw new StagedWriteError('COMMIT_FAILED', 'embedder returned no vector for the skill')
+
+  const { auditActionId } = await importSkill(
+    { audit: deps.audit },
+    {
+      skillId: payload.skillId,
+      name: payload.name,
+      instructions: payload.instructions,
+      embedding,
+      projectId: payload.projectId,
+      provenance,
+      agentId: row.proposedBy,
+      description: `skill-import: create Skill ${payload.skillId} ('${payload.name}') from ${payload.projectName || payload.projectId}`
+    }
+  )
+  return auditActionId
+}
+
+// ── the 'dedupe-merge' staged-write kind (dashboard dedupe over MCP) ──────────
+
+/** staged_writes.kind for a memory de-duplication merge proposed over MCP. */
+export const DEDUPE_MERGE_STAGED_KIND = 'dedupe-merge'
+
+export interface DedupeMergePayload {
+  /** Node label being merged (Preference | Knowledge | Tag — mergeDuplicates re-checks). */
+  readonly label: string
+  /** The surviving node. */
+  readonly keepId: string
+  /** The nodes folded into the keeper. */
+  readonly removeIds: readonly string[]
+  /** Human handle of the keeper (for the review diff — resolved at propose time). */
+  readonly keepDisplay: string
+  /** Human handle of each removed node (for the review diff). */
+  readonly displays: readonly { readonly id: string; readonly display: string }[]
+  readonly rationale: string
+}
+
+export function decodeDedupeMergePayload(payload: Record<string, unknown>, context: string): DedupeMergePayload {
+  const label = payload['label']
+  const keepId = payload['keepId']
+  if (typeof label !== 'string' || label === '') {
+    throw new StagedWriteError('INVALID_PAYLOAD', `${context}: 'label' must be a non-empty string`)
+  }
+  if (typeof keepId !== 'string' || keepId === '') {
+    throw new StagedWriteError('INVALID_PAYLOAD', `${context}: 'keepId' must be a non-empty string`)
+  }
+  const removeRaw = Array.isArray(payload['removeIds']) ? (payload['removeIds'] as unknown[]) : []
+  const removeIds = removeRaw.filter((v): v is string => typeof v === 'string' && v !== '')
+  if (removeIds.length === 0) {
+    throw new StagedWriteError('INVALID_PAYLOAD', `${context}: 'removeIds' must list at least one node id`)
+  }
+  const displaysRaw = Array.isArray(payload['displays']) ? (payload['displays'] as unknown[]) : []
+  const displays = displaysRaw
+    .map((d) => (d !== null && typeof d === 'object' ? (d as { id?: unknown; display?: unknown }) : {}))
+    .filter((d): d is { id: string; display: string } => typeof d.id === 'string' && typeof d.display === 'string')
+  return {
+    label,
+    keepId,
+    removeIds,
+    keepDisplay: typeof payload['keepDisplay'] === 'string' ? payload['keepDisplay'] : keepId,
+    displays: displays.length > 0 ? displays : removeIds.map((id) => ({ id, display: id })),
+    rationale: typeof payload['rationale'] === 'string' ? payload['rationale'] : ''
+  }
+}
+
+/** Insert a dedupe-merge staged row (random id — a merge is never de-duplicated). */
+export function stageDedupeMerge(db: BetterSqlite3.Database, proposedBy: string, payload: DedupeMergePayload): string {
+  const id = `sw-dedupe-${randomUUID().slice(0, 16)}`
+  db.prepare(
+    `INSERT INTO staged_writes (id, proposed_by, kind, target_label, target_id, payload_json)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(id, proposedBy, DEDUPE_MERGE_STAGED_KIND, payload.label, payload.keepId, JSON.stringify(payload))
+  return id
+}
+
+/**
+ * Approve committer: run the SAME audited mergeDuplicates the dashboard uses
+ * (no embedder needed — a merge re-points edges + deletes nodes, never
+ * re-embeds; stagedWriteRequiresEmbedder returns false for this kind).
+ * mergeDuplicates re-validates existence at commit, so a node deleted since
+ * staging fails cleanly. Attributed to the proposer (§13).
+ */
+async function commitDedupeMerge(deps: StagedWritesDeps, row: StagedWriteRow): Promise<string> {
+  const payload = decodeDedupeMergePayload(row.payload, `staged write ${row.id}`)
+  try {
+    const result = await mergeDuplicates(
+      { engine: deps.engine, audit: deps.audit, actor: row.proposedBy },
+      { label: payload.label, keepId: payload.keepId, removeIds: payload.removeIds }
+    )
+    return result.auditActionId
+  } catch (err) {
+    if (err instanceof MemoryEditError) {
+      throw new StagedWriteError(err.code === 'NOT_FOUND' ? 'COMMIT_FAILED' : 'INVALID_PAYLOAD', err.message)
     }
     throw err
   }

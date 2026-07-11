@@ -80,11 +80,23 @@ export async function recordCandidateVersion(
     benchmarkScore: number | null
     status: 'candidate' | 'retired'
     agentId?: string
+    /**
+     * HAS_VERSION provenance (§21 rule 4). Defaults to the improvement agent's
+     * stamp; the Stage-3 skill-import REVISION path passes
+     * `project-skill-extraction@0.0.1` + its per-candidate confidence so an
+     * imported revision candidate is stamped as an extraction, not an
+     * improvement.
+     */
+    extractedBy?: string
+    edgeConfidence?: number | null
+    description?: string
   }
 ): Promise<{ auditActionId: string }> {
+  const edgeConfidence = entry.edgeConfidence !== undefined ? entry.edgeConfidence : entry.benchmarkScore
   const { actionId } = await deps.audit.graphWrite(
     entry.agentId ?? SKILL_IMPROVEMENT_AGENT_ID,
-    `skill-improvement: record ${entry.status} version ${entry.candidateVersionId} for skill ${entry.skillId}`,
+    entry.description ??
+      `skill-improvement: record ${entry.status} version ${entry.candidateVersionId} for skill ${entry.skillId}`,
     async (tx) => {
       await tx.upsertNode('SkillVersion', {
         id: entry.candidateVersionId,
@@ -97,13 +109,99 @@ export async function recordCandidateVersion(
         { label: 'Skill', id: entry.skillId },
         { label: 'SkillVersion', id: entry.candidateVersionId },
         {
-          extracted_by: SKILL_IMPROVEMENT_PROVENANCE,
-          ...(entry.benchmarkScore !== null ? { confidence: entry.benchmarkScore } : {})
+          extracted_by: entry.extractedBy ?? SKILL_IMPROVEMENT_PROVENANCE,
+          ...(edgeConfidence !== null ? { confidence: edgeConfidence } : {})
         }
       )
     }
   )
   return { auditActionId: actionId }
+}
+
+// ── import (base-Skill creation — dashboard create + Stage-3 skill-import) ────
+
+/** Minimal deps for {@link importSkill} — only the audit log (which owns the lane). */
+export interface ImportSkillDeps {
+  readonly audit: AuditLog
+}
+
+export interface ImportSkillEntry {
+  /** Server-generated Skill id (dashboard: `usr-skill-…`; import: `skl-…`). */
+  readonly skillId: string
+  readonly name: string
+  /** Full SKILL.md text (verbatim), stored on both the Skill and its version. */
+  readonly instructions: string
+  /** Pre-computed by the caller (dashboard: pre-lane; import: at commit). */
+  readonly embedding: number[]
+  /** When set, links the source Project via Project-[:USES]->Skill (stamped). */
+  readonly projectId?: string
+  /**
+   * Extraction provenance for the written EDGES (HAS_VERSION + USES). Skill and
+   * SkillVersion nodes carry NO provenance columns (§18), so the stamp only
+   * rides the edges. Omit for a user-authored dashboard create (no stamp).
+   */
+  readonly provenance?: { readonly extracted_by: string; readonly confidence: number }
+  /** Audit actor (§13) + History description subject. */
+  readonly agentId: string
+  readonly description?: string
+}
+
+export interface ImportSkillResult {
+  readonly auditActionId: string
+  readonly skillId: string
+  readonly versionId: string
+}
+
+/**
+ * The single base-Skill committer (feature A / Stage 3): create a `Skill` + its
+ * active `SkillVersion` + `HAS_VERSION` (and, for an import, the Project `USES`
+ * link) in ONE audited lane job (§21 rules 1 + 11) — so the reversible delta
+ * undoes the whole shape. The version id is `candidateVersionIdOf(skillId,
+ * instructions)`, so re-committing identical instructions is idempotent.
+ *
+ * Both writers of a first-class Skill converge here: the dashboard
+ * `memory.node.create` Skill branch (no project link, no provenance — the
+ * embedding computed pre-lane) and the staged `skill-import` approve path
+ * (Project-linked + stamped — the embedding computed at commit, P1.7).
+ */
+export async function importSkill(deps: ImportSkillDeps, entry: ImportSkillEntry): Promise<ImportSkillResult> {
+  const versionId = candidateVersionIdOf(entry.skillId, entry.instructions)
+  const edgeProps =
+    entry.provenance !== undefined
+      ? { extracted_by: entry.provenance.extracted_by, confidence: entry.provenance.confidence }
+      : undefined
+  const { actionId } = await deps.audit.graphWrite(
+    entry.agentId,
+    entry.description ?? `import Skill ${entry.skillId} ('${entry.name}')`,
+    async (tx) => {
+      await tx.upsertNode('Skill', {
+        id: entry.skillId,
+        name: entry.name,
+        instructions: entry.instructions,
+        current_version: versionId,
+        embedding: entry.embedding
+      })
+      await tx.upsertNode('SkillVersion', { id: versionId, instructions: entry.instructions, status: 'active' })
+      await tx.createEdge(
+        'HAS_VERSION',
+        { label: 'Skill', id: entry.skillId },
+        { label: 'SkillVersion', id: versionId },
+        edgeProps
+      )
+      if (entry.projectId !== undefined) {
+        // The §18 skill↔project edge is Project-[:USES]->Skill (schema
+        // REL_TABLES: USES pairs include [Project, Skill]) — stamped like the
+        // HAS_VERSION edge so the link is provenance-attributable.
+        await tx.createEdge(
+          'USES',
+          { label: 'Project', id: entry.projectId },
+          { label: 'Skill', id: entry.skillId },
+          edgeProps
+        )
+      }
+    }
+  )
+  return { auditActionId: actionId, skillId: entry.skillId, versionId }
 }
 
 /** A rejected stylistic candidate retires (audited; the record stays). */

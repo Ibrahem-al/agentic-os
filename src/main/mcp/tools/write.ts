@@ -25,6 +25,8 @@ import {
   SKILL_IMPROVEMENT_TASK_KIND
 } from '../../agents'
 import { normalizeMd } from '../../agents/skills/candidate'
+import { DEDUPE_MERGE_LABELS, MemoryEditError, planDedupeMerge } from '../../memory'
+import { stageDedupeMerge, type DedupeMergePayload } from '../../security'
 import { enqueueExtractionContinuation, extractionContinuationTaskId } from '../../triggers'
 import { stableStringify } from '../callLog'
 import { ToolError, parse, jsonSchema, type McpToolDef, type ToolContext } from './shared'
@@ -389,6 +391,51 @@ async function proposeSkillRevision(args: unknown, ctx: ToolContext): Promise<un
   }
 }
 
+// ── propose_dedupe_merge ────────────────────────────────────────────────────────
+
+const ProposeDedupeMergeInput = z.object({
+  label: z.enum(DEDUPE_MERGE_LABELS).describe('Node label to merge — one of Preference, Knowledge, Tag.'),
+  keep_id: z.string().min(1).describe('The surviving node id (list_duplicate_memories suggests one).'),
+  remove_ids: z.array(z.string().min(1)).min(1).describe('Duplicate node ids to fold into the keeper.'),
+  rationale: z.string().optional().describe('Why these are the same memory (shown in the review diff).')
+})
+
+async function proposeDedupeMerge(args: unknown, ctx: ToolContext): Promise<unknown> {
+  const input = parse(ProposeDedupeMergeInput, args, 'propose_dedupe_merge')
+  // Validate exactly as mergeDuplicates would (label supported, keeper ∉ removals,
+  // every id exists) and resolve the displays for the review diff — all pre-lane.
+  let plan
+  try {
+    plan = await planDedupeMerge(
+      { engine: ctx.engine },
+      { label: input.label, keepId: input.keep_id, removeIds: input.remove_ids }
+    )
+  } catch (err) {
+    if (err instanceof MemoryEditError) throw new ToolError(err.code, err.message)
+    throw err
+  }
+  const payload: DedupeMergePayload = {
+    label: plan.label,
+    keepId: plan.keepId,
+    removeIds: plan.removals.map((r) => r.id),
+    keepDisplay: plan.keepDisplay,
+    displays: plan.removals.map((r) => ({ id: r.id, display: r.display })),
+    rationale: input.rationale ?? ''
+  }
+  // The ONLY write this tool performs is to SQLite staging — never the graph
+  // (§21 rule 6). Approval runs the SAME audited mergeDuplicates the dashboard does.
+  const id = stageDedupeMerge(ctx.db, `claude-mcp:${ctx.sessionId}`, payload)
+  return {
+    staged: true,
+    stagedWriteId: id,
+    label: plan.label,
+    keepId: plan.keepId,
+    removeIds: payload.removeIds,
+    status: 'staged',
+    note: 'Merge staged for user review — nothing is merged in the graph until approved.'
+  }
+}
+
 export const WRITE_TOOL_DEFS: readonly McpToolDef[] = [
   {
     name: 'propose_correction',
@@ -417,5 +464,12 @@ export const WRITE_TOOL_DEFS: readonly McpToolDef[] = [
       'Propose a rewritten SKILL.md for an existing skill. It is benchmarked against a held-out split and adopted ONLY through the §17 gate (stylistic skills need one-click user approval; verifiable skills need a net-positive, zero-regression result) — never self-certified. Rejected if a candidate for the skill is already awaiting review.',
     inputSchema: jsonSchema(ProposeSkillRevisionInput),
     handle: proposeSkillRevision
+  },
+  {
+    name: 'propose_dedupe_merge',
+    description:
+      'Propose merging duplicate memory nodes (Preference | Knowledge | Tag) onto a keeper — validated and STAGED for user review, never merged directly (§21 rule 6). On approval the removed nodes’ edges move onto the keeper and the duplicates are deleted, in one audited, undoable step. Use list_duplicate_memories to find groups and a suggested keeper.',
+    inputSchema: jsonSchema(ProposeDedupeMergeInput),
+    handle: proposeDedupeMerge
   }
 ]

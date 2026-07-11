@@ -50,7 +50,7 @@ import { MCP_TOOLS, ToolError, type McpReadContext, type ToolContext } from './t
  * runs narrow this FURTHER per bound task via `registerRunnerTaskTemplate` (§3.2,
  * FP-5) — a tighter subset enforced below.
  */
-const RUNNER_SESSION_ALLOWLIST: ReadonlySet<string> = new Set<string>([...READ_TOOLS, ...STAGING_TOOLS])
+export const RUNNER_SESSION_ALLOWLIST: ReadonlySet<string> = new Set<string>([...READ_TOOLS, ...STAGING_TOOLS])
 
 /**
  * The agent-mode extraction template (§3.2/FP-5): the ONLY tools an agent-mode

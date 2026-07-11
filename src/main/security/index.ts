@@ -18,6 +18,7 @@ export {
 } from './capabilities'
 export {
   CONTROL_TOOLS,
+  DASHBOARD_TOOLS,
   PermissionEngine,
   READ_TOOLS,
   STAGING_TOOLS,
@@ -36,15 +37,24 @@ export {
 } from './audit'
 export {
   approveStagedWrite,
+  decodeDedupeMergePayload,
+  decodeSkillImportPayload,
+  DEDUPE_MERGE_STAGED_KIND,
   getStagedWrite,
   listStagedWrites,
   rejectStagedWrite,
   rejectStagedWriteWithEffects,
   renderStagedWriteDiff,
+  SKILL_IMPORT_STAGED_KIND,
+  stageDedupeMerge,
+  stagedSkillImportHashes,
   stagedWriteRequiresEmbedder,
+  stageSkillImport,
   StagedWriteError,
   type ApproveResult,
   type CommitEmbedder,
+  type DedupeMergePayload,
+  type SkillImportPayload,
   type StagedWriteRow,
   type StagedWriteStatus,
   type StagedWritesDeps

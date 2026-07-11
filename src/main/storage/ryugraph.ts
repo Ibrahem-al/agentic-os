@@ -45,6 +45,7 @@ import type {
 import {
   ftsIndexName,
   isRetrievable,
+  nodeTable,
   relTable,
   vectorIndexName,
   writableNodeProperties,
@@ -740,6 +741,20 @@ export class RyuGraphEngine implements StorageEngine {
     return this.lane.enqueue(`createEdge:${type}`, () => this.createEdgeInLane(type, from, to, props))
   }
 
+  async deleteNode(label: NodeLabel, id: string): Promise<void> {
+    this.assertOpen()
+    this.validateDeleteNode(label, id)
+    this.dirtySinceCheckpoint = true
+    return this.lane.enqueue(`deleteNode:${label}`, () => this.deleteNodeInLane(label, id))
+  }
+
+  async deleteEdge(type: EdgeType, from: NodeRef, to: NodeRef): Promise<void> {
+    this.assertOpen()
+    this.validateEdge(type, from, to)
+    this.dirtySinceCheckpoint = true
+    return this.lane.enqueue(`deleteEdge:${type}`, () => this.deleteEdgeInLane(type, from, to))
+  }
+
   async withWrite<T>(fn: (tx: WriteTx) => Promise<T>): Promise<T> {
     this.assertOpen()
     this.dirtySinceCheckpoint = true
@@ -755,6 +770,14 @@ export class RyuGraphEngine implements StorageEngine {
       createEdge: (type, from, to, props) => {
         this.validateEdge(type, from, to, props)
         return this.createEdgeInLane(type, from, to, props)
+      },
+      deleteNode: (label, id) => {
+        this.validateDeleteNode(label, id)
+        return this.deleteNodeInLane(label, id)
+      },
+      deleteEdge: (type, from, to) => {
+        this.validateEdge(type, from, to)
+        return this.deleteEdgeInLane(type, from, to)
       }
     }
     return this.lane.enqueue('withWrite', () => fn(tx))
@@ -990,6 +1013,59 @@ export class RyuGraphEngine implements StorageEngine {
         `createEdge(${type}): endpoint(s) missing — ${from.label}:${from.id} → ${to.label}:${to.id}`
       )
     }
+  }
+
+  private validateDeleteNode(label: NodeLabel, id: string): void {
+    nodeTable(label) // throws on unknown label (guards the interpolated :${label})
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new Error(`deleteNode(${label}): id must be a non-empty string`)
+    }
+  }
+
+  private async deleteNodeInLane(label: NodeLabel, id: string): Promise<void> {
+    // DETACH DELETE removes the node AND every incident edge in one statement;
+    // the HNSW/FTS indexes auto-maintain on DELETE (unlike SET — see class
+    // header), so no drop→delete→recreate dance is needed for the delete itself.
+    await this.run(this.writeConn, `MATCH (n:${label} {id: $id}) DETACH DELETE n`, { id })
+    // ryugraph 25.9.1 caveat: once a vector index is EMPTIED by deletes it enters
+    // a degenerate state — a subsequent insert into it is never served by
+    // QUERY_VECTOR_INDEX (the query returns no rows at all; probe-verified on this
+    // branch, the same vector-extension fragility the phase-13 report hardened
+    // `rebuildEmbedding` against). A DROP+CREATE returns the label to a clean,
+    // queryable index, so a later insert — e.g. an audit undo restoring the
+    // deleted node, or a re-ingest — is served again. Non-empty deletes maintain
+    // correctly, so this fires at most once per label (the delete that empties
+    // it), keeping bulk cascades cheap.
+    if (isRetrievable(label)) {
+      const rows = await this.run(this.writeConn, `MATCH (n:${label}) RETURN count(n) AS c`)
+      if (Number(rows[0]?.['c'] ?? 0) === 0) await this.rebuildEmptiedVectorIndex(label as RetrievableLabel)
+    }
+  }
+
+  /**
+   * Rebuild a just-emptied retrievable label's vector index (DROP + CREATE from
+   * the — now zero — surviving rows). Registered in `vectorRebuilds` so a
+   * concurrent vectorSearch awaits it, exactly as rebuildEmbedding does.
+   */
+  private async rebuildEmptiedVectorIndex(label: RetrievableLabel): Promise<void> {
+    const rebuild = (async (): Promise<void> => {
+      await this.run(this.writeConn, `CALL DROP_VECTOR_INDEX('${label}', '${vectorIndexName(label)}')`)
+      await this.run(this.writeConn, `CALL CREATE_VECTOR_INDEX('${label}', '${vectorIndexName(label)}', 'embedding')`)
+    })()
+    this.vectorRebuilds.set(label, rebuild)
+    try {
+      await rebuild
+    } finally {
+      if (this.vectorRebuilds.get(label) === rebuild) this.vectorRebuilds.delete(label)
+    }
+  }
+
+  private async deleteEdgeInLane(type: EdgeType, from: NodeRef, to: NodeRef): Promise<void> {
+    await this.run(
+      this.writeConn,
+      `MATCH (a:${from.label} {id: $from})-[r:${type}]->(b:${to.label} {id: $to}) DELETE r`,
+      { from: from.id, to: to.id }
+    )
   }
 }
 

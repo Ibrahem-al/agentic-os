@@ -339,6 +339,28 @@ export const RETRIEVAL_REWRITE_MAX_TOKENS = 128
 export const ENTITY_MERGE_COSINE = 0.9
 export const ENTITY_TIEBREAK_COSINE_LOW = 0.75
 
+// ── Memory deduplication (dashboard maintenance — user-directed extension) ────
+/**
+ * Cosine-similarity floor for the NEAR-duplicate memory scan (memory/dedupe.ts).
+ * §20 defines NO figure for de-duplicating already-stored memory: the entity-
+ * resolution merge line (ENTITY_MERGE_COSINE 0.9) governs extraction-time
+ * writes, a different decision than proposing a MERGE of two long-lived nodes to
+ * a human. A near-dedup false positive silently loses a distinct memory, so this
+ * is deliberately CONSERVATIVE — well above 0.9 — and every group is only ever a
+ * suggestion (nothing merges without an explicit human/staged approval). Rule-12
+ * pick, recorded in the feature report.
+ */
+export const DEDUPE_SIMILARITY_DEFAULT = 0.95
+/**
+ * Per-label node cap for one dedupe scan (bounds the O(n·k) vector-probe work so
+ * a huge graph can't hang the scan). When a label has more nodes than this, only
+ * the most-recently-updated cap are scanned and the result is flagged truncated.
+ * Rule-12 pick, recorded in the feature report.
+ */
+export const DEDUPE_SCAN_PER_LABEL_CAP = 2000
+/** k for each node's own-label vector probe during the near-duplicate scan (small — near-dups cluster tightly). Rule-12 pick. */
+export const DEDUPE_NEAR_NEIGHBOR_K = 10
+
 // ── Extraction ───────────────────────────────────────────────────────────────
 /** Escalate a session to the cloud tier below this local confidence. */
 export const EXTRACTION_ESCALATE_CONFIDENCE = 0.6
@@ -587,6 +609,17 @@ export const WATCHED_FOLDERS_CONFIG_FILENAME = 'watched-folders.json'
  * confidence 1.0). The version tracks package.json's `version`.
  */
 export const CODEBASE_INGEST_PROVENANCE = 'codebase-ingest@0.0.1'
+/**
+ * Provenance stamp on the edges written when a project skill (SKILL.md /
+ * .claude command / LLM proposal) discovered during codebase ingestion is
+ * approved from the review queue (feature A / Stage 3 — user-directed spec
+ * extension). Skill/SkillVersion nodes carry no provenance columns (§18), so
+ * the stamp rides the provenance-bearing edges (HAS_VERSION + the Project USES
+ * link). Confidence is per-candidate: 1.0 for deterministic artifacts, 0.6 for
+ * LLM proposals (no §20 value — recorded in the Stage-3 report). Version tracks
+ * package.json.
+ */
+export const PROJECT_SKILL_EXTRACTION_PROVENANCE = 'project-skill-extraction@0.0.1'
 /**
  * Values below are not in §20 — conservative rule-12 picks, recorded in the
  * phase-07 report.

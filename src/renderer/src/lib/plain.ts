@@ -128,6 +128,45 @@ export function plural(n: number, singular: string, pluralWord?: string): string
 }
 
 /**
+ * Friendly label for a raw graph property key (readability addendum R2). A few
+ * high-traffic keys get a hand-written phrase; everything else falls back to the
+ * key with underscores turned to spaces (`content_hash` → "content hash"). The
+ * raw key stays available for the caller to keep in a `title` attribute. `label`
+ * is accepted for future per-label overrides and ignored today (one shared map
+ * reads well across every node kind).
+ */
+const PROP_LABELS: Readonly<Record<string, string>> = {
+  statement: 'what it says',
+  content: 'content',
+  instructions: 'instructions',
+  name: 'name',
+  summary: 'summary',
+  description: 'description',
+  project_count: 'used in projects',
+  source: 'where it came from',
+  source_doc: 'from document',
+  kind: 'type',
+  type: 'type',
+  status: 'status',
+  tier: 'tier',
+  is_global: 'available everywhere',
+  benchmark_score: 'quality score',
+  current_version: 'current version',
+  config_ref: 'config reference',
+  content_hash: 'content hash',
+  transcript_ref: 'transcript',
+  created_at: 'created',
+  updated_at: 'updated',
+  ingested_at: 'added',
+  started_at: 'started',
+  ended_at: 'ended'
+}
+
+export function plainPropLabel(_label: string, key: string): string {
+  return PROP_LABELS[key] ?? key.replace(/_/g, ' ')
+}
+
+/**
  * Duration in plain words with a space before the unit: "4.2 s", "2 min",
  * "1 h 5 min". Null/unknown → an em dash. Roomier than format.ts `duration`.
  */

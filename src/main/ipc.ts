@@ -102,6 +102,17 @@ import {
 } from './ingest'
 import { claudeMcpAddCommand } from './mcp'
 import {
+  createMemoryEdge,
+  createMemoryNode,
+  deleteMemoryEdge,
+  deleteMemoryNode,
+  mergeDuplicates,
+  MemoryEditError,
+  scanDuplicates,
+  updateMemoryNode,
+  type MemoryEditDeps
+} from './memory'
+import {
   HookInstallError,
   installSessionEndHook,
   type DurableTaskQueue,
@@ -228,6 +239,7 @@ const errorCode = (err: unknown): IpcErrorCode => {
   if (err instanceof StagedWriteError) return err.code
   if (err instanceof UndoError) return err.code
   if (err instanceof IngestError) return err.code
+  if (err instanceof MemoryEditError) return err.code
   if (err instanceof SkillImprovementError) return err.code
   if (err instanceof OllamaError) return 'OLLAMA_ERROR'
   if (err instanceof HookInstallError) return 'INVALID_STATE'
@@ -366,6 +378,44 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   })
 
   register('memory.node', ({ label, id }) => getNode(need.engine(), { label, id }))
+
+  // ── memory editing (feature B: user CRUD — IPC-only, never MCP §21.6) ──────
+
+  const memoryEditDeps = (): MemoryEditDeps => ({
+    engine: need.engine(),
+    audit: need.audit(),
+    actor: DASHBOARD_USER,
+    // Optional on purpose: non-retrievable labels (Tag, Document, …) stay
+    // editable when the model layer did not boot; a retrievable write then
+    // fails OLLAMA_ERROR pre-lane with nothing written (memory/edit.ts).
+    ...(deps.ollama !== null ? { embedder: deps.ollama } : {})
+  })
+
+  register('memory.node.create', ({ label, props }) => createMemoryNode(memoryEditDeps(), { label, props }))
+
+  register('memory.node.update', ({ label, id, props }) => updateMemoryNode(memoryEditDeps(), { label, id, props }))
+
+  register('memory.node.delete', ({ label, id }) => deleteMemoryNode(memoryEditDeps(), { label, id }))
+
+  register('memory.edge.create', ({ type, from, to }) => createMemoryEdge(memoryEditDeps(), { type, from, to }))
+
+  register('memory.edge.delete', ({ type, from, to }) => deleteMemoryEdge(memoryEditDeps(), { type, from, to }))
+
+  // ── memory deduplication (scan is read-only; merge is one audited lane job) ──
+
+  register('memory.dedupe.scan', ({ labels, threshold }) =>
+    scanDuplicates(
+      { engine: need.engine() },
+      {
+        ...(labels !== undefined ? { labels } : {}),
+        ...(threshold !== undefined ? { threshold } : {})
+      }
+    )
+  )
+
+  register('memory.dedupe.merge', ({ label, keepId, removeIds }) =>
+    mergeDuplicates({ engine: need.engine(), audit: need.audit(), actor: DASHBOARD_USER }, { label, keepId, removeIds })
+  )
 
   // ── review queue ───────────────────────────────────────────────────────────
 
@@ -707,6 +757,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         engine: need.engine(),
         embedder: need.ollama(),
         llm: need.ollama(),
+        db: need.db(),
         ...(deps.scanner !== null ? { scanner: deps.scanner } : {}),
         ...(deps.audit !== null ? { audit: { log: deps.audit, agentId: DASHBOARD_USER } } : {})
       },
@@ -739,6 +790,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       knowledgeDocuments: result.knowledge.documents.length,
       knowledgePruned: result.knowledge.pruned.length,
       knowledgeFailed: result.knowledge.failed.map((f) => ({ file: f.file, error: f.error })),
+      skills: result.skills,
       skipped: result.skipped.length
     }
     return dto

@@ -118,6 +118,7 @@ export {
   adoptSkillVersion,
   candidateVersionIdOf,
   diffLines,
+  importSkill,
   recordCandidateVersion,
   renderSkillImprovementDiff,
   retireCandidateVersion,
@@ -128,6 +129,9 @@ export {
   stagedWriteIdOf,
   stageSkillImprovement,
   type AdoptResult,
+  type ImportSkillDeps,
+  type ImportSkillEntry,
+  type ImportSkillResult,
   type RollbackResult,
   type SkillImprovementPayload,
   type SkillLifecycleDeps

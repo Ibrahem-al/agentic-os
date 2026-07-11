@@ -27,9 +27,12 @@ import type {
   StagedWriteDto,
   StagedWriteStatusDto
 } from '../../../shared/ipc'
+import type { InspectTarget, PanelProps } from '../App'
 import { call, useIpc } from '../lib/ipc'
 import { truncate, usd } from '../lib/format'
 import { dayKey, lastNDays, plainStatus, plural } from '../lib/plain'
+import { plainProposerTitle, summarizeStagedWrite } from '../lib/stagedSummary'
+import type { SourceRef } from '../lib/stagedSummary'
 import {
   Badge,
   Button,
@@ -71,15 +74,14 @@ function errText(err: unknown): string {
 
 /**
  * Whether committing this staged write needs a live Ollama at click time
- * (§9.2/P1.7). Mirrors the backend predicate: an extraction that CREATES a new
- * retrievable node with embedOnCommit gets its embedding computed at approval —
- * the statement is in the payload, the vector is not staged. Computed from the
- * DTO payload the backend already ships (kind + op + embedOnCommit) so the
- * preflight needs no extra round-trip.
+ * (§9.2/P1.7). The backend already computes this on the DTO
+ * (`stagedWriteRequiresEmbedder`) and it generalizes across kinds: an extraction
+ * CREATE that embeds on commit, AND a `skill-import` create (a fresh Skill whose
+ * embedding is computed at commit). We trust the DTO flag rather than re-deriving
+ * a kind-specific heuristic here.
  */
 function requiresEmbedder(row: StagedWriteDto): boolean {
-  if (row.kind !== 'extraction') return false
-  return asString(row.payload['op']) === 'create' && row.payload['embedOnCommit'] === true
+  return row.requiresEmbedder
 }
 
 /** The source session a staged write came from (extraction payloads stamp it). */
@@ -87,45 +89,15 @@ function sourceSessionOf(row: StagedWriteDto): string | null {
   return asString(row.payload['session']) ?? asString(row.payload['sessionId'])
 }
 
-/** One-line human handle for a staged write (the statement/evidence/reason). */
-function summaryOf(row: StagedWriteDto): string {
-  const node = asObject(row.payload['node'])
-  const props = node !== null ? asObject(node['props']) : null
-  const statement = props !== null ? asString(props['statement']) : null
-  const patch = asObject(row.payload['patch'])
-  const patchStatement = patch !== null ? asString(patch['statement']) : null
-  return (
-    statement ??
-    patchStatement ??
-    asString(row.payload['evidence']) ??
-    asString(row.payload['reason']) ??
-    row.targetId ??
-    row.id
-  )
+/** staged_writes.kind for a project skill discovered during codebase ingest (Stage 3). */
+const SKILL_IMPORT_KIND = 'skill-import'
+
+function isSkillImport(row: StagedWriteDto): boolean {
+  return row.kind === SKILL_IMPORT_KIND
 }
 
-/** The plain verb for a staged write's operation (create/update/delete). */
-function verbFor(row: StagedWriteDto): string {
-  const op = asString(row.payload['op'])
-  if (op === 'create') return 'Add a new'
-  if (op === 'update' || op === 'patch') return 'Update'
-  if (op === 'delete' || op === 'remove') return 'Remove'
-  if (row.kind === 'correction') return 'Correct'
-  return 'Change'
-}
-
-/**
- * A plain sentence for a memory-change row: verb + what it touches + the
- * statement in quotes when there is a real one (summaryOf falls back to an id,
- * which we never quote at the user).
- */
-function describeStaged(row: StagedWriteDto): string {
-  const target = row.targetLabel ?? 'memory'
-  const head = `${verbFor(row)} ${target}`
-  const summary = summaryOf(row)
-  const hasStatement = summary !== row.id && summary !== row.targetId
-  return hasStatement ? `${head} — “${truncate(summary, 80)}”` : head
-}
+// The row primary line, the diff-modal headline, and the batch-approve list all
+// read from ONE sentence engine (readability addendum R1): summarizeStagedWrite.
 
 function diffLineClass(line: string): string {
   if (line.startsWith('+ ')) return 'text-ok'
@@ -189,7 +161,8 @@ const STAGED_COLUMNS: readonly Column<StagedWriteDto>[] = [
     header: 'change',
     render: (row) => (
       <div className="flex flex-col gap-0.5">
-        <span className="text-[13px] leading-5 text-ink">{describeStaged(row)}</span>
+        <span className="text-[13px] leading-5 text-ink">{summarizeStagedWrite(row).what}</span>
+        {/* Keep the raw kind visible (golden-path asserts a row toContainText('extraction')). */}
         <span className="font-mono text-[11px] text-ink-mute">
           {row.kind} · proposed by {row.proposedBy}
         </span>
@@ -219,7 +192,10 @@ const APPROVE_ALL_COLUMNS: readonly Column<StagedWriteDto>[] = [
   {
     key: 'summary',
     header: 'summary',
-    render: (row) => <span title={summaryOf(row)}>{truncate(summaryOf(row), 64)}</span>
+    render: (row) => {
+      const what = summarizeStagedWrite(row).what
+      return <span title={what}>{truncate(what, 64)}</span>
+    }
   }
 ]
 
@@ -241,17 +217,68 @@ const APPROVAL_FILTER_OPTIONS = [
 // Button tooltip when a new-preference commit needs the local AI helper.
 const OLLAMA_BLOCKED_TITLE = 'Needs the local AI helper (Ollama), which looks offline right now.'
 
+// ── "where it came from" chips (R1 + R3 deep link) ───────────────────────────
+
+/**
+ * One source chip. Session/Project/node chips deep-link into the Memory inspector
+ * (R3); a file chip is inert mono text (the renderer is sandboxed — path text and
+ * "found in" phrasing is as far as it goes, no filesystem opening).
+ */
+function SourceChip({
+  refItem,
+  onInspect
+}: {
+  refItem: SourceRef
+  onInspect?: (target: InspectTarget) => void
+}): React.JSX.Element {
+  const prefix =
+    refItem.kind === 'project' ? 'project' : refItem.kind === 'session' ? 'session' : (refItem.label ?? 'node')
+  if (refItem.kind === 'file') {
+    return (
+      <span
+        className="inline-flex max-w-full items-center rounded-md bg-raised px-2 py-0.5 font-mono text-[11px] break-all text-ink-mute"
+        {...(refItem.path !== undefined ? { title: refItem.path } : {})}
+      >
+        {truncate(refItem.display, 52)}
+      </span>
+    )
+  }
+  const { label, id } = refItem
+  if (onInspect !== undefined && label !== undefined && id !== undefined) {
+    return (
+      <button
+        type="button"
+        data-testid={`review-source-${refItem.kind}`}
+        onClick={() => onInspect({ label, id })}
+        title={`Open in Memory (${id})`}
+        className="inline-flex max-w-full items-center gap-1 rounded-md border border-line px-2 py-0.5 text-[11px] text-accent transition-colors duration-120 hover:bg-raised focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+      >
+        <span className="text-ink-mute">{prefix}</span>
+        <span className="min-w-0 truncate">{truncate(refItem.display, 44)}</span>
+      </button>
+    )
+  }
+  return (
+    <span className="inline-flex max-w-full items-center gap-1 rounded-md bg-raised px-2 py-0.5 text-[11px] text-ink-mute">
+      <span>{prefix}</span>
+      <span className="min-w-0 truncate">{truncate(refItem.display, 44)}</span>
+    </span>
+  )
+}
+
 // ── memory-change modal ───────────────────────────────────────────────────────
 
 function StagedWriteModal({
   row,
   ollamaReady,
+  onInspect,
   onClose,
   onChanged
 }: {
   row: StagedWriteDto
   /** null while the Ollama status is still loading (fail-open: never block). */
   ollamaReady: boolean | null
+  onInspect?: (target: InspectTarget) => void
   onClose: () => void
   onChanged: () => void
 }): React.JSX.Element {
@@ -260,16 +287,23 @@ function StagedWriteModal({
   const [busy, setBusy] = useState(false)
 
   const payload = row.payload
+  // ONE sentence engine (R1): plain what / why / where-from for every kind.
+  const summary = summarizeStagedWrite(row)
   const provenance = asObject(payload['provenance'])
   const extractedBy =
     (provenance !== null ? asString(provenance['extracted_by']) : null) ?? asString(payload['extracted_by'])
   const confidence =
     (provenance !== null ? asNumber(provenance['confidence']) : null) ?? asNumber(payload['confidence'])
-  const evidence = asString(payload['evidence'])
   const session = asString(payload['session']) ?? asString(payload['sessionId'])
-  const reason = asString(payload['reason'])
   const commitError = row.validation !== null ? asString(row.validation['commitError']) : null
   const hasProvenance = extractedBy !== null || confidence !== null || session !== null
+
+  // Skill-import specifics (feature A): a proposed skill was written by AI from
+  // the docs (confidence 0.6); an artifact was found verbatim in the repo.
+  const skillImport = isSkillImport(row)
+  const skillProposal = skillImport && payload['proposal'] === true
+  const skillSource = skillImport ? asString(payload['source']) : null
+  const skillConfidence = skillImport ? asNumber(payload['confidence']) : null
 
   // Ollama preflight (P1.7): a new-Preference extraction embeds at commit, so a
   // known-down Ollama blocks the commit up front. Unknown status fails open.
@@ -336,42 +370,78 @@ function StagedWriteModal({
   return (
     <Modal title="Proposed memory change" onClose={onClose} wide footer={footer}>
       <div className="mb-3 flex items-start justify-between gap-3">
-        <span className="text-[14px] leading-5 text-ink">{describeStaged(row)}</span>
+        <div className="min-w-0">
+          <div className="mb-0.5 text-[12px] text-ink-mute">What happens if you approve</div>
+          <div className="text-[14px] leading-5 text-ink">{summary.what}</div>
+        </div>
         <Badge status={row.status} title={plain.explain} />
       </div>
 
-      {evidence !== null && (
+      {summary.why !== undefined && (
         <div className="mb-3">
-          <div className="mb-1 text-[12px] text-ink-mute">Why this was proposed</div>
+          <div className="mb-1 text-[12px] text-ink-mute">Why the agent proposed it</div>
           <blockquote className="rounded-md bg-raised px-3 py-2 text-[12px] leading-5 text-ink-mute">
-            {evidence}
+            {summary.why}
           </blockquote>
         </div>
       )}
-      {evidence === null && reason !== null && (
-        <div className="mb-3 text-[12px] text-ink-mute">
-          Why this was proposed: <span className="text-ink">{reason}</span>
+
+      {summary.source !== undefined && summary.source.length > 0 && (
+        <div className="mb-3">
+          <div className="mb-1 text-[12px] text-ink-mute">Where it came from</div>
+          <div className="flex flex-wrap gap-1.5">
+            {summary.source.map((refItem, i) => (
+              <SourceChip key={i} refItem={refItem} onInspect={onInspect} />
+            ))}
+          </div>
         </div>
       )}
 
-      <div className="mb-1 text-[12px] text-ink-mute">What will change if you approve:</div>
-      {diff.error !== null ? (
-        <ErrorState error={diff.error} onRetry={diff.reload} />
-      ) : diff.data === null ? (
-        <div className="py-2 text-[12px] text-ink-mute">Loading the change…</div>
-      ) : (
-        <pre
-          data-testid="staged-diff"
-          className="rounded-md border border-line bg-bg px-3 py-2 font-mono text-[12px] leading-5 whitespace-pre-wrap"
-        >
-          {diff.data.split('\n').map((line, i) => (
-            <span key={i} className={diffLineClass(line)}>
-              {line}
-              {'\n'}
-            </span>
-          ))}
-        </pre>
+      {skillImport && (
+        <div className="mb-3 flex flex-col gap-1.5 rounded-md bg-raised px-3 py-2 text-[12px] leading-5 text-ink-mute">
+          <span>
+            {skillProposal
+              ? 'This skill was proposed by AI from the project’s documentation — it is stored as inert data until you approve it. Review it first.'
+              : 'This skill was found in the project’s files. It becomes standing instructions the assistant follows once approved — review it first.'}
+          </span>
+          <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            {skillSource !== null && (
+              <span>
+                Source: <span className="font-mono text-ink break-all">{skillSource}</span>
+              </span>
+            )}
+            {skillConfidence !== null && (
+              <span className="inline-flex items-center gap-1.5">
+                confidence <Confidence value={skillConfidence} />
+              </span>
+            )}
+          </span>
+        </div>
       )}
+
+      {/* The exact op-by-op change (ids, edges, cypher-level detail) is technical:
+          it moves behind a disclosure, but stays open by default so the raw diff
+          is visible on open (the summary above is the plain lead). */}
+      <Disclosure summary="Technical changes" defaultOpen>
+        <div className="mb-1 text-[12px] text-ink-mute">What will change if you approve:</div>
+        {diff.error !== null ? (
+          <ErrorState error={diff.error} onRetry={diff.reload} />
+        ) : diff.data === null ? (
+          <div className="py-2 text-[12px] text-ink-mute">Loading the change…</div>
+        ) : (
+          <pre
+            data-testid="staged-diff"
+            className="rounded-md border border-line bg-bg px-3 py-2 font-mono text-[12px] leading-5 whitespace-pre-wrap"
+          >
+            {diff.data.split('\n').map((line, i) => (
+              <span key={i} className={diffLineClass(line)}>
+                {line}
+                {'\n'}
+              </span>
+            ))}
+          </pre>
+        )}
+      </Disclosure>
 
       {row.status === 'approved' && commitError !== null && (
         <div className="mt-3 rounded-md border border-err/40 bg-err/10 px-3 py-2" role="alert">
@@ -385,14 +455,13 @@ function StagedWriteModal({
           data-testid="staged-approve-blocked"
           className="mt-3 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px]"
         >
-          This new preference is saved with help from the local AI helper (Ollama), which looks offline right now. Start
-          Ollama, then approve.
+          Saving this needs the local AI helper (Ollama), which looks offline right now. Start Ollama, then approve.
         </div>
       )}
 
       {hasProvenance && (
         <div className="mt-3">
-          <Disclosure summary="Where this came from">
+          <Disclosure summary="Technical provenance">
             <KV
               entries={[
                 ...(extractedBy !== null
@@ -494,8 +563,8 @@ function ApproveAllModal({
           data-testid="staged-approve-all-blocked"
           className="mt-2 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px]"
         >
-          {blocked.length} {blocked.length === 1 ? 'change saves' : 'changes save'} a new preference with the local AI
-          helper (Ollama), which looks offline — skipped until it is running.
+          {blocked.length} {blocked.length === 1 ? 'change saves' : 'changes save'} a new preference or skill with the
+          local AI helper (Ollama), which looks offline — skipped until it is running.
         </div>
       )}
     </Modal>
@@ -525,9 +594,12 @@ function StagedGroupBlock({
     <div className="mb-4 rounded-md border border-line" data-testid={`staged-group-${slug(group.key)}`}>
       <div className="flex items-center justify-between gap-3 border-b border-line bg-surface px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="text-[11px] text-ink-mute">{group.sessionId !== null ? 'From session' : 'Proposed by'}</span>
-          <span className="truncate font-mono text-[12px] text-ink" title={group.sessionId ?? group.proposedBy}>
-            {truncate(group.sessionId ?? group.proposedBy, 44)}
+          {/* Plain proposer title; the raw agent id stays in the tooltip. */}
+          <span className="truncate text-[12px] text-ink" title={group.proposedBy}>
+            {plainProposerTitle(group.proposedBy)}
+            {group.sessionId !== null && (
+              <span className="text-ink-mute"> (session {truncate(group.sessionId, 12)})</span>
+            )}
           </span>
           <span className="font-mono text-[11px] text-ink-mute">{plural(group.rows.length, 'change')}</span>
         </div>
@@ -659,7 +731,7 @@ function FlagRow({ row }: { row: InjectionFlagDto }): React.JSX.Element {
 
 // ── panel ─────────────────────────────────────────────────────────────────────
 
-export default function ReviewPanel(): React.JSX.Element {
+export default function ReviewPanel({ onInspect }: PanelProps): React.JSX.Element {
   const toast = useToast()
   const [stagedFilter, setStagedFilter] = useState<StagedWriteStatusDto | 'all'>('staged')
   const [approvalFilter, setApprovalFilter] = useState<'pending' | 'approved' | 'denied' | 'all'>('pending')
@@ -726,8 +798,8 @@ export default function ReviewPanel(): React.JSX.Element {
             <div className="mb-2 flex items-start gap-1.5 text-[12px] text-ink-mute">
               <Icon name="info" size={14} className="mt-0.5 shrink-0" />
               <span>
-                The local AI helper (Ollama) looks offline. A change that saves a new preference can&apos;t be approved
-                until it is running again.
+                The local AI helper (Ollama) looks offline. A change that saves a new preference or skill can&apos;t be
+                approved until it is running again.
               </span>
             </div>
           )}
@@ -832,6 +904,7 @@ export default function ReviewPanel(): React.JSX.Element {
         <StagedWriteModal
           row={selected}
           ollamaReady={ollamaReady}
+          onInspect={onInspect}
           onClose={() => setSelected(null)}
           onChanged={() => staged.reload()}
         />

@@ -121,9 +121,12 @@ const HARD_ROLES: readonly RoleKey[] = ['retrieval.critic', 'retrieval.rewrite',
 // ── role table ────────────────────────────────────────────────────────────────
 
 describe('ROLE_KEYS + ROLE_DEFAULTS (§2.2 / §11.4)', () => {
-  it('enumerates exactly the 13 §2.2 roles', () => {
-    expect(ROLE_KEYS).toHaveLength(13)
-    expect(new Set(ROLE_KEYS).size).toBe(13)
+  it('enumerates the §2.2 roles (13) plus the Stage-3 ingest.skillProposal extension', () => {
+    // 13 §2.2 reasoning roles + ingest.skillProposal (user-directed spec
+    // extension, feature A / Stage 3): a local-by-default, subscribable role.
+    expect(ROLE_KEYS).toHaveLength(14)
+    expect(new Set(ROLE_KEYS).size).toBe(14)
+    expect(ROLE_KEYS).toContain('ingest.skillProposal')
     expect(Object.keys(ROLE_DEFAULTS).sort()).toEqual([...ROLE_KEYS].sort())
   })
 

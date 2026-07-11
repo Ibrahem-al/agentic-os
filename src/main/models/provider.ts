@@ -53,6 +53,7 @@ export type RoleKey =
   | 'skills.executor'
   | 'skills.grader'
   | 'ingest.projectSummary'
+  | 'ingest.skillProposal'
   | 'scanner.llmVerdict'
   | 'context.summarize'
 
@@ -69,6 +70,7 @@ export const ROLE_KEYS: readonly RoleKey[] = [
   'skills.executor',
   'skills.grader',
   'ingest.projectSummary',
+  'ingest.skillProposal',
   'scanner.llmVerdict',
   'context.summarize'
 ]
@@ -112,6 +114,10 @@ export const ROLE_DEFAULTS: Readonly<Record<RoleKey, RoleDefault>> = {
   'skills.executor': { today: 'local-qwen3', hardLocal: true, subscribable: false },
   'skills.grader': { today: 'local-qwen3', hardLocal: true, subscribable: false },
   'ingest.projectSummary': { today: 'local-qwen3', hardLocal: false, subscribable: true },
+  // Stage-3 skill-proposal pass over project docs — local-by-default like
+  // ingest.projectSummary (DEFAULT == TODAY: identical to the injected llm);
+  // subscribable so a user who opts into the runner may route it, never HARD.
+  'ingest.skillProposal': { today: 'local-qwen3', hardLocal: false, subscribable: true },
   'scanner.llmVerdict': { today: 'local-qwen3', hardLocal: true, subscribable: false },
   'context.summarize': { today: 'local-qwen3', hardLocal: false, subscribable: false }
 }

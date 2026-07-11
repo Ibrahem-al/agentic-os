@@ -14,6 +14,17 @@ export {
   type IngestedKnowledgeDoc,
   type ProjectSummarizer
 } from './codebase'
+export {
+  discoverArtifactSkills,
+  discoverProjectSkills,
+  extractProjectSkills,
+  proposeProjectSkills,
+  type DiscoveredSkill,
+  type SkillDiscoveryResult,
+  type SkillExtractionDeps,
+  type SkillExtractionResult,
+  type SkillProposalLlm
+} from './skills'
 export { walkCodebase, type CodebaseWalkResult, type SkippedWalkEntry, type WalkedFile } from './codebaseWalk'
 export {
   codeLanguageForExtension,

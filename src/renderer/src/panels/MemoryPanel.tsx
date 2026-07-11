@@ -12,18 +12,36 @@
  * human handle and keeps ids / complex JSON behind "Technical details". The
  * label chip keeps its exact two-span "<Label> <count>" contract (e2e selects
  * it by accessible name); the plain description lives in a SEPARATE element.
+ *
+ * Feature B (Stage 4): full user CRUD over the graph — an "Add memory" flow
+ * (category picker → per-label field form), and inspector-level Edit / Delete
+ * (with a plain cascade-count confirm) / Connect to… (edge-type picker filtered
+ * to valid §18 pairs + a memory.search target picker) / per-edge remove. Every
+ * mutation runs as ONE audited write-lane job (actor user:dashboard), so each is
+ * reversible from History; each response carries its auditActionId, so the
+ * confirmation toast offers an inline Undo without a History round trip.
  */
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type {
+  IpcEdgeType,
   IpcNodeLabel,
+  JsonObject,
   JsonValue,
+  MemoryDeleteResultDto,
+  MemoryDuplicateGroupDto,
   MemoryEdgeDto,
+  MemoryNodeDetailDto,
+  MemoryNodeMutationDto,
   MemoryNodeSummaryDto,
   MemorySearchHitDto
 } from '../../../shared/ipc'
+import { IPC_EDGE_PAIRS, IPC_EDGE_TYPES, IPC_NODE_LABELS } from '../../../shared/ipc'
+import type { PanelProps } from '../App'
 import { IpcError, call, useIpc } from '../lib/ipc'
 import { truncate } from '../lib/format'
+import { plainPropLabel, plural } from '../lib/plain'
+import { nodeHandle, summarizeNode } from '../lib/nodeSummary'
 import {
   Button,
   Confidence,
@@ -33,10 +51,14 @@ import {
   ErrorState,
   KV,
   LoadingRows,
+  Modal,
   PanelHeader,
   SectionHeader,
+  Select,
   TextInput,
-  Timestamp
+  Timestamp,
+  Toggle,
+  useToast
 } from '../ui/kit'
 import type { Column } from '../ui/kit'
 import { CompositionBar } from '../ui/viz'
@@ -68,6 +90,151 @@ const LABEL_DESCRIPTIONS: Readonly<Record<IpcNodeLabel, string>> = {
 // Cycled across the composition segments so adjacent categories stay distinct;
 // tokens only (see viz CompTint), never semantic here — memory holds no state.
 const COMP_TINTS = ['accent', 'ok', 'warn', 'undo', 'mute'] as const
+
+// ── per-label editable-field map (feature B) ────────────────────────────────────
+//
+// Renderer-side mirror of the §18 writable node properties MINUS the protected
+// keys (id / created_at / updated_at / embedding / extracted_by / confidence),
+// which the server owns and this panel never sends. Like IPC_NODE_LABELS this is
+// a hand-kept copy; the Record over IpcNodeLabel keeps it exhaustive. It drives
+// BOTH the create form and the inspector's edit form.
+
+type FieldType = 'text' | 'longtext' | 'number' | 'boolean'
+
+interface FieldSpec {
+  readonly key: string
+  readonly label: string
+  readonly type: FieldType
+  readonly placeholder?: string
+}
+
+interface LabelForm {
+  /** User-facing category name ("Preference", "Note", "Tag", …). */
+  readonly title: string
+  /** One-line description shown in the category picker. */
+  readonly desc: string
+  /** Primary categories lead; the rest hide behind "More types…". */
+  readonly primary: boolean
+  readonly fields: readonly FieldSpec[]
+}
+
+const LABEL_FORMS: Readonly<Record<IpcNodeLabel, LabelForm>> = {
+  Preference: {
+    title: 'Preference',
+    desc: 'Something it should remember about how you work',
+    primary: true,
+    fields: [{ key: 'statement', label: 'What to remember', type: 'longtext', placeholder: 'e.g. Always run the linter before committing' }]
+  },
+  Knowledge: {
+    title: 'Note',
+    desc: 'A fact or note',
+    primary: true,
+    fields: [{ key: 'content', label: 'The note', type: 'longtext', placeholder: 'e.g. The staging database resets every night at 2am' }]
+  },
+  Tag: {
+    title: 'Tag',
+    desc: 'A label to group things',
+    primary: true,
+    fields: [
+      { key: 'name', label: 'Label', type: 'text', placeholder: 'e.g. onboarding' },
+      { key: 'is_global', label: 'Available everywhere', type: 'boolean' }
+    ]
+  },
+  Project: {
+    title: 'Project',
+    desc: 'A project it knows about',
+    primary: true,
+    fields: [
+      { key: 'name', label: 'Name', type: 'text' },
+      { key: 'summary', label: 'Summary', type: 'longtext' }
+    ]
+  },
+  Session: {
+    title: 'Session',
+    desc: 'A past work session',
+    primary: false,
+    fields: [
+      { key: 'transcript_ref', label: 'Transcript reference', type: 'text' },
+      { key: 'tier', label: 'Tier', type: 'text', placeholder: 'daily' },
+      { key: 'started_at', label: 'Started at', type: 'text', placeholder: 'ISO date/time' },
+      { key: 'ended_at', label: 'Ended at', type: 'text', placeholder: 'ISO date/time' }
+    ]
+  },
+  Skill: {
+    title: 'Skill',
+    desc: 'An ability with standing instructions',
+    primary: false,
+    fields: [
+      { key: 'name', label: 'Name', type: 'text' },
+      { key: 'instructions', label: 'What it tells the assistant to do', type: 'longtext' }
+    ]
+  },
+  SkillVersion: {
+    title: 'Skill version',
+    desc: 'A single revision of a skill',
+    primary: false,
+    fields: [
+      { key: 'instructions', label: 'Instructions', type: 'longtext' },
+      { key: 'status', label: 'Status', type: 'text', placeholder: 'candidate / active / retired' },
+      { key: 'benchmark_score', label: 'Quality score', type: 'number' }
+    ]
+  },
+  Example: {
+    title: 'Example',
+    desc: 'An example it learned from',
+    primary: false,
+    fields: [
+      { key: 'kind', label: 'Kind', type: 'text', placeholder: 'success / failure' },
+      { key: 'content', label: 'What happened', type: 'longtext' }
+    ]
+  },
+  Correction: {
+    title: 'Correction',
+    desc: 'A correction you made',
+    primary: false,
+    fields: [{ key: 'content', label: 'The correction', type: 'longtext' }]
+  },
+  MCP: {
+    title: 'MCP tool',
+    desc: 'A technical building block',
+    primary: false,
+    fields: [
+      { key: 'name', label: 'Name', type: 'text' },
+      { key: 'config_ref', label: 'Config reference', type: 'text' }
+    ]
+  },
+  Plugin: {
+    title: 'Plugin',
+    desc: 'A technical building block',
+    primary: false,
+    fields: [
+      { key: 'name', label: 'Name', type: 'text' },
+      { key: 'config_ref', label: 'Config reference', type: 'text' }
+    ]
+  },
+  Component: {
+    title: 'Component',
+    desc: 'A piece of a codebase',
+    primary: false,
+    fields: [
+      { key: 'name', label: 'Name', type: 'text' },
+      { key: 'type', label: 'Type', type: 'text', placeholder: 'page / route / service / …' }
+    ]
+  },
+  Document: {
+    title: 'Document',
+    desc: 'A source document',
+    primary: false,
+    fields: [
+      { key: 'source', label: 'Source', type: 'text' },
+      { key: 'content_hash', label: 'Content hash', type: 'text' },
+      { key: 'ingested_at', label: 'Added at', type: 'text', placeholder: 'ISO date/time' }
+    ]
+  }
+}
+
+const PRIMARY_LABELS = IPC_NODE_LABELS.filter((l) => LABEL_FORMS[l].primary)
+const MORE_LABELS = IPC_NODE_LABELS.filter((l) => !LABEL_FORMS[l].primary)
 
 interface NodeRef {
   readonly label: IpcNodeLabel
@@ -104,6 +271,78 @@ function plainWords(raw: string): string {
   return raw.toLowerCase().replace(/_/g, ' ')
 }
 
+// ── form value helpers (feature B) ──────────────────────────────────────────────
+
+type FieldValue = string | boolean
+type FormValues = Record<string, FieldValue>
+
+/** Seed a form's values from an existing node's props (blank for create). */
+function initialValues(form: LabelForm, props?: JsonObject): FormValues {
+  const out: FormValues = {}
+  for (const field of form.fields) {
+    const raw = props?.[field.key]
+    if (field.type === 'boolean') out[field.key] = raw === true
+    else if (raw === null || raw === undefined) out[field.key] = ''
+    else out[field.key] = typeof raw === 'string' ? raw : String(raw)
+  }
+  return out
+}
+
+function asText(value: FieldValue | undefined): string {
+  return typeof value === 'string' ? value : value === undefined ? '' : String(value)
+}
+
+/** The first text field carries the human handle — a create needs it non-empty. */
+function hasHandle(form: LabelForm, values: FormValues): boolean {
+  const first = form.fields[0]
+  if (first === undefined) return false
+  if (first.type === 'boolean') return true
+  return asText(values[first.key]).trim() !== ''
+}
+
+/** Props for a create: skip blanks; parse numbers; booleans always ride. */
+function buildCreateProps(form: LabelForm, values: FormValues): JsonObject {
+  const props: JsonObject = {}
+  for (const field of form.fields) {
+    const value = values[field.key]
+    if (field.type === 'boolean') {
+      props[field.key] = value === true
+    } else if (field.type === 'number') {
+      const trimmed = asText(value).trim()
+      if (trimmed === '') continue
+      const num = Number(trimmed)
+      if (Number.isFinite(num)) props[field.key] = num
+    } else {
+      const text = asText(value)
+      if (text.trim() !== '') props[field.key] = text
+    }
+  }
+  return props
+}
+
+/** Props for an edit: only CHANGED fields (upsert merges; empty text clears). */
+function buildEditProps(form: LabelForm, values: FormValues, initial: FormValues): JsonObject {
+  const props: JsonObject = {}
+  for (const field of form.fields) {
+    const value = values[field.key]
+    if (field.type === 'boolean') {
+      if ((value === true) !== (initial[field.key] === true)) props[field.key] = value === true
+      continue
+    }
+    const text = asText(value)
+    if (text === asText(initial[field.key])) continue
+    if (field.type === 'number') {
+      const trimmed = text.trim()
+      if (trimmed === '') continue // never clear a number from the dashboard
+      const num = Number(trimmed)
+      if (Number.isFinite(num)) props[field.key] = num
+    } else {
+      props[field.key] = text
+    }
+  }
+  return props
+}
+
 // ── prop rendering ────────────────────────────────────────────────────────────
 
 function renderPropValue(key: string, value: JsonValue): ReactNode {
@@ -118,6 +357,749 @@ function renderPropValue(key: string, value: JsonValue): ReactNode {
   }
   return (
     <span className="font-mono text-[12px] break-words whitespace-pre-wrap">{JSON.stringify(value)}</span>
+  )
+}
+
+// ── shared field form (create + edit) ───────────────────────────────────────────
+
+function FieldInput({
+  field,
+  value,
+  onChange
+}: {
+  field: FieldSpec
+  value: FieldValue | undefined
+  onChange: (value: FieldValue) => void
+}): React.JSX.Element {
+  const testId = `memory-field-${field.key}`
+  if (field.type === 'boolean') {
+    return (
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-[12px] text-ink-mute">{field.label}</span>
+        <Toggle checked={value === true} onChange={onChange} label={field.label} testId={testId} />
+      </div>
+    )
+  }
+  if (field.type === 'longtext') {
+    return (
+      <label className="flex flex-col gap-1">
+        <span className="text-[12px] text-ink-mute">{field.label}</span>
+        <textarea
+          data-testid={testId}
+          aria-label={field.label}
+          value={asText(value)}
+          onChange={(e) => onChange(e.target.value)}
+          rows={4}
+          {...(field.placeholder !== undefined ? { placeholder: field.placeholder } : {})}
+          className="rounded-md border border-line-strong bg-raised px-2.5 py-2 text-[13px] leading-5 text-ink placeholder:text-ink-mute focus:border-accent focus:outline-none transition-colors duration-120"
+        />
+      </label>
+    )
+  }
+  return (
+    <TextInput
+      label={field.label}
+      value={asText(value)}
+      onChange={onChange}
+      testId={testId}
+      mono={field.type === 'number'}
+      {...(field.placeholder !== undefined ? { placeholder: field.placeholder } : {})}
+    />
+  )
+}
+
+function NodeFields({
+  label,
+  values,
+  onChange
+}: {
+  label: IpcNodeLabel
+  values: FormValues
+  onChange: (key: string, value: FieldValue) => void
+}): React.JSX.Element {
+  const form = LABEL_FORMS[label]
+  return (
+    <div className="flex flex-col gap-3">
+      {label === 'Skill' && (
+        <p className="rounded-md bg-raised px-3 py-2 text-[12px] leading-5 text-ink-mute">
+          Editing a skill here changes its instructions, not its saved versions. To manage versions or improve
+          it, use the Skills panel.
+        </p>
+      )}
+      {form.fields.map((field) => (
+        <FieldInput key={field.key} field={field} value={values[field.key]} onChange={(value) => onChange(field.key, value)} />
+      ))}
+    </div>
+  )
+}
+
+// ── add-memory flow (category picker → form) ────────────────────────────────────
+
+function CategoryButton({
+  label,
+  onPick
+}: {
+  label: IpcNodeLabel
+  onPick: (label: IpcNodeLabel) => void
+}): React.JSX.Element {
+  const form = LABEL_FORMS[label]
+  return (
+    <button
+      type="button"
+      data-testid={`memory-add-label-${label}`}
+      onClick={() => onPick(label)}
+      className="flex w-full cursor-pointer flex-col gap-0.5 rounded-md border border-line px-3 py-2 text-left transition-colors duration-120 hover:bg-raised focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+    >
+      <span className="text-[13px] text-ink">{form.title}</span>
+      <span className="text-[12px] text-ink-mute">{form.desc}</span>
+    </button>
+  )
+}
+
+function AddMemoryModal({
+  onClose,
+  onCreated
+}: {
+  onClose: () => void
+  onCreated: (result: MemoryNodeMutationDto) => void
+}): React.JSX.Element {
+  const toast = useToast()
+  const [label, setLabel] = useState<IpcNodeLabel | null>(null)
+  const [values, setValues] = useState<FormValues>({})
+  const [busy, setBusy] = useState(false)
+
+  const pick = useCallback((next: IpcNodeLabel) => {
+    setLabel(next)
+    setValues(initialValues(LABEL_FORMS[next]))
+  }, [])
+
+  const form = label !== null ? LABEL_FORMS[label] : null
+  const props = form !== null ? buildCreateProps(form, values) : {}
+  const skillReady = label !== 'Skill' || asText(values['instructions']).trim() !== ''
+  const canSubmit = form !== null && hasHandle(form, values) && skillReady
+
+  async function submit(): Promise<void> {
+    if (label === null) return
+    setBusy(true)
+    try {
+      const result = await call('memory.node.create', { label, props })
+      onCreated(result)
+      onClose()
+    } catch (err) {
+      toast.notify('err', toIpcError(err).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (label === null || form === null) {
+    return (
+      <Modal title="Add to memory" onClose={onClose} footer={<Button onClick={onClose}>Cancel</Button>}>
+        <p className="mb-2 text-[12px] text-ink-mute">What would you like it to remember?</p>
+        <div className="flex flex-col gap-2">
+          {PRIMARY_LABELS.map((l) => (
+            <CategoryButton key={l} label={l} onPick={pick} />
+          ))}
+        </div>
+        <div className="mt-3">
+          <Disclosure summary="More types…" testId="memory-add-more">
+            <div className="flex flex-col gap-2">
+              {MORE_LABELS.map((l) => (
+                <CategoryButton key={l} label={l} onPick={pick} />
+              ))}
+            </div>
+          </Disclosure>
+        </div>
+      </Modal>
+    )
+  }
+
+  return (
+    <Modal
+      title={`New ${form.title.toLowerCase()}`}
+      onClose={onClose}
+      footer={
+        <>
+          <Button disabled={busy} onClick={() => setLabel(null)}>
+            Back
+          </Button>
+          <Button variant="primary" testId="memory-add-submit" disabled={busy || !canSubmit} onClick={() => void submit()}>
+            Add to memory
+          </Button>
+        </>
+      }
+    >
+      <NodeFields label={label} values={values} onChange={(key, value) => setValues((old) => ({ ...old, [key]: value }))} />
+    </Modal>
+  )
+}
+
+// ── edit-memory modal ───────────────────────────────────────────────────────────
+
+function EditMemoryModal({
+  node,
+  onClose,
+  onSaved
+}: {
+  node: MemoryNodeDetailDto
+  onClose: () => void
+  onSaved: (result: MemoryNodeMutationDto) => void
+}): React.JSX.Element {
+  const toast = useToast()
+  const form = LABEL_FORMS[node.label]
+  const initial = useMemo(() => initialValues(form, node.props), [form, node.props])
+  const [values, setValues] = useState<FormValues>(initial)
+  const [busy, setBusy] = useState(false)
+
+  const props = buildEditProps(form, values, initial)
+  const canSubmit = Object.keys(props).length > 0
+
+  async function submit(): Promise<void> {
+    setBusy(true)
+    try {
+      const result = await call('memory.node.update', { label: node.label, id: node.id, props })
+      onSaved(result)
+      onClose()
+    } catch (err) {
+      toast.notify('err', toIpcError(err).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal
+      title={`Edit ${form.title.toLowerCase()}`}
+      onClose={onClose}
+      footer={
+        <>
+          <Button disabled={busy} onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" testId="memory-edit-submit" disabled={busy || !canSubmit} onClick={() => void submit()}>
+            Save changes
+          </Button>
+        </>
+      }
+    >
+      <NodeFields label={node.label} values={values} onChange={(key, value) => setValues((old) => ({ ...old, [key]: value }))} />
+    </Modal>
+  )
+}
+
+// ── delete confirm (with plain cascade counts) ──────────────────────────────────
+
+function DeleteConfirmModal({
+  node,
+  onClose,
+  onDeleted
+}: {
+  node: MemoryNodeDetailDto
+  onClose: () => void
+  onDeleted: (result: MemoryDeleteResultDto) => void
+}): React.JSX.Element {
+  const toast = useToast()
+  const [busy, setBusy] = useState(false)
+
+  // Cascade counts come straight from the node's own outgoing edges (§ backend
+  // delete): a Document takes its HAS_CHUNK chunks; a Skill its HAS_VERSION versions.
+  const chunkCount = node.outgoing.filter((e) => e.type === 'HAS_CHUNK').length
+  const versionCount = node.outgoing.filter((e) => e.type === 'HAS_VERSION').length
+  const cascade =
+    node.label === 'Document' && chunkCount > 0
+      ? `This also removes its ${plural(chunkCount, 'saved chunk')}.`
+      : node.label === 'Skill' && versionCount > 0
+        ? `This also removes its ${plural(versionCount, 'version')}.`
+        : null
+
+  async function confirm(): Promise<void> {
+    setBusy(true)
+    try {
+      const result = await call('memory.node.delete', { label: node.label, id: node.id })
+      onDeleted(result)
+      onClose()
+    } catch (err) {
+      toast.notify('err', toIpcError(err).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal
+      title="Delete this?"
+      onClose={onClose}
+      footer={
+        <>
+          <Button disabled={busy} onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="danger" testId="memory-delete-confirm" disabled={busy} onClick={() => void confirm()}>
+            Delete
+          </Button>
+        </>
+      }
+    >
+      <div className="text-[13px]">Delete this {LABEL_FORMS[node.label].title.toLowerCase()} from memory?</div>
+      {cascade !== null && <p className="mt-2 text-[12px] leading-5 text-warn">{cascade}</p>}
+      <p className="mt-2 text-[12px] leading-5 text-ink-mute">You can undo this from History right after.</p>
+    </Modal>
+  )
+}
+
+// ── connect to… (edge-type picker + memory.search target picker) ────────────────
+
+interface ConnectOption {
+  readonly key: string
+  readonly type: IpcEdgeType
+  readonly direction: 'out' | 'in'
+  readonly otherLabels: readonly IpcNodeLabel[]
+  readonly optionLabel: string
+}
+
+/** Valid edge options for a node in BOTH directions (from §18 IPC_EDGE_PAIRS). */
+function connectOptionsFor(label: IpcNodeLabel): ConnectOption[] {
+  const acc = new Map<string, { type: IpcEdgeType; direction: 'out' | 'in'; others: Set<IpcNodeLabel> }>()
+  for (const type of IPC_EDGE_TYPES) {
+    for (const [from, to] of IPC_EDGE_PAIRS[type]) {
+      if (from === label) {
+        const key = `${type}:out`
+        const entry = acc.get(key) ?? { type, direction: 'out' as const, others: new Set<IpcNodeLabel>() }
+        entry.others.add(to)
+        acc.set(key, entry)
+      }
+      if (to === label) {
+        const key = `${type}:in`
+        const entry = acc.get(key) ?? { type, direction: 'in' as const, others: new Set<IpcNodeLabel>() }
+        entry.others.add(from)
+        acc.set(key, entry)
+      }
+    }
+  }
+  return [...acc.values()].map((entry) => {
+    const others = [...entry.others]
+    const rel = plainWords(entry.type)
+    const optionLabel =
+      entry.direction === 'out' ? `${rel}: this → ${others.join(' / ')}` : `${rel}: ${others.join(' / ')} → this`
+    return { key: `${entry.type}:${entry.direction}`, type: entry.type, direction: entry.direction, otherLabels: others, optionLabel }
+  })
+}
+
+function ConnectModal({
+  node,
+  onClose,
+  onConnected
+}: {
+  node: MemoryNodeDetailDto
+  onClose: () => void
+  onConnected: (auditActionId: string) => void
+}): React.JSX.Element {
+  const toast = useToast()
+  const options = useMemo(() => connectOptionsFor(node.label), [node.label])
+  const [optKey, setOptKey] = useState(options[0]?.key ?? '')
+  const [query, setQuery] = useState('')
+  const [hits, setHits] = useState<readonly MemorySearchHitDto[] | null>(null)
+  const [searching, setSearching] = useState(false)
+  const [busy, setBusy] = useState(false)
+
+  const opt = options.find((o) => o.key === optKey)
+
+  async function runSearch(): Promise<void> {
+    if (opt === undefined || query.trim() === '') return
+    setSearching(true)
+    try {
+      const res = await call('memory.search', { query: query.trim(), labels: [...opt.otherLabels] })
+      setHits(res.filter((h) => (opt.otherLabels as readonly string[]).includes(h.label)))
+    } catch (err) {
+      toast.notify('err', toIpcError(err).message)
+    } finally {
+      setSearching(false)
+    }
+  }
+
+  async function connect(hit: MemorySearchHitDto): Promise<void> {
+    if (opt === undefined) return
+    const self = { label: node.label, id: node.id }
+    const other = { label: hit.label, id: hit.id }
+    const from = opt.direction === 'out' ? self : other
+    const to = opt.direction === 'out' ? other : self
+    setBusy(true)
+    try {
+      const result = await call('memory.edge.create', { type: opt.type, from, to })
+      onConnected(result.auditActionId)
+      onClose()
+    } catch (err) {
+      toast.notify('err', toIpcError(err).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal title="Connect to…" onClose={onClose} footer={<Button onClick={onClose}>Close</Button>}>
+      {options.length === 0 ? (
+        <p className="text-[12px] text-ink-mute">Nothing in memory can be connected to this kind of thing.</p>
+      ) : (
+        <div className="flex flex-col gap-3">
+          <Select
+            value={optKey}
+            onChange={(value) => {
+              setOptKey(value)
+              setHits(null)
+            }}
+            options={options.map((o) => ({ value: o.key, label: o.optionLabel }))}
+            label="Kind of connection"
+            testId="memory-connect-type"
+          />
+          <div className="flex items-end gap-2">
+            <div className="min-w-0 flex-1">
+              <TextInput
+                label="Find what to connect"
+                value={query}
+                onChange={setQuery}
+                onEnter={() => void runSearch()}
+                testId="memory-connect-search"
+                placeholder="Search by name or words"
+              />
+            </div>
+            <Button size="default" disabled={searching || query.trim() === ''} onClick={() => void runSearch()}>
+              Search
+            </Button>
+          </div>
+          {searching && <LoadingRows rows={3} />}
+          {hits !== null && !searching && (
+            hits.length === 0 ? (
+              <p className="text-[12px] text-ink-mute">
+                Nothing matched. Search only finds Projects, Skills, Preferences and Notes.
+              </p>
+            ) : (
+              <ul className="flex flex-col divide-y divide-line rounded-md border border-line">
+                {hits.map((hit) => (
+                  <li key={nodeKey(hit)} className="flex items-center justify-between gap-2 px-3 py-2">
+                    <span className="min-w-0 text-[12px] break-words">
+                      {truncate(hit.text, 120)} <span className="text-ink-mute">({hit.label})</span>
+                    </span>
+                    <Button
+                      testId={`memory-connect-target-${hit.id}`}
+                      disabled={busy}
+                      onClick={() => void connect(hit)}
+                    >
+                      Connect
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            )
+          )}
+        </div>
+      )}
+    </Modal>
+  )
+}
+
+// ── edge remove confirm ─────────────────────────────────────────────────────────
+
+function EdgeRemoveModal({
+  node,
+  edge,
+  onClose,
+  onRemoved
+}: {
+  node: MemoryNodeDetailDto
+  edge: MemoryEdgeDto
+  onClose: () => void
+  onRemoved: (auditActionId: string) => void
+}): React.JSX.Element {
+  const toast = useToast()
+  const [busy, setBusy] = useState(false)
+
+  async function confirm(): Promise<void> {
+    const self = { label: node.label, id: node.id }
+    const other = { label: edge.label, id: edge.id }
+    const from = edge.direction === 'out' ? self : other
+    const to = edge.direction === 'out' ? other : self
+    setBusy(true)
+    try {
+      const result = await call('memory.edge.delete', { type: edge.type as IpcEdgeType, from, to })
+      onRemoved(result.auditActionId)
+      onClose()
+    } catch (err) {
+      toast.notify('err', toIpcError(err).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal
+      title="Remove this connection?"
+      onClose={onClose}
+      footer={
+        <>
+          <Button disabled={busy} onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="danger" testId="edge-remove-confirm" disabled={busy} onClick={() => void confirm()}>
+            Remove
+          </Button>
+        </>
+      }
+    >
+      <div className="text-[13px]">
+        Remove the “{plainWords(edge.type)}” connection to <span className="break-words">{truncate(edge.display, 80)}</span>?
+      </div>
+      <p className="mt-2 text-[12px] leading-5 text-ink-mute">
+        This only removes the link — nothing on either side is deleted. You can undo it from History.
+      </p>
+    </Modal>
+  )
+}
+
+// ── find duplicates (scan + audited merge) ──────────────────────────────────────
+
+/** Only these labels merge automatically; Skill/Project groups are report-only. */
+const MERGEABLE_DEDUPE_LABELS = new Set<IpcNodeLabel>(['Preference', 'Knowledge', 'Tag'])
+
+/** Plain reason chip text for a duplicate group. */
+function dedupeReasonText(group: MemoryDuplicateGroupDto): string {
+  if (group.reason === 'exact') return 'identical wording'
+  const pct = group.similarity != null ? Math.round(group.similarity * 100) : null
+  return pct !== null ? `nearly identical (${pct}% similar)` : 'nearly identical'
+}
+
+/** Plain hint for a label that cannot be auto-merged. */
+function reportOnlyHint(label: IpcNodeLabel): string {
+  if (label === 'Skill') return "Skills can't be auto-merged — review them in Skills."
+  if (label === 'Project') return "Projects can't be auto-merged — review them here."
+  return `${label} items can't be auto-merged here.`
+}
+
+type DedupeScanState =
+  | { readonly phase: 'loading' }
+  | { readonly phase: 'error'; readonly error: IpcError }
+  | { readonly phase: 'ready'; readonly groups: readonly MemoryDuplicateGroupDto[]; readonly truncated: boolean }
+
+function dedupeGroupKey(group: MemoryDuplicateGroupDto): string {
+  return `${group.label}:${group.suggestedKeepId}`
+}
+
+function DedupeGroupCard({
+  group,
+  index,
+  keepId,
+  busy,
+  confirming,
+  onPickKeeper,
+  onStartMerge,
+  onCancelMerge,
+  onConfirmMerge
+}: {
+  group: MemoryDuplicateGroupDto
+  index: number
+  keepId: string
+  busy: boolean
+  confirming: boolean
+  onPickKeeper: (id: string) => void
+  onStartMerge: () => void
+  onCancelMerge: () => void
+  onConfirmMerge: (keepId: string) => void
+}): React.JSX.Element {
+  const mergeable = MERGEABLE_DEDUPE_LABELS.has(group.label)
+  const removeCount = group.nodes.length - 1
+  const keepNode = group.nodes.find((n) => n.id === keepId) ?? group.nodes[0]
+  const radioName = `dedupe-keep-${index}`
+  return (
+    <div className="rounded-md border border-line" data-testid={`dedupe-group-${index}`}>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-line bg-surface px-3 py-2">
+        <span className="rounded-full bg-raised px-2 py-0.5 text-[11px] text-ink-mute">{dedupeReasonText(group)}</span>
+        <span className="text-[12px] text-ink-mute">
+          {plural(group.nodes.length, `matching ${group.label}`, `matching ${group.label}s`)}
+        </span>
+      </div>
+      <ul className="flex flex-col divide-y divide-line">
+        {group.nodes.map((node) => (
+          <li key={node.id} className="px-3 py-2">
+            {mergeable ? (
+              <label className="flex cursor-pointer items-start gap-2.5">
+                <input
+                  type="radio"
+                  name={radioName}
+                  checked={node.id === keepId}
+                  disabled={busy}
+                  onChange={() => onPickKeeper(node.id)}
+                  data-testid={`dedupe-keep-${node.id}`}
+                  className="mt-1 accent-[var(--color-accent)]"
+                  aria-label={`Keep ${truncate(node.display, 60)}`}
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[13px] break-words">{truncate(node.display, 140)}</span>
+                  <span className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[11px] text-ink-mute">
+                    <span>{plural(node.edgeCount, 'connection')}</span>
+                    <Timestamp iso={node.updatedAt} />
+                    {node.id === keepId && <span className="text-accent">keeps this</span>}
+                  </span>
+                </span>
+              </label>
+            ) : (
+              <div className="min-w-0">
+                <span className="block text-[13px] break-words">{truncate(node.display, 140)}</span>
+                <span className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[11px] text-ink-mute">
+                  <span>{plural(node.edgeCount, 'connection')}</span>
+                  <Timestamp iso={node.updatedAt} />
+                </span>
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+      <div className="border-t border-line px-3 py-2">
+        {!mergeable ? (
+          <p className="text-[12px] text-ink-mute">{reportOnlyHint(group.label)}</p>
+        ) : confirming ? (
+          <div className="flex flex-col gap-2">
+            <p className="text-[12px] leading-5 text-ink-mute">
+              Merge {plural(removeCount, 'duplicate')} into “{truncate(keepNode?.display ?? '', 60)}”? Their connections
+              move onto the kept one. You can undo this from History.
+            </p>
+            <div className="flex gap-1.5">
+              <Button disabled={busy} onClick={onCancelMerge}>
+                Cancel
+              </Button>
+              <Button
+                variant="danger"
+                testId="memory-dedupe-merge-confirm"
+                disabled={busy}
+                onClick={() => onConfirmMerge(keepId)}
+              >
+                Merge {removeCount}
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <Button variant="primary" testId="memory-dedupe-merge" disabled={busy} onClick={onStartMerge}>
+            Keep this one, merge {plural(removeCount, 'duplicate')} into it
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function DedupeModal({
+  onClose,
+  notifyUndoable,
+  onChanged
+}: {
+  onClose: () => void
+  notifyUndoable: (auditActionId: string, message: string) => void
+  onChanged: () => void
+}): React.JSX.Element {
+  const toast = useToast()
+  const [scan, setScan] = useState<DedupeScanState>({ phase: 'loading' })
+  const [keepers, setKeepers] = useState<Record<string, string>>({})
+  const [confirming, setConfirming] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const runScan = useCallback(async (): Promise<void> => {
+    setScan({ phase: 'loading' })
+    setConfirming(null)
+    try {
+      const res = await call('memory.dedupe.scan', {})
+      const seed: Record<string, string> = {}
+      for (const group of res.groups) seed[dedupeGroupKey(group)] = group.suggestedKeepId
+      setKeepers(seed)
+      setScan({ phase: 'ready', groups: res.groups, truncated: res.truncated })
+    } catch (err) {
+      setScan({ phase: 'error', error: toIpcError(err) })
+    }
+  }, [])
+
+  useEffect(() => {
+    void runScan()
+  }, [runScan])
+
+  const merge = useCallback(
+    async (group: MemoryDuplicateGroupDto, keepId: string): Promise<void> => {
+      const removeIds = group.nodes.map((n) => n.id).filter((id) => id !== keepId)
+      if (removeIds.length === 0) return
+      setBusy(true)
+      try {
+        const result = await call('memory.dedupe.merge', { label: group.label, keepId, removeIds })
+        notifyUndoable(result.auditActionId, `Merged ${plural(result.removed, 'duplicate')} — undo available in History`)
+        onChanged()
+        await runScan()
+      } catch (err) {
+        toast.notify('err', toIpcError(err).message)
+      } finally {
+        setBusy(false)
+      }
+    },
+    [notifyUndoable, onChanged, runScan, toast]
+  )
+
+  let body: ReactNode
+  if (scan.phase === 'loading') {
+    body = (
+      <p className="py-2 text-[13px] text-ink-mute" role="status">
+        Comparing everything it knows…
+      </p>
+    )
+  } else if (scan.phase === 'error') {
+    body = <ErrorState error={scan.error} onRetry={() => void runScan()} />
+  } else if (scan.groups.length === 0) {
+    body = <EmptyState icon={<Icon name="check" size={20} />}>No duplicates found — memory looks clean.</EmptyState>
+  } else {
+    body = (
+      <div className="flex flex-col gap-3">
+        {scan.truncated && (
+          <p className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-5">
+            Only part of memory was scanned (it&apos;s large) — run again after merging.
+          </p>
+        )}
+        {scan.groups.map((group, i) => {
+          const key = dedupeGroupKey(group)
+          return (
+            <DedupeGroupCard
+              key={key}
+              group={group}
+              index={i}
+              keepId={keepers[key] ?? group.suggestedKeepId}
+              busy={busy}
+              confirming={confirming === key}
+              onPickKeeper={(id) => setKeepers((old) => ({ ...old, [key]: id }))}
+              onStartMerge={() => setConfirming(key)}
+              onCancelMerge={() => setConfirming(null)}
+              onConfirmMerge={(keepId) => void merge(group, keepId)}
+            />
+          )
+        })}
+      </div>
+    )
+  }
+
+  const canRescan = scan.phase !== 'loading'
+  return (
+    <Modal
+      title="Find duplicates"
+      onClose={onClose}
+      wide
+      footer={
+        <>
+          <Button disabled={!canRescan || busy} onClick={() => void runScan()}>
+            Scan again
+          </Button>
+          <Button variant="primary" onClick={onClose}>
+            Done
+          </Button>
+        </>
+      }
+    >
+      <p className="mb-3 text-[12px] leading-5 text-ink-mute">
+        Memories that say almost the same thing. Pick the one to keep — its connections stay and the duplicates fold into
+        it. Every merge is undoable from History.
+      </p>
+      {body}
+    </Modal>
   )
 }
 
@@ -137,12 +1119,14 @@ function EdgeSection({
   title,
   emptyText,
   edges,
-  onNavigate
+  onNavigate,
+  onRemove
 }: {
   title: string
   emptyText: string
   edges: readonly MemoryEdgeDto[]
   onNavigate: (ref: NodeRef) => void
+  onRemove: (edge: MemoryEdgeDto) => void
 }): React.JSX.Element {
   return (
     <section className="mt-5">
@@ -176,6 +1160,16 @@ function EdgeSection({
                       {truncate(edge.display, 120)}
                     </button>
                     {confidence !== null && <Confidence value={confidence} />}
+                    <button
+                      type="button"
+                      aria-label={`Remove the ${plainWords(edge.type)} connection to ${truncate(edge.display, 60)}`}
+                      title="Remove this connection"
+                      data-testid={`edge-remove-${edge.type}-${edge.id}`}
+                      onClick={() => onRemove(edge)}
+                      className="ml-auto shrink-0 cursor-pointer rounded-md px-1.5 text-[12px] text-ink-mute transition-colors duration-120 hover:bg-raised hover:text-err focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                    >
+                      <Icon name="x" size={12} />
+                    </button>
                   </li>
                 )
               })}
@@ -193,14 +1187,25 @@ function Inspector({
   nodeRef,
   canBack,
   onBack,
-  onNavigate
+  onNavigate,
+  onMutated,
+  onDeleted
 }: {
   nodeRef: NodeRef
   canBack: boolean
   onBack: () => void
   onNavigate: (ref: NodeRef) => void
+  /** A same-node mutation committed (edit / connect / edge-remove) → refresh + undoable toast. */
+  onMutated: (auditActionId: string, message: string) => void
+  /** The node itself was deleted → clear + refresh + undoable toast. */
+  onDeleted: (result: MemoryDeleteResultDto) => void
 }): React.JSX.Element {
   const detail = useIpc('memory.node', { label: nodeRef.label, id: nodeRef.id })
+  const [editing, setEditing] = useState(false)
+  const [connecting, setConnecting] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const [edgeToRemove, setEdgeToRemove] = useState<MemoryEdgeDto | null>(null)
+
   if (detail.error !== null) return <ErrorState error={detail.error} onRetry={detail.reload} />
   if (detail.loading || detail.data === null) return <LoadingRows rows={6} />
 
@@ -213,15 +1218,30 @@ function Inspector({
   // Plain-first: primitive props read in the KV; nested JSON is technical detail.
   const simple = entries.filter(([, value]) => typeof value !== 'object')
   const complex = entries.filter(([, value]) => typeof value === 'object')
-  const heading = nodeRef.display ?? node.id
+  // Heading = the human handle; a deep link (R3) may arrive without one, so fall
+  // back to a handle derived from the props before the raw id.
+  const heading = nodeRef.display ?? nodeHandle(node.label, node.props) ?? node.id
 
   return (
     <div className="px-4 py-3">
       <div className="flex items-center gap-2.5">
         {canBack && <Button onClick={onBack}>back</Button>}
         <span className="text-[12px] text-ink-mute">{node.label}</span>
+        <div className="ml-auto flex items-center gap-1.5">
+          <Button testId="memory-edit" onClick={() => setEditing(true)}>
+            Edit
+          </Button>
+          <Button testId="memory-connect" onClick={() => setConnecting(true)}>
+            Connect to…
+          </Button>
+          <Button variant="danger-ghost" testId="memory-delete" onClick={() => setDeleting(true)}>
+            Delete
+          </Button>
+        </div>
       </div>
       <div className="mt-1.5 text-[14px] break-words">{heading}</div>
+      {/* Plain "what this is" lead line (R2): one sentence from props + edge counts. */}
+      <div className="mt-1 text-[13px] leading-5 text-ink-mute">{summarizeNode(node)}</div>
       {(extractedBy !== null || confidence !== null) && (
         <div className="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 border-b border-line pb-2.5 text-[12px] text-ink-mute">
           {extractedBy !== null && (
@@ -236,7 +1256,13 @@ function Inspector({
         {simple.length === 0 ? (
           <div className="text-[12px] text-ink-mute">Nothing else is recorded about this.</div>
         ) : (
-          <KV entries={simple.map(([key, value]) => ({ k: plainWords(key), v: renderPropValue(key, value) }))} />
+          <KV
+            entries={simple.map(([key, value]) => ({
+              k: plainPropLabel(node.label, key),
+              v: renderPropValue(key, value),
+              kTitle: key
+            }))}
+          />
         )}
       </div>
       {complex.length > 0 && (
@@ -254,13 +1280,39 @@ function Inspector({
         emptyText="This isn't connected to anything else yet."
         edges={node.outgoing}
         onNavigate={onNavigate}
+        onRemove={setEdgeToRemove}
       />
       <EdgeSection
         title="Connected from"
         emptyText="Nothing else points to this yet."
         edges={node.incoming}
         onNavigate={onNavigate}
+        onRemove={setEdgeToRemove}
       />
+
+      {editing && (
+        <EditMemoryModal
+          node={node}
+          onClose={() => setEditing(false)}
+          onSaved={(result) => onMutated(result.auditActionId, 'Saved — undo available in History')}
+        />
+      )}
+      {connecting && (
+        <ConnectModal
+          node={node}
+          onClose={() => setConnecting(false)}
+          onConnected={(auditActionId) => onMutated(auditActionId, 'Connected — undo available in History')}
+        />
+      )}
+      {deleting && <DeleteConfirmModal node={node} onClose={() => setDeleting(false)} onDeleted={onDeleted} />}
+      {edgeToRemove !== null && (
+        <EdgeRemoveModal
+          node={node}
+          edge={edgeToRemove}
+          onClose={() => setEdgeToRemove(null)}
+          onRemoved={(auditActionId) => onMutated(auditActionId, 'Connection removed — undo available in History')}
+        />
+      )}
     </div>
   )
 }
@@ -283,14 +1335,20 @@ const LIST_COLUMNS: readonly Column<MemoryNodeSummaryDto>[] = [
 
 // ── panel ─────────────────────────────────────────────────────────────────────
 
-export default function MemoryPanel(): React.JSX.Element {
+export default function MemoryPanel({ inspect: inspectTarget, onInspectConsumed }: PanelProps): React.JSX.Element {
+  const toast = useToast()
   const counts = useIpc('memory.counts', undefined)
   const [query, setQuery] = useState('')
   const [search, setSearch] = useState<SearchState | null>(null)
   const [list, setList] = useState<ListState | null>(null)
   const [stack, setStack] = useState<readonly NodeRef[]>([])
+  const [addOpen, setAddOpen] = useState(false)
+  const [dedupeOpen, setDedupeOpen] = useState(false)
+  const [inspectorGen, setInspectorGen] = useState(0)
   const listGen = useRef(0)
   const searchGen = useRef(0)
+  const listRef = useRef<ListState | null>(null)
+  listRef.current = list
 
   const current = stack.length > 0 ? stack[stack.length - 1] : undefined
   const currentKey = current !== undefined ? nodeKey(current) : null
@@ -352,6 +1410,77 @@ export default function MemoryPanel(): React.JSX.Element {
   const goBack = useCallback(() => {
     setStack((old) => old.slice(0, -1))
   }, [])
+
+  // R3 deep link: when App hands us a one-shot inspect target (e.g. from an
+  // Approvals source chip), switch the browse list to its category, open its
+  // inspector, then tell App we consumed it so a nav-away-and-back doesn't re-fire.
+  useEffect(() => {
+    if (inspectTarget == null) return
+    loadPage(inspectTarget.label, [])
+    setStack([{ label: inspectTarget.label, id: inspectTarget.id }])
+    onInspectConsumed?.()
+  }, [inspectTarget, loadPage, onInspectConsumed])
+
+  // ── mutation plumbing (feature B) ─────────────────────────────────────────────
+
+  const reloadList = useCallback(() => {
+    const cur = listRef.current
+    if (cur !== null) loadPage(cur.label, [])
+  }, [loadPage])
+
+  const bumpInspector = useCallback(() => setInspectorGen((g) => g + 1), [])
+
+  const undoAction = useCallback(
+    async (auditActionId: string): Promise<void> => {
+      try {
+        await call('audit.undo', { id: auditActionId })
+        toast.notify('ok', 'Undone.')
+        counts.reload()
+        reloadList()
+        bumpInspector()
+      } catch (err) {
+        toast.notify('err', toIpcError(err).message)
+      }
+    },
+    [toast, counts, reloadList, bumpInspector]
+  )
+
+  const notifyUndoable = useCallback(
+    (auditActionId: string, message: string) => {
+      toast.notify('ok', message, { label: 'Undo', testId: 'undo-toast-action', onClick: () => void undoAction(auditActionId) })
+    },
+    [toast, undoAction]
+  )
+
+  // A create shows the new node's category immediately (switches the list to it).
+  const onCreated = useCallback(
+    (result: MemoryNodeMutationDto) => {
+      notifyUndoable(result.auditActionId, 'Saved — undo available in History')
+      counts.reload()
+      loadPage(result.label, [])
+    },
+    [notifyUndoable, counts, loadPage]
+  )
+
+  const onMutated = useCallback(
+    (auditActionId: string, message: string) => {
+      notifyUndoable(auditActionId, message)
+      counts.reload()
+      reloadList()
+      bumpInspector()
+    },
+    [notifyUndoable, counts, reloadList, bumpInspector]
+  )
+
+  const onDeleted = useCallback(
+    (result: MemoryDeleteResultDto) => {
+      notifyUndoable(result.auditActionId, `Deleted ${plural(result.deleted.nodes, 'item')} — undo available in History`)
+      setStack([])
+      counts.reload()
+      reloadList()
+    },
+    [notifyUndoable, counts, reloadList]
+  )
 
   // ── left column bodies ──────────────────────────────────────────────────────
 
@@ -522,6 +1651,12 @@ export default function MemoryPanel(): React.JSX.Element {
         icon={<Icon name="memory" size={18} />}
         actions={
           <>
+            <Button variant="primary" testId="memory-add" onClick={() => setAddOpen(true)}>
+              Add memory
+            </Button>
+            <Button testId="memory-dedupe-scan" onClick={() => setDedupeOpen(true)}>
+              Find duplicates
+            </Button>
             <TextInput
               value={query}
               onChange={setQuery}
@@ -544,14 +1679,30 @@ export default function MemoryPanel(): React.JSX.Element {
             <EmptyState>Pick something on the left to see its details.</EmptyState>
           ) : (
             <Inspector
+              key={`${currentKey}:${inspectorGen}`}
               nodeRef={current}
               canBack={stack.length > 1}
               onBack={goBack}
               onNavigate={navigate}
+              onMutated={onMutated}
+              onDeleted={onDeleted}
             />
           )}
         </div>
       </div>
+
+      {addOpen && <AddMemoryModal onClose={() => setAddOpen(false)} onCreated={onCreated} />}
+      {dedupeOpen && (
+        <DedupeModal
+          onClose={() => setDedupeOpen(false)}
+          notifyUndoable={notifyUndoable}
+          onChanged={() => {
+            counts.reload()
+            reloadList()
+            bumpInspector()
+          }}
+        />
+      )}
     </div>
   )
 }

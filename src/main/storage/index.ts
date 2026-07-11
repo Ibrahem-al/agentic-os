@@ -22,10 +22,12 @@ export {
   RETRIEVABLE_LABELS,
   nodeTable,
   relTable,
+  writableNodeProperties,
   type EdgeType,
   type NodeLabel,
   type NodeTableSpec,
   type PropertySpec,
+  type PropertyType,
   type RelTableSpec,
   type RetrievableLabel
 } from './schema'

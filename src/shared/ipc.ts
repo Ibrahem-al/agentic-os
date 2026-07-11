@@ -38,6 +38,67 @@ export type IpcNodeLabel = (typeof IPC_NODE_LABELS)[number]
 
 export const IPC_RETRIEVABLE_LABELS = ['Project', 'Skill', 'Preference', 'Knowledge'] as const
 
+/**
+ * Renderer-safe mirror of the §18 relationship vocabulary (storage/schema.ts
+ * REL_TABLES). This file must stay dependency-free, so — like IPC_NODE_LABELS —
+ * it is a hand-kept copy; tests/integration/memory.edit.test.ts pins both
+ * constants against the schema so they can never drift. IPC_EDGE_PAIRS drives
+ * the memory panel's "Connect to…" picker (only valid (from, to) label pairs
+ * are offered) and mirrors the server-side edge validation exactly.
+ */
+export const IPC_EDGE_TYPES = [
+  'PRODUCED',
+  'USED',
+  'USES',
+  'HAS_COMPONENT',
+  'DEPENDS_ON',
+  'CONNECTS_TO',
+  'HAS_VERSION',
+  'HAS_EXAMPLE',
+  'OBSERVED_IN',
+  'IMPROVED',
+  'DERIVED_FROM',
+  'APPLIES_TO',
+  'HAS_CHUNK',
+  'EXTRACTED_FROM',
+  'TAGGED'
+] as const
+export type IpcEdgeType = (typeof IPC_EDGE_TYPES)[number]
+
+export const IPC_EDGE_PAIRS: Readonly<Record<IpcEdgeType, readonly (readonly [IpcNodeLabel, IpcNodeLabel])[]>> = {
+  PRODUCED: [['Session', 'Project']],
+  USED: [
+    ['Session', 'Skill'],
+    ['Session', 'MCP'],
+    ['Session', 'Plugin']
+  ],
+  USES: [
+    ['Project', 'Skill'],
+    ['Project', 'MCP'],
+    ['Project', 'Plugin']
+  ],
+  HAS_COMPONENT: [['Project', 'Component']],
+  DEPENDS_ON: [['Component', 'Component']],
+  CONNECTS_TO: [['Component', 'Component']],
+  HAS_VERSION: [['Skill', 'SkillVersion']],
+  HAS_EXAMPLE: [['Skill', 'Example']],
+  OBSERVED_IN: [['Correction', 'Session']],
+  IMPROVED: [['Correction', 'Skill']],
+  DERIVED_FROM: [['Preference', 'Correction']],
+  APPLIES_TO: [['Preference', 'Tag']],
+  HAS_CHUNK: [['Document', 'Knowledge']],
+  EXTRACTED_FROM: [
+    ['Component', 'Session'],
+    ['Preference', 'Session'],
+    ['Knowledge', 'Session']
+  ],
+  TAGGED: [
+    ['Project', 'Tag'],
+    ['Skill', 'Tag'],
+    ['Knowledge', 'Tag']
+  ]
+}
+
 export const IPC_CLOUD_PROVIDERS = ['anthropic', 'openai', 'gemini', 'openrouter'] as const
 export type IpcCloudProvider = (typeof IPC_CLOUD_PROVIDERS)[number]
 
@@ -119,6 +180,78 @@ export interface MemoryNodeDetailDto {
   readonly props: JsonObject
   readonly outgoing: readonly MemoryEdgeDto[]
   readonly incoming: readonly MemoryEdgeDto[]
+}
+
+// ── memory editing (feature B: user CRUD — dashboard IPC only, never MCP) ────
+
+/** One edge endpoint in a memory.edge.* request. */
+export interface MemoryNodeRefDto {
+  readonly label: IpcNodeLabel
+  readonly id: string
+}
+
+/**
+ * memory.node.create / memory.node.update result. Every memory.* mutation
+ * returns its audit action id so the UI can offer "Undo" directly (toast
+ * action → audit.undo) without a History-panel round trip.
+ */
+export interface MemoryNodeMutationDto {
+  readonly label: IpcNodeLabel
+  readonly id: string
+  readonly auditActionId: string
+}
+
+/** memory.node.delete result: what the structured cascade removed, in plain counts. */
+export interface MemoryDeleteResultDto {
+  readonly auditActionId: string
+  readonly deleted: { readonly nodes: number; readonly edges: number }
+}
+
+/** memory.edge.create / memory.edge.delete result. */
+export interface MemoryEdgeMutationDto {
+  readonly auditActionId: string
+}
+
+// ── memory deduplication (dashboard maintenance — scan + audited merge) ──────
+
+/** One member of a duplicate group. */
+export interface MemoryDuplicateNodeDto {
+  readonly id: string
+  /** One-line human handle (truncated render text / Tag name). */
+  readonly display: string
+  readonly updatedAt: string | null
+  /** Incident-edge count — the primary keeper signal. */
+  readonly edgeCount: number
+}
+
+/**
+ * A cluster of duplicate memories the scan found. `reason: 'exact'` is
+ * normalized-text/name equality; `'near'` is embedding cosine ≥ the scan
+ * threshold (then `similarity` is the group's weakest pairwise cosine). Members
+ * are ordered best-keeper-first and `suggestedKeepId` is that keeper (most
+ * edges, tie → newest). Merging is a SEPARATE explicit action.
+ */
+export interface MemoryDuplicateGroupDto {
+  readonly label: IpcNodeLabel
+  readonly reason: 'exact' | 'near'
+  readonly similarity?: number
+  readonly nodes: readonly MemoryDuplicateNodeDto[]
+  readonly suggestedKeepId: string
+}
+
+/** memory.dedupe.scan result — the groups plus a partial-scan flag. */
+export interface MemoryDedupeScanResultDto {
+  readonly groups: readonly MemoryDuplicateGroupDto[]
+  /** True when a label held more nodes than the scan cap (the scan was partial). */
+  readonly truncated: boolean
+}
+
+/** memory.dedupe.merge result — undoable via `auditActionId`. */
+export interface MemoryDedupeMergeResultDto {
+  readonly auditActionId: string
+  readonly removed: number
+  readonly edgesRepointed: number
+  readonly edgesDropped: number
 }
 
 // ── review queue ──────────────────────────────────────────────────────────────
@@ -361,13 +494,25 @@ export interface IngestCodebaseResultDto {
   readonly knowledgeDocuments: number
   readonly knowledgePruned: number
   readonly knowledgeFailed: readonly { readonly file: string; readonly error: string }[]
+  /**
+   * Stage-3 project skill extraction. `staged`/`revisions` wait in the
+   * Approvals queue (nothing is live until a human approves); all zeros when
+   * the pass did not run.
+   */
+  readonly skills: {
+    readonly discovered: number
+    readonly staged: number
+    readonly revisions: number
+    readonly skippedExisting: number
+    readonly proposalsSkipped: number
+  }
   readonly skipped: number
 }
 
 /** Pushed over IPC_EVENT_INGEST_PROGRESS while ingest.codebase runs. */
 export interface IngestProgressEventDto {
   readonly runId: string
-  readonly phase: 'walking' | 'parsing' | 'writing' | 'knowledge'
+  readonly phase: 'walking' | 'parsing' | 'writing' | 'knowledge' | 'skills'
   readonly filesWalked: number
   readonly codeFilesParsed: number
   readonly componentsFound: number
@@ -651,6 +796,37 @@ export interface IpcChannels {
     res: readonly MemorySearchHitDto[]
   }
   'memory.node': { req: { label: IpcNodeLabel; id: string }; res: MemoryNodeDetailDto }
+
+  /**
+   * Memory editing (feature B): dashboard-only graph/KB mutations. IPC is the
+   * ONLY surface — never exposed as MCP tools (§21 rule 6: Claude's write path
+   * stays propose_correction → staged → validated). Every mutation runs as ONE
+   * audited write-lane job (actor user:dashboard) so it is visible and
+   * undoable in the History panel; validation + embedding happen BEFORE the
+   * lane, so a rejected request (or a down embedder → OLLAMA_ERROR) writes
+   * nothing. `props` may not carry protected keys (id / created_at /
+   * updated_at / embedding / extracted_by / confidence).
+   */
+  'memory.node.create': { req: { label: IpcNodeLabel; props: JsonObject }; res: MemoryNodeMutationDto }
+  'memory.node.update': { req: { label: IpcNodeLabel; id: string; props: JsonObject }; res: MemoryNodeMutationDto }
+  /** Structured cascade: a Document takes its HAS_CHUNK Knowledge chunks with it; a Skill its HAS_VERSION SkillVersions. */
+  'memory.node.delete': { req: { label: IpcNodeLabel; id: string }; res: MemoryDeleteResultDto }
+  'memory.edge.create': { req: { type: IpcEdgeType; from: MemoryNodeRefDto; to: MemoryNodeRefDto }; res: MemoryEdgeMutationDto }
+  'memory.edge.delete': { req: { type: IpcEdgeType; from: MemoryNodeRefDto; to: MemoryNodeRefDto }; res: MemoryEdgeMutationDto }
+
+  /**
+   * Memory deduplication (feature B maintenance): a read-only duplicate scan and
+   * an audited merge. `scan` finds exact (normalized text/name) + near
+   * (embedding cosine ≥ threshold, default DEDUPE_SIMILARITY_DEFAULT) duplicate
+   * GROUPS across Project/Skill/Preference/Knowledge/Tag; `merge` collapses one
+   * group onto its keeper in ONE audited lane job (undoable in History) — v1
+   * merges Preference/Knowledge/Tag only (Skill/Project are scan-report-only).
+   */
+  'memory.dedupe.scan': { req: { labels?: readonly string[]; threshold?: number }; res: MemoryDedupeScanResultDto }
+  'memory.dedupe.merge': {
+    req: { label: IpcNodeLabel; keepId: string; removeIds: readonly string[] }
+    res: MemoryDedupeMergeResultDto
+  }
 
   'review.staged.list': { req: { status?: StagedWriteStatusDto }; res: readonly StagedWriteDto[] }
   'review.staged.diff': { req: { id: string }; res: string }

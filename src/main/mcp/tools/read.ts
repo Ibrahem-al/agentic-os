@@ -18,6 +18,7 @@ import { RETRIEVABLE_LABELS } from '../../storage'
 import { searchMemory } from '../../retrieval'
 import { IngestError } from '../../ingest'
 import { StagedWriteError } from '../../security'
+import { scanDuplicates, DEDUPE_LABELS } from '../../memory'
 import { IPC_NODE_LABELS } from '../../../shared/ipc'
 import {
   getAppStatus,
@@ -131,6 +132,22 @@ const ListNodesInput = z.object({
 const GetNodeInput = z.object({
   label: z.enum(IPC_NODE_LABELS).describe('The node label.'),
   id: z.string().min(1).describe('The node id.')
+})
+
+/** Groups shipped per list_duplicate_memories reply (the rest are counted). */
+const DUPLICATE_GROUPS_REPLY_CAP = 50
+
+const ListDuplicateMemoriesInput = z.object({
+  labels: z
+    .array(z.enum(DEDUPE_LABELS))
+    .optional()
+    .describe('Restrict to these labels; default all of Project, Skill, Preference, Knowledge, Tag.'),
+  threshold: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .describe('Near-duplicate cosine floor (default 0.95); exact-text/name duplicates are always included.')
 })
 
 const ListStagedWritesInput = z.object({
@@ -336,6 +353,19 @@ async function getNodeTool(args: unknown, ctx: ToolContext): Promise<unknown> {
   }
 }
 
+async function listDuplicateMemoriesTool(args: unknown, ctx: ToolContext): Promise<unknown> {
+  const input = parse(ListDuplicateMemoriesInput, args, 'list_duplicate_memories')
+  const { groups, truncated } = await scanDuplicates(
+    { engine: ctx.engine },
+    {
+      ...(input.labels !== undefined ? { labels: input.labels } : {}),
+      ...(input.threshold !== undefined ? { threshold: input.threshold } : {})
+    }
+  )
+  // Cap the shipped groups like the other list tools; the full count rides along.
+  return { groups: groups.slice(0, DUPLICATE_GROUPS_REPLY_CAP), groupsTotal: groups.length, truncated }
+}
+
 // ── §4.D review / observability ─────────────────────────────────────────────────
 
 async function listStagedWritesTool(args: unknown, ctx: ToolContext): Promise<unknown> {
@@ -529,6 +559,13 @@ export const READ_TOOL_DEFS: readonly McpToolDef[] = [
     description: 'Inspector detail for one node: its properties (no embedding) plus the typed incoming/outgoing neighborhood.',
     inputSchema: jsonSchema(GetNodeInput),
     handle: getNodeTool
+  },
+  {
+    name: 'list_duplicate_memories',
+    description:
+      'Find duplicate memory GROUPS across Project/Skill/Preference/Knowledge/Tag: exact (normalized text/name equality) and near (embedding cosine ≥ threshold, default 0.95). Read-only — each group reports its members (with edge counts) and a suggested keeper (most-connected, tie → newest). Merge with propose_dedupe_merge (staged for review).',
+    inputSchema: jsonSchema(ListDuplicateMemoriesInput),
+    handle: listDuplicateMemoriesTool
   },
   {
     name: 'list_staged_writes',

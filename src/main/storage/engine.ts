@@ -71,6 +71,21 @@ export interface WriteTx {
   cypher(query: string, params?: CypherParams): Promise<Row[]>
   upsertNode(label: NodeLabel, props: NodeProps): Promise<UpsertResult>
   createEdge(type: EdgeType, from: NodeRef, to: NodeRef, props?: EdgeProps): Promise<void>
+  /**
+   * DETACH-delete a node by id: removes the node and every incident edge in one
+   * engine-internal statement. Because the generated cypher is engine-managed —
+   * unlike a raw mutating cypher() — this does NOT flag an audited action
+   * un-undoable; the audit recorder captures the node (full pre-image, embedding
+   * included) and its incident edges as inverse ops before the delete runs. A
+   * no-op when the node does not exist. HNSW/FTS indexes auto-maintain on delete.
+   */
+  deleteNode(label: NodeLabel, id: string): Promise<void>
+  /**
+   * Delete a single edge (type, from, to). Engine-managed cypher (does not
+   * poison audit reversibility). A no-op when the edge does not exist. Throws
+   * if (type, from.label, to.label) is not a §18 schema pair.
+   */
+  deleteEdge(type: EdgeType, from: NodeRef, to: NodeRef): Promise<void>
 }
 
 export interface StorageEngine {
@@ -99,6 +114,21 @@ export interface StorageEngine {
    * endpoint node does not exist.
    */
   createEdge(type: EdgeType, from: NodeRef, to: NodeRef, props?: EdgeProps): Promise<void>
+
+  /**
+   * DETACH-delete a node by id (lane-serialized): removes the node and every
+   * incident edge. A structured op — not raw cypher — so an audited caller can
+   * record its reversible inverse (§13). A no-op when the node does not exist;
+   * HNSW/FTS indexes auto-maintain on delete. Throws on an unknown label.
+   */
+  deleteNode(label: NodeLabel, id: string): Promise<void>
+
+  /**
+   * Delete a single edge by (type, from, to) (lane-serialized). Structured op
+   * (does not poison audit reversibility). A no-op when the edge does not
+   * exist. Throws if (type, from.label, to.label) is not in the §18 schema.
+   */
+  deleteEdge(type: EdgeType, from: NodeRef, to: NodeRef): Promise<void>
 
   /** k-nearest-neighbor search over a retrievable label's HNSW index (direct read). */
   vectorSearch(label: RetrievableLabel, embedding: readonly number[], k: number): Promise<VectorHit[]>

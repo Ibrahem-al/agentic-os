@@ -489,13 +489,23 @@ export function DataTable<T>({
   )
 }
 
-/** Key–value grid for inspectors (mono values, wraps long text). */
-export function KV({ entries }: { entries: readonly { k: string; v: ReactNode }[] }): React.JSX.Element {
+/**
+ * Key–value grid for inspectors (mono values, wraps long text). An optional
+ * `kTitle` keeps the raw/technical key in a tooltip when `k` shows a friendly
+ * label (readability addendum R2).
+ */
+export function KV({
+  entries
+}: {
+  entries: readonly { k: string; v: ReactNode; kTitle?: string }[]
+}): React.JSX.Element {
   return (
     <dl className="grid grid-cols-[minmax(96px,max-content)_1fr] gap-x-4 gap-y-1.5 text-[12px]">
-      {entries.map(({ k, v }) => (
-        <div key={k} className="contents">
-          <dt className="font-mono text-[11px] leading-5 text-ink-mute">{k}</dt>
+      {entries.map(({ k, v, kTitle }, i) => (
+        <div key={`${k}:${i}`} className="contents">
+          <dt className="font-mono text-[11px] leading-5 text-ink-mute" {...(kTitle !== undefined ? { title: kTitle } : {})}>
+            {k}
+          </dt>
           <dd className="min-w-0 break-words leading-5">{v}</dd>
         </div>
       ))}
@@ -617,14 +627,27 @@ export function Modal({
 
 // ── toasts ────────────────────────────────────────────────────────────────────
 
+/**
+ * An optional inline action on a toast — e.g. an "Undo" affordance right where
+ * the confirmation lands, so a reversible mutation can be reversed without
+ * hunting through the History panel. Additive: callers that pass no action get
+ * the same plain toast as before.
+ */
+export interface ToastAction {
+  readonly label: string
+  readonly onClick: () => void
+  readonly testId?: string
+}
+
 export interface Toast {
   readonly id: number
   readonly kind: 'ok' | 'err' | 'info'
   readonly message: string
+  readonly action?: ToastAction
 }
 
 interface ToastApi {
-  notify(kind: Toast['kind'], message: string): void
+  notify(kind: Toast['kind'], message: string, action?: ToastAction): void
 }
 
 const ToastContext = createContext<ToastApi>({ notify: () => undefined })
@@ -636,9 +659,9 @@ export function useToast(): ToastApi {
 export function ToastProvider({ children }: { children: ReactNode }): React.JSX.Element {
   const [toasts, setToasts] = useState<readonly Toast[]>([])
 
-  const notify = useCallback((kind: Toast['kind'], message: string) => {
+  const notify = useCallback((kind: Toast['kind'], message: string, action?: ToastAction) => {
     const id = Date.now() + Math.random()
-    setToasts((current) => [...current, { id, kind, message }])
+    setToasts((current) => [...current, { id, kind, message, ...(action !== undefined ? { action } : {}) }])
     // Errors stay until dismissed; everything else auto-clears (DESIGN.md).
     if (kind !== 'err') {
       setTimeout(() => setToasts((current) => current.filter((t) => t.id !== id)), 5000)
@@ -670,6 +693,21 @@ export function ToastProvider({ children }: { children: ReactNode }): React.JSX.
                 ×
               </button>
             </div>
+            {toast.action !== undefined && (
+              <div className="mt-1.5">
+                <button
+                  type="button"
+                  {...(toast.action.testId !== undefined ? { 'data-testid': toast.action.testId } : {})}
+                  className="cursor-pointer rounded-md border border-line-strong px-2 py-0.5 text-[11px] font-medium text-ink transition-colors duration-120 hover:bg-raised focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                  onClick={() => {
+                    toast.action?.onClick()
+                    setToasts((current) => current.filter((t) => t.id !== toast.id))
+                  }}
+                >
+                  {toast.action.label}
+                </button>
+              </div>
+            )}
           </div>
         ))}
       </div>

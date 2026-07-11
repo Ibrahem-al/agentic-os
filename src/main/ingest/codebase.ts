@@ -45,6 +45,8 @@ import {
 } from './knowledge'
 import { walkCodebase, type SkippedWalkEntry, type WalkedFile } from './codebaseWalk'
 import { codeLanguageForExtension, parseCodeFile, type CodeUnit, type ParsedFile } from './codeParser'
+import { extractProjectSkills, type SkillExtractionResult } from './skills'
+import type BetterSqlite3 from 'better-sqlite3'
 
 /** Structural (satisfied by OllamaClient): the LOCAL small LLM for summaries. */
 export interface ProjectSummarizer {
@@ -70,11 +72,18 @@ export interface CodebaseIngestDeps {
   readonly scanner?: InjectionScanner
   /** §13 audit context, passed through to knowledge ingests (phase 09). */
   readonly audit?: { readonly log: AuditLog; readonly agentId: string }
+  /**
+   * appdata.db (SQLite). Present ⇒ the Stage-3 skill-extraction pass runs
+   * (SKILL.md / .claude commands / LLM proposals → staged `skill-import` rows).
+   * Absent ⇒ the pass is skipped entirely and behaviour is byte-identical to
+   * before (existing callers that omit it are unchanged).
+   */
+  readonly db?: BetterSqlite3.Database
 }
 
 /** Progress events for the dashboard (phase 10) — n files / n components. */
 export interface CodebaseIngestProgress {
-  readonly phase: 'walking' | 'parsing' | 'writing' | 'knowledge'
+  readonly phase: 'walking' | 'parsing' | 'writing' | 'knowledge' | 'skills'
   readonly filesWalked: number
   readonly codeFilesParsed: number
   readonly componentsFound: number
@@ -110,7 +119,22 @@ export interface IngestCodebaseResult {
     readonly pruned: readonly string[]
     readonly failed: readonly { file: string; error: string }[]
   }
+  /**
+   * Stage-3 skill extraction: all zeros when the pass did not run (no `db`
+   * dep). `staged`/`revisions` are pending in the Approvals queue — nothing is
+   * live until a human approves.
+   */
+  readonly skills: SkillExtractionResult
   readonly skipped: readonly SkippedWalkEntry[]
+}
+
+/** Zero result for the skill pass (no `db` dep ⇒ pass skipped). */
+const NO_SKILLS: SkillExtractionResult = {
+  discovered: 0,
+  staged: 0,
+  revisions: 0,
+  skippedExisting: 0,
+  proposalsSkipped: 0
 }
 
 const sha256Hex = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex')
@@ -723,6 +747,28 @@ export async function ingestCodebase(
     })
   }
 
+  // 9) Stage-3 skill extraction (staged, never live): SKILL.md / .claude
+  //    commands / LLM proposals → `skill-import` review rows. Skipped whole
+  //    when no appdata db is wired (DEFAULT == TODAY for existing callers). It
+  //    touches only SQLite staging rows, so it never changes the graph `status`.
+  let skills: SkillExtractionResult = NO_SKILLS
+  if (deps.db !== undefined) {
+    progress({ phase: 'skills', filesWalked, codeFilesParsed: parsed.length, componentsFound })
+    skills = await extractProjectSkills(
+      {
+        engine,
+        db: deps.db,
+        llm: deps.llm,
+        ...(deps.router !== undefined ? { router: deps.router } : {}),
+        ...(deps.scanner !== undefined ? { scanner: deps.scanner } : {}),
+        proposedBy: deps.audit?.agentId ?? 'project-skill-extraction'
+      },
+      root,
+      walk.docFiles,
+      { id: project.id, name: project.name }
+    )
+  }
+
   const knowledgeChanged = documents.some((d) => d.status !== 'unchanged') || staleDocs.length > 0
   const status: IngestCodebaseResult['status'] = project.create
     ? 'created'
@@ -746,6 +792,7 @@ export async function ingestCodebase(
     },
     dependsOn: { total: desiredEdges.size, created: newEdges.length, deleted: staleEdges.length },
     knowledge: { documents, pruned: staleDocs.map((d) => d.source), failed },
+    skills,
     skipped: walk.skipped
   }
 }
