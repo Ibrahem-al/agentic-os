@@ -115,6 +115,15 @@ export class WriteLane {
     return this.maxObservedActive
   }
 
+  /**
+   * True when no job is pending or running — every enqueued job has finished
+   * (finishOrder caught up to the enqueue count). A point-in-time read (the
+   * updater quiesce guard polls it); a new job may be enqueued the next tick.
+   */
+  get idle(): boolean {
+    return this.nextFinishOrder === this.nextSeq
+  }
+
   /** Resolves once every job enqueued so far has finished. */
   async onIdle(): Promise<void> {
     let tail

@@ -116,6 +116,93 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+// ── install quiesce (§21.9 crash-safety, G5+G6) ──────────────────────────────
+
+/**
+ * Total time updater.install waits for in-flight work to drain before it either
+ * installs (idle) or defers (still busy). The user already chose to restart, so a
+ * short bound keeps the app responsive; the deferred path loses nothing (the
+ * update applies on the next quit via autoInstallOnAppQuit).
+ */
+const UPDATER_QUIESCE_TIMEOUT_MS = 30_000
+/** How often the quiesce guard re-checks the queue + write lane while waiting. */
+const UPDATER_QUIESCE_POLL_MS = 200
+
+/** Structural slice of the storage engine the install quiesce needs (§21.9). */
+export interface QuiesceEngine {
+  /** True when the write lane has no pending or running job. */
+  laneIdle(): boolean
+  /** Force a checkpoint so the on-disk graph is current before the new binary boots. */
+  checkpoint(): Promise<void>
+}
+
+/** Structural slice of the durable task queue the install quiesce needs. */
+export interface QuiesceQueue {
+  /** The id of the task executing right now, or null when the queue is idle. */
+  readonly runningTaskId: string | null
+}
+
+export interface QuiesceForInstallDeps {
+  readonly engine: QuiesceEngine | null
+  readonly queue: QuiesceQueue | null
+  /** Test seams. */
+  readonly timeoutMs?: number
+  readonly pollMs?: number
+  readonly now?: () => number
+  readonly sleep?: (ms: number) => Promise<void>
+  readonly log?: (line: string) => void
+}
+
+export interface QuiesceForInstallResult {
+  /** True: the queue + write lane drained (or there was nothing to drain) — safe to install now. */
+  readonly idle: boolean
+  /** True when a pre-install checkpoint was forced (only on the idle path). */
+  readonly checkpointed: boolean
+}
+
+/**
+ * G5+G6 pre-install quiesce: `quitAndInstall` bypasses the will-quit bounded
+ * drain and relaunches into the new binary, which runs storage migrations at its
+ * first boot. So before installing, wait (bounded) for the durable queue's
+ * running task to finish AND the single write lane to go idle, then force a
+ * checkpoint so the graph on disk is current (the new version never falls back to
+ * a stale checkpoint). If still busy after the bound, DON'T install — return
+ * `idle:false`; the caller defers and autoInstallOnAppQuit applies the update on
+ * the next ordinary quit. Never throws (a failed checkpoint is best-effort — WAL
+ * replay recovers).
+ */
+export async function quiesceForInstall(deps: QuiesceForInstallDeps): Promise<QuiesceForInstallResult> {
+  const timeoutMs = deps.timeoutMs ?? UPDATER_QUIESCE_TIMEOUT_MS
+  const pollMs = deps.pollMs ?? UPDATER_QUIESCE_POLL_MS
+  const now = deps.now ?? Date.now
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const log = deps.log ?? (() => undefined)
+
+  const busy = (): boolean =>
+    (deps.queue?.runningTaskId ?? null) !== null || (deps.engine !== null && !deps.engine.laneIdle())
+
+  const deadline = now() + timeoutMs
+  while (busy()) {
+    if (now() >= deadline) {
+      log('[updater] install deferred — a write is still in flight after the quiesce bound; the update applies on the next quit')
+      return { idle: false, checkpointed: false }
+    }
+    await sleep(pollMs)
+  }
+
+  // Idle: checkpoint so the new version boots off a current graph, not a stale one.
+  let checkpointed = false
+  if (deps.engine !== null) {
+    try {
+      await deps.engine.checkpoint()
+      checkpointed = true
+    } catch (err) {
+      log(`[updater] pre-install checkpoint failed (WAL replay will recover): ${errorText(err)}`)
+    }
+  }
+  return { idle: true, checkpointed }
+}
+
 export function bootUpdater(deps: BootUpdaterDeps = {}): UpdaterController {
   const log = deps.log ?? console.log
   const now = deps.now ?? Date.now

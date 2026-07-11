@@ -95,6 +95,7 @@ Everything the runner sends rides your Claude account's usage and quota; the app
 
 - Auto-update is wired via `electron-updater` (GitHub releases feed). An update never risks your memory: the graph store carries a schema version, and **the whole graph directory is backed up before any migration runs** (`backups/<stamp>-pre-migration-v<N>/`). The app refuses to open a store *newer* than itself, and `appdata.db` is snapshotted before its own schema upgrades too.
 - A weekly export job (Sunday 03:30) dumps the full graph to Neo4j-compatible CSV + Cypher under `exports/` — your memory is never trapped in the engine.
+- **Interrupted writes.** A single change to your memory can touch several records, and the graph store commits each step as it goes — so a crash, a force-quit, or an update landing mid-write could leave a change half-applied. To make that safe, every change is *journaled before it lands*: the app records how to undo it first, then writes. If the app is killed or updated in the middle of a write, the next launch rolls the half-finished change back to a clean state and tells you on the dashboard (an "interrupted write" note) — you never end up with a partly-written memory. Updates cooperate with this: an in-app "Restart to update" waits for any write in progress to finish (and if one is still running, it defers the install to the next time you close the app) rather than cutting a write off.
 
 ## Known limitations (v0.1.0)
 

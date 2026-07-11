@@ -33,6 +33,7 @@ import { EMBEDDING_DIM, GRAPH_CHECKPOINT_INTERVAL_MS } from '../config'
 import type {
   CypherParams,
   EdgeProps,
+  LaneJournal,
   NodeProps,
   NodeRef,
   Row,
@@ -357,6 +358,12 @@ export class RyuGraphEngine implements StorageEngine {
   private periodicCheckpointCount = 0
   /** In-flight vector-index rebuilds, per label (searches await these). */
   private readonly vectorRebuilds = new Map<RetrievableLabel, Promise<void>>()
+  /**
+   * Optional crash-safety journal wired at boot (setLaneJournal) to the lane_jobs
+   * appdata table. Undefined until then — and in tests — so the lane behaves
+   * byte-identically without it.
+   */
+  private journal: LaneJournal | undefined
   /** Backup taken by this open (null when none was needed). */
   readonly backupCreated: string | null
   /**
@@ -677,7 +684,7 @@ export class RyuGraphEngine implements StorageEngine {
     if (MUTATING_STATEMENT.test(query)) {
       // §21 rule 1: mutations ride the lane, whoever wrote the query.
       this.dirtySinceCheckpoint = true
-      return this.lane.enqueue('cypher', () => this.run(this.writeConn, query, params))
+      return this.laneJob('cypher', () => this.run(this.writeConn, query, params))
     }
     return this.run(this.readConn, query, params)
   }
@@ -725,37 +732,64 @@ export class RyuGraphEngine implements StorageEngine {
     }
   }
 
+  /**
+   * Wire (or clear) the crash-safety lane-job journal. Wired at boot to the
+   * lane_jobs appdata table AFTER both stores open; a re-open (reconnect) rewires
+   * the fresh engine. Never called ⇒ laneJob is a transparent pass-through.
+   */
+  setLaneJournal(journal: LaneJournal | null): void {
+    this.journal = journal ?? undefined
+  }
+
+  /**
+   * Enqueue a write lane job, bracketing it with the crash-safety journal when
+   * one is wired: record the job before it runs, delete its record when it settles
+   * (success OR error) in the finally — so only a process crash mid-job leaves a
+   * lane_jobs row for the boot sweep. Identical to a bare lane.enqueue when no
+   * journal is set (same label, same ordering).
+   */
+  private laneJob<T>(label: string, job: () => Promise<T>): Promise<T> {
+    return this.lane.enqueue(label, async () => {
+      const jobId = this.journal?.jobStarted(label) ?? null
+      try {
+        return await job()
+      } finally {
+        if (jobId !== null) this.journal?.jobFinished(jobId)
+      }
+    })
+  }
+
   // ── StorageEngine: writes (lane-serialized) ────────────────────────────────
 
   async upsertNode(label: NodeLabel, props: NodeProps): Promise<UpsertResult> {
     this.assertOpen()
     const id = this.validateNodeProps(label, props)
     this.dirtySinceCheckpoint = true
-    return this.lane.enqueue(`upsertNode:${label}`, () => this.upsertNodeInLane(label, id, props))
+    return this.laneJob(`upsertNode:${label}`, () => this.upsertNodeInLane(label, id, props))
   }
 
   async createEdge(type: EdgeType, from: NodeRef, to: NodeRef, props?: EdgeProps): Promise<void> {
     this.assertOpen()
     this.validateEdge(type, from, to, props)
     this.dirtySinceCheckpoint = true
-    return this.lane.enqueue(`createEdge:${type}`, () => this.createEdgeInLane(type, from, to, props))
+    return this.laneJob(`createEdge:${type}`, () => this.createEdgeInLane(type, from, to, props))
   }
 
   async deleteNode(label: NodeLabel, id: string): Promise<void> {
     this.assertOpen()
     this.validateDeleteNode(label, id)
     this.dirtySinceCheckpoint = true
-    return this.lane.enqueue(`deleteNode:${label}`, () => this.deleteNodeInLane(label, id))
+    return this.laneJob(`deleteNode:${label}`, () => this.deleteNodeInLane(label, id))
   }
 
   async deleteEdge(type: EdgeType, from: NodeRef, to: NodeRef): Promise<void> {
     this.assertOpen()
     this.validateEdge(type, from, to)
     this.dirtySinceCheckpoint = true
-    return this.lane.enqueue(`deleteEdge:${type}`, () => this.deleteEdgeInLane(type, from, to))
+    return this.laneJob(`deleteEdge:${type}`, () => this.deleteEdgeInLane(type, from, to))
   }
 
-  async withWrite<T>(fn: (tx: WriteTx) => Promise<T>): Promise<T> {
+  async withWrite<T>(fn: (tx: WriteTx) => Promise<T>, label = 'withWrite'): Promise<T> {
     this.assertOpen()
     this.dirtySinceCheckpoint = true
     const tx: WriteTx = {
@@ -780,12 +814,17 @@ export class RyuGraphEngine implements StorageEngine {
         return this.deleteEdgeInLane(type, from, to)
       }
     }
-    return this.lane.enqueue('withWrite', () => fn(tx))
+    return this.laneJob(label, () => fn(tx))
   }
 
   async checkpoint(): Promise<void> {
     this.assertOpen()
     await this.lane.enqueue('checkpoint', () => this.run(this.writeConn, 'CHECKPOINT'))
+  }
+
+  /** True when the write lane has no pending or running job (see StorageEngine). */
+  laneIdle(): boolean {
+    return this.lane.idle
   }
 
   async close(options?: { skipDatabaseClose?: boolean }): Promise<void> {

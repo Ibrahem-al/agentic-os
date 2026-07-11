@@ -41,7 +41,7 @@ import type {
   WatchedFolderDto
 } from '../shared/ipc'
 import { IPC_EVENT_INGEST_PROGRESS, IPC_EVENT_OLLAMA_PULL, IPC_INVOKE_PREFIX } from '../shared/ipc'
-import type { UpdaterController } from './updater'
+import { quiesceForInstall, type UpdaterController } from './updater'
 import { BACKUP_INTERVAL_HOURS_CHOICES, CLOUD_PROVIDERS, WATCHED_FOLDERS_CONFIG_FILENAME, type CloudProvider } from './config'
 import {
   exportData,
@@ -966,15 +966,39 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     state: 'disabled',
     detail: 'auto-update runs only in the installed (packaged) app'
   }
+  // Plain copy surfaced in Settings when an install is deferred because a write
+  // was still in flight after the quiesce bound (§21.9 G5+G6).
+  const UPDATER_INSTALL_DEFERRED_DETAIL = 'The app is finishing a write — the update will install when you next close it.'
 
   register('updater.status', () => deps.updater?.status() ?? disabledUpdaterStatus)
 
   register('updater.check', () => deps.updater?.check() ?? disabledUpdaterStatus)
 
-  register('updater.install', () => {
+  register('updater.install', async () => {
     const updater = deps.updater
     if (updater === null || updater === undefined) return disabledUpdaterStatus
-    // The user already confirmed the restart in the UI; this quits + installs.
+    // Only a genuinely downloaded update installs; anything else, quitAndInstall
+    // is a documented no-op, so there's nothing to quiesce for.
+    if (updater.status().state !== 'downloaded') {
+      updater.quitAndInstall()
+      return updater.status()
+    }
+    // §21.9 (G5+G6): quitAndInstall bypasses will-quit's bounded drain and
+    // relaunches into the new binary (which migrates storage at first boot). So
+    // drain HERE first — wait (bounded) for the durable queue's running task to
+    // finish AND the write lane to go idle, then checkpoint so the new version
+    // never boots off a stale graph. The user already confirmed the restart.
+    const { idle } = await quiesceForInstall({
+      engine: deps.engine,
+      queue: deps.triggers?.queue ?? null,
+      log: (line) => console.log(line)
+    })
+    if (!idle) {
+      // Busy after the bound — DON'T interrupt the in-flight write. The downloaded
+      // update still applies on the next ordinary quit (autoInstallOnAppQuit).
+      console.log('[updater] install deferred — deferring to autoInstallOnAppQuit on the next quit')
+      return { ...updater.status(), installDeferred: true, detail: UPDATER_INSTALL_DEFERRED_DETAIL }
+    }
     updater.quitAndInstall()
     return updater.status()
   })

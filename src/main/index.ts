@@ -102,6 +102,7 @@ import {
 import { registerIpcHandlers, unregisterIpcHandlers } from './ipc'
 import { bootUpdater, type UpdaterController } from './updater'
 import { computeBootDiagnostics } from './bootDiagnostics'
+import { createLaneJournal, runCrashSweep, runStagedApprovedSweep } from './crashSweep'
 
 // Native modules are CJS; load them through require so the bundler leaves them
 // external and Electron resolves them from node_modules at runtime.
@@ -209,6 +210,14 @@ function recordBootError(subsystem: string, err: unknown): void {
 }
 
 /**
+ * Runtime boot diagnostics that are NOT a pure fold of subsystem state — the
+ * crash sweep's rollback/interrupted-write findings (crashSweep.ts). Replaced
+ * (not appended) on every bootStorage so a reconnect re-run never duplicates
+ * them; currentBootDiagnostics() concatenates them after the pure fold.
+ */
+let crashSweepDiagnostics: BootDiagnosticDto[] = []
+
+/**
  * Snapshot the module singletons + captured boot errors and fold them into the
  * per-subsystem diagnostics the dashboard shows (the pure fold lives in
  * bootDiagnostics.ts so it is unit-testable). Called once at bootIpc (the last
@@ -216,18 +225,21 @@ function recordBootError(subsystem: string, err: unknown): void {
  * `subsystems`.
  */
 function currentBootDiagnostics(): BootDiagnosticDto[] {
-  return computeBootDiagnostics({
-    errors: bootErrors,
-    engineOpen: engine !== null,
-    appDataOpen: appData !== null,
-    walQuarantined: engine?.walQuarantined ?? null,
-    modelsOpen: ollama !== null,
-    kernelOpen: kernelInstances !== null,
-    mcpOpen: mcpServer !== null,
-    mcpUrl: mcpServer?.url ?? null,
-    agentsOpen: extractionAgent !== null,
-    triggersOpen: triggerInstances !== null
-  })
+  return [
+    ...computeBootDiagnostics({
+      errors: bootErrors,
+      engineOpen: engine !== null,
+      appDataOpen: appData !== null,
+      walQuarantined: engine?.walQuarantined ?? null,
+      modelsOpen: ollama !== null,
+      kernelOpen: kernelInstances !== null,
+      mcpOpen: mcpServer !== null,
+      mcpUrl: mcpServer?.url ?? null,
+      agentsOpen: extractionAgent !== null,
+      triggersOpen: triggerInstances !== null
+    }),
+    ...crashSweepDiagnostics
+  ]
 }
 
 /** Which boot stages produced live singletons right now (app.status shape). */
@@ -469,6 +481,40 @@ async function bootStorage(): Promise<void> {
     })
   } catch (err) {
     console.warn('[storage] data-manifest write failed (ignored)', err)
+  }
+
+  // Crash-safety (§21.9): wire the engine's lane-job journal to the lane_jobs
+  // table, then run the boot sweep — roll back any write the last shutdown left
+  // partially applied (the write lane is exclusive, not transactional) and flag
+  // interrupted non-audited jobs. Done HERE (after both stores open, before every
+  // subsystem boots) so no new write races the sweep; the AuditLog it needs is a
+  // throwaway over the same db+engine (bootKernel builds the durable one). A
+  // reconnect re-runs this over the fresh engine. Fully fail-safe: a sweep hiccup
+  // never takes boot down and the underlying writes stay durable regardless.
+  engine.setLaneJournal(createLaneJournal(appData.db))
+  try {
+    // ONE throwaway AuditLog over this db+engine feeds both sweeps (bootKernel
+    // builds the durable one later). Both are fail-safe and self-clearing.
+    const sweepAudit = new AuditLog({ db: appData.db, backupsDir: paths.backupsDir, engine })
+    const sweep = await runCrashSweep({ db: appData.db, audit: sweepAudit })
+    // Staged-approved sweep (§21.9 Stage B): re-drive embedder-free approved rows
+    // the last shutdown left mid-commit; leave embedder-needed ones for Approvals.
+    // Runs HERE (before every subsystem) so the re-driven commit lands before any
+    // new work; a stuck row needing the embedder just surfaces as a boot warn.
+    const approvedSweep = await runStagedApprovedSweep({ db: appData.db, engine, audit: sweepAudit })
+    crashSweepDiagnostics = [...sweep.diagnostics, ...approvedSweep.diagnostics]
+    if (sweep.rolledBack + sweep.rollbackFailed + sweep.nonAuditedFlagged + sweep.auditedCleared > 0) {
+      console.warn(
+        `[storage] crash sweep — ${sweep.rolledBack} interrupted write(s) rolled back, ${sweep.rollbackFailed} rollback failure(s), ${sweep.nonAuditedFlagged} non-audited job(s) flagged, ${sweep.auditedCleared} audited lane row(s) cleared`
+      )
+    }
+    if (approvedSweep.reCommitted + approvedSweep.reCommitFailed + approvedSweep.embedderDeferred > 0) {
+      console.warn(
+        `[storage] staged-approved sweep — ${approvedSweep.reCommitted} approved change(s) re-committed, ${approvedSweep.reCommitFailed} re-commit failure(s), ${approvedSweep.embedderDeferred} left for Approvals (needs the embedder)`
+      )
+    }
+  } catch (err) {
+    console.error('[storage] crash sweep failed (ignored — writes remain durable)', err)
   }
 }
 
@@ -1256,6 +1302,19 @@ void app.whenReady().then(async () => {
 // Quit path: checkpoint + close connections, but keep the Database handle —
 // ryugraph 25.9.1 segfaults during native teardown after Database.close(),
 // which would turn every clean exit into a crash. WAL replay covers the rest.
+//
+// Updater interaction (§21.9): this drain-then-app.exit(0) sequence runs for
+// EVERY quit, including an update install. Two install paths reach here:
+//  - explicit `updater.install` (Settings "Restart to update"): the IPC handler
+//    quiesces the stores FIRST (quiesceForInstall — drain queue+lane, checkpoint),
+//    THEN calls electron-updater quitAndInstall(), which spawns the NSIS installer
+//    as a DETACHED child before quitting; so this handler's app.exit(0) tears down
+//    the current process while the already-launched installer waits for exit and
+//    applies the update. app.exit(0) does not cancel it (separate process).
+//  - autoInstallOnAppQuit (background / the deferred-busy path): a downloaded
+//    update installs on the NEXT ordinary quit; electron-updater's own quit hook
+//    launches the installer during this same teardown. The pre-migration backup +
+//    first-boot migration are proven end-to-end by scripts/smoke/packaged-smoke.mjs.
 let quitting = false
 app.on('will-quit', (event) => {
   if (quitting) return
@@ -1300,11 +1359,24 @@ app.on('will-quit', (event) => {
       providerRouter = null
       kernelInstances = null
       securityInstances = null
-      appData?.close()
-      appData = null
-      const closing = engine
+      // ORDER MATTERS (audit finding): engine.close() DRAINS the write lane
+      // (lane.onIdle) and checkpoints — and draining lane jobs still write to
+      // appdata.db (the audit 'pending'→ok/error finalize + the lane-job journal's
+      // jobFinished deletes). Closing appdata.db first would make a draining job
+      // hit a CLOSED SQLite handle, losing the SQLite-side record of that write.
+      // So drain the engine FIRST, then close appdata.db. (The graph handle itself
+      // is leaked — skipDatabaseClose — because ryugraph 25.9.1 segfaults on
+      // native teardown; the checkpoint above makes the on-disk state clean.)
+      const closingEngine = engine
       engine = null
-      return closing?.close({ skipDatabaseClose: true }).catch((err) => console.error('[storage] close failed', err))
+      const closingAppData = appData
+      appData = null
+      return (
+        closingEngine?.close({ skipDatabaseClose: true }).catch((err) => console.error('[storage] close failed', err)) ??
+        Promise.resolve()
+      ).finally(() => {
+        closingAppData?.close()
+      })
     })
     .finally(() => app.exit(0))
 })

@@ -356,6 +356,9 @@ function StagedWriteModal({
         </Button>
       </>
     ) : row.status === 'approved' ? (
+      // An 'approved' row was decided but hasn't finished committing (a crash
+      // between the audited commit and the status flip, or an earlier commit
+      // error). Approve is re-drivable, so the same button finishes it.
       <Button
         variant="primary"
         testId="staged-approve"
@@ -363,7 +366,7 @@ function StagedWriteModal({
         {...(blocked ? { title: OLLAMA_BLOCKED_TITLE } : {})}
         onClick={() => void approve()}
       >
-        Try saving again
+        Finish committing
       </Button>
     ) : undefined
 
@@ -376,6 +379,16 @@ function StagedWriteModal({
         </div>
         <Badge status={row.status} title={plain.explain} />
       </div>
+
+      {row.status === 'approved' && (
+        <div
+          role="note"
+          data-testid="staged-approved-hint"
+          className="mb-3 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-5"
+        >
+          This change was approved but hasn’t finished saving yet. Use “Finish committing” below to complete it.
+        </div>
+      )}
 
       {summary.why !== undefined && (
         <div className="mb-3">

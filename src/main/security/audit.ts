@@ -153,10 +153,18 @@ export class AuditLog implements AuditHook {
   /**
    * Run a whole-mutation job through the single write lane (§21 rule 1),
    * recording inverse ops for every structured operation. Returns the job's
-   * result plus the audit action id. If the job throws mid-way, the ops
-   * already committed (lane jobs are exclusive, not transactional) are logged
-   * with outcome 'error' and their inverses — so a partial write can still be
-   * rolled back from the dashboard.
+   * result plus the audit action id.
+   *
+   * Crash-journaled (§21.9): the lane is exclusive, NOT transactional — each
+   * statement auto-commits, so a crash mid-job leaves a durable PARTIAL write.
+   * To make that recoverable, the audit row is written 'pending' with empty
+   * inverses BEFORE the lane job starts, and its inverse_json is re-persisted
+   * (newest-first, roll-back-ready) after every recorded op and BEFORE the
+   * matching forward mutation runs. So a row still 'pending' at the next boot is
+   * a write the process died mid-way, and its inverse_json rolls back exactly the
+   * committed prefix (crashSweep.ts). On success the row flips to 'ok'; a caught
+   * error keeps today's 'error' semantics (outcome 'error' + the inverses so far,
+   * so a partial write can still be rolled back from the dashboard).
    */
   async graphWrite<T>(
     agentId: string,
@@ -168,19 +176,28 @@ export class AuditLog implements AuditHook {
     const inverse: GraphInverseOp[] = []
     let rawMutations = 0
 
-    const finish = (outcome: 'ok' | 'error', error?: string): void => {
-      this.insertRow({
-        id: actionId,
-        agentId,
-        kind: 'graph-write',
-        description,
-        reversible: rawMutations === 0,
-        inverse: [...inverse].reverse(), // undo applies newest-first
-        backupDir: null,
-        outcome,
-        error: error ?? null,
-        details: { ops: inverse.length, rawMutations }
-      })
+    // Write-intent journal: the 'pending' row lands BEFORE the lane job runs.
+    this.insertPendingGraphWrite(actionId, agentId, description)
+    // Keep the crash-recovery inverse current after every recorded op (sync
+    // better-sqlite3 update — fine at this op volume). newest-first == undo order.
+    const persistInverse = (): void => {
+      this.db
+        .prepare('UPDATE audit_log SET inverse_json = ? WHERE id = ?')
+        .run(JSON.stringify([...inverse].reverse()), actionId)
+    }
+    const finalize = (outcome: 'ok' | 'error', error?: string): void => {
+      this.db
+        .prepare(
+          `UPDATE audit_log SET outcome = ?, reversible = ?, inverse_json = ?, error = ?, details_json = ? WHERE id = ?`
+        )
+        .run(
+          outcome,
+          rawMutations === 0 ? 1 : 0,
+          JSON.stringify([...inverse].reverse()),
+          error ?? null,
+          JSON.stringify({ ops: inverse.length, rawMutations }),
+          actionId
+        )
     }
 
     try {
@@ -189,13 +206,15 @@ export class AuditLog implements AuditHook {
           cypher: async (query, params) => {
             if (isMutatingCypher(query)) {
               // No generic inverse for arbitrary Cypher — the ACTION becomes
-              // un-undoable rather than silently half-reversible (§13).
+              // un-undoable rather than silently half-reversible (§13). Nothing
+              // to persist (there is no inverse to record).
               rawMutations += 1
             }
             return tx.cypher(query, params)
           },
           upsertNode: async (label, props) => {
             inverse.push(await preImageOf(tx, label, props))
+            persistInverse() // record the undo BEFORE the forward write
             return tx.upsertNode(label, props)
           },
           createEdge: async (type, from, to, props?: EdgeProps) => {
@@ -203,6 +222,7 @@ export class AuditLog implements AuditHook {
             // MERGE on an existing edge only restamps updated_at — nothing to
             // invert; a newly created edge is deleted on undo.
             if (!exists) inverse.push({ op: 'delete-edge', type, from, to })
+            persistInverse()
             return tx.createEdge(type, from, to, props)
           },
           deleteNode: async (label, id) => {
@@ -211,29 +231,31 @@ export class AuditLog implements AuditHook {
             // can rebuild the node and reconnect it. Ordering matters — the
             // node restore must apply BEFORE its edge restores (createEdge needs
             // both endpoints to exist). undo replays newest-pushed-first (the
-            // whole inverse array is reversed at finish), so push the incident
-            // edges FIRST and the node restore LAST: after the reversal the
-            // node is restored first, then its edges. A missing node → nothing
-            // captured, nothing to delete.
+            // whole inverse array is reversed at persist/finalize), so push the
+            // incident edges FIRST and the node restore LAST: after the reversal
+            // the node is restored first, then its edges. A missing node →
+            // nothing captured, nothing to delete.
             const node = await nodePreImageForDelete(tx, label, id)
             if (node !== null) {
               inverse.push(...(await incidentEdgesOf(tx, label, id)))
               inverse.push(node)
             }
+            persistInverse()
             return tx.deleteNode(label, id)
           },
           deleteEdge: async (type, from, to) => {
             const op = await edgePreImageForDelete(tx, type, from, to)
             if (op !== null) inverse.push(op)
+            persistInverse()
             return tx.deleteEdge(type, from, to)
           }
         }
         return fn(recording)
-      })
-      finish('ok')
+      }, `graph-write:${actionId}`)
+      finalize('ok')
       return { result, actionId, reversible: rawMutations === 0 }
     } catch (err) {
-      finish('error', err instanceof Error ? err.message : String(err))
+      finalize('error', err instanceof Error ? err.message : String(err))
       throw err
     }
   }
@@ -323,7 +345,30 @@ export class AuditLog implements AuditHook {
       .run(undoId, actionId)
   }
 
+  /**
+   * Boot-sweep entry (crashSweep.ts): a graph-write row still 'pending' at boot
+   * means the process died mid-write. Apply its accumulated inverses to ROLL BACK
+   * the committed prefix (the ops are idempotent — delete-node on an absent node
+   * no-ops, restore-node upserts), then flip the row to 'error' with a suffix so
+   * it reads as a settled, non-undoable action in the log. Throws if the rollback
+   * lane job fails — the sweep then leaves the row and surfaces an error.
+   */
+  async rollbackInterruptedWrite(actionId: string): Promise<void> {
+    await this.applyInverseOps(actionId, `interrupted-rollback:${actionId}`)
+    this.db
+      .prepare(
+        `UPDATE audit_log SET outcome = 'error', error = ?,
+         description = description || ' (rolled back after interrupted write)' WHERE id = ?`
+      )
+      .run('write interrupted by a crash/shutdown; the committed prefix was rolled back at boot', actionId)
+  }
+
   private async undoGraph(actionId: string): Promise<void> {
+    await this.applyInverseOps(actionId, `undo:${actionId}`)
+  }
+
+  /** Apply a row's recorded inverse ops in ONE lane job (§21 rule 1), newest-first. */
+  private async applyInverseOps(actionId: string, label: string): Promise<void> {
     const engine = this.requireEngine()
     const raw = this.db.prepare('SELECT inverse_json FROM audit_log WHERE id = ?').get(actionId) as
       | { inverse_json: string | null }
@@ -384,7 +429,7 @@ export class AuditLog implements AuditHook {
           await tx.createEdge(type, from, to, op.props)
         }
       }
-    })
+    }, label)
   }
 
   private undoFile(row: AuditActionRow): void {
@@ -413,7 +458,13 @@ export class AuditLog implements AuditHook {
   }
 
   listActions(filter?: { kind?: AuditActionRow['kind']; agentId?: string }): AuditActionRow[] {
-    const clauses: string[] = []
+    // 'pending' rows are a transient internal state (a graph write in flight, or
+    // one a crash left mid-write until the boot sweep settles it to 'error') — an
+    // in-flight, un-undoable, not-yet-real action. They are filtered OUT of the
+    // normal history view so the dashboard only ever sees settled ok/error rows
+    // (AuditActionRow.outcome stays 'ok'|'error'); the boot sweep reads pending
+    // rows directly by outcome (crashSweep.ts).
+    const clauses: string[] = [`outcome != 'pending'`]
     const params: unknown[] = []
     if (filter?.kind !== undefined) {
       clauses.push('kind = ?')
@@ -423,8 +474,9 @@ export class AuditLog implements AuditHook {
       clauses.push('agent_id = ?')
       params.push(filter.agentId)
     }
-    const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : ''
-    const rows = this.db.prepare(`SELECT * FROM audit_log${where} ORDER BY created_at, id`).all(...params) as RawRow[]
+    const rows = this.db
+      .prepare(`SELECT * FROM audit_log WHERE ${clauses.join(' AND ')} ORDER BY created_at, id`)
+      .all(...params) as RawRow[]
     return rows.map(decodeRow)
   }
 
@@ -441,6 +493,21 @@ export class AuditLog implements AuditHook {
     const dir = join(this.backupsDir, 'audit', actionId)
     mkdirSync(dir, { recursive: true })
     return dir
+  }
+
+  /**
+   * The write-intent journal row for graphWrite: a 'pending' graph-write with
+   * empty inverses, inserted BEFORE the lane job runs. graphWrite then keeps its
+   * inverse_json current per op and finalizes it to ok/error; a row still
+   * 'pending' at the next boot is a crash-interrupted write (crashSweep.ts).
+   */
+  private insertPendingGraphWrite(actionId: string, agentId: string, description: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO audit_log (id, agent_id, kind, description, reversible, inverse_json, backup_dir, outcome, error, details_json)
+         VALUES (?, ?, 'graph-write', ?, 0, NULL, NULL, 'pending', NULL, ?)`
+      )
+      .run(actionId, agentId, description, JSON.stringify({ ops: 0, rawMutations: 0 }))
   }
 
   private insertFileRow(

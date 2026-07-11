@@ -484,12 +484,21 @@ export default function SettingsPanel(): React.JSX.Element {
   }
 
   /**
-   * Confirmed restart-to-install. On success the app quits and relaunches to
-   * apply the update, so this panel never re-renders; only a failure surfaces.
+   * Confirmed restart-to-install. On the normal path the app quits + relaunches
+   * to apply the update, so this panel never re-renders. But the install can be
+   * DEFERRED (§21.9 quiesce: a write was still in flight) — then it returns
+   * installDeferred and the app keeps running, so fold that snapshot back in and
+   * tell the user (the update still applies on the next quit).
    */
   const installUpdate = async (): Promise<void> => {
     try {
-      await call('updater.install', undefined)
+      const status = await call('updater.install', undefined)
+      if (status.installDeferred === true) {
+        setUpdater(status)
+        setConfirmRestart(false)
+        toast.notify('ok', status.detail ?? 'The update will install when you next close the app.')
+      }
+      // Otherwise the app is quitting to install — no state change needed here.
     } catch (err) {
       setConfirmRestart(false)
       toast.notify('err', errMessage(err))
@@ -991,6 +1000,18 @@ export default function SettingsPanel(): React.JSX.Element {
               <p className="text-[12px] text-ink-mute" role="status">
                 Version{updater?.version !== undefined ? ` v${updater.version}` : ''} is downloaded and ready to
                 install.
+              </p>
+            )}
+
+            {/* Install deferred (§21.9 quiesce): a write was in flight, so we did
+                not interrupt it — the update applies on the next quit. */}
+            {updState === 'downloaded' && updater?.installDeferred === true && (
+              <p
+                className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-5"
+                role="status"
+                data-testid="updater-deferred"
+              >
+                {updater.detail ?? 'The app is finishing a write — the update will install when you next close it.'}
               </p>
             )}
 

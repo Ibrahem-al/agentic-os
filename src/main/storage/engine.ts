@@ -66,6 +66,21 @@ export interface TextHit {
   readonly score: number
 }
 
+/**
+ * Optional crash-safety journal the engine calls around every write lane job
+ * (withWrite + the internal write methods; NOT checkpoints or migrations).
+ * `jobStarted` records the job before it runs and returns the journal row id (or
+ * null when the insert failed — journaling must never break a write); the engine
+ * calls `jobFinished(id)` when the job settles (success OR error), which DELETES
+ * the row, so only a process crash mid-job leaves a row behind for the boot sweep.
+ * Absent (tests, and every moment before boot wires it) ⇒ the engine behaves
+ * byte-identically to before (same lane labels, same ordering).
+ */
+export interface LaneJournal {
+  jobStarted(label: string): number | null
+  jobFinished(id: number): void
+}
+
 /** Mutation surface handed to a withWrite job; runs inside the lane reservation. */
 export interface WriteTx {
   cypher(query: string, params?: CypherParams): Promise<Row[]>
@@ -136,11 +151,26 @@ export interface StorageEngine {
   /** Keyword search over a retrievable label's FTS index (direct read). */
   textSearch(label: RetrievableLabel, query: string, k: number): Promise<TextHit[]>
 
-  /** Reserve the write lane for a multi-statement mutation job. */
-  withWrite<T>(fn: (tx: WriteTx) => Promise<T>): Promise<T>
+  /**
+   * Reserve the write lane for a multi-statement mutation job. `label` names the
+   * lane job (default 'withWrite') — the audit log passes `graph-write:<actionId>`
+   * so the crash sweep can tie a stranded lane-job-journal row back to its audit
+   * action (an audited write is reconciled from its 'pending' audit row, not
+   * re-flagged as a non-audited interrupted job).
+   */
+  withWrite<T>(fn: (tx: WriteTx) => Promise<T>, label?: string): Promise<T>
 
   /** Force a storage checkpoint (WAL compaction); lane-serialized. */
   checkpoint(): Promise<void>
+
+  /**
+   * True when the write lane has no pending or running job (all enqueued jobs
+   * have settled). A point-in-time read for the updater quiesce guard (§21.9):
+   * it drains the lane before an in-app update install so the new binary never
+   * boots off a half-applied write. A fresh job may enqueue right after — the
+   * caller polls this, then acts under the boot/quit safety net.
+   */
+  laneIdle(): boolean
 
   /**
    * Close connections (and by default the database handle). The app's quit

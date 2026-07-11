@@ -145,6 +145,11 @@ const APPDATA_SCHEMA: readonly string[] = [
   // reversible delta — graph inverse ops in inverse_json, file pre-images in
   // backups/<id>/ — plus the kernel's mediated-action trail (kind 'action',
   // not reversible: those rows are observations, not state changes).
+  // outcome 'pending' (v8): a crash-journaled graph write is inserted 'pending'
+  // BEFORE its lane job runs and flipped to ok/error after (security/audit.ts) —
+  // a 'pending' row surviving a restart is a write the process died mid-way and
+  // the boot sweep rolls back (crashSweep.ts). An EXISTING store's audit_log was
+  // created with the two-value CHECK; migrateAuditLogOutcomeCheck() rebuilds it.
   `CREATE TABLE IF NOT EXISTS audit_log (
     id TEXT PRIMARY KEY,
     agent_id TEXT NOT NULL,
@@ -154,7 +159,7 @@ const APPDATA_SCHEMA: readonly string[] = [
     reversible INTEGER NOT NULL DEFAULT 0,
     inverse_json TEXT,
     backup_dir TEXT,
-    outcome TEXT NOT NULL DEFAULT 'ok' CHECK (outcome IN ('ok','error')),
+    outcome TEXT NOT NULL DEFAULT 'ok' CHECK (outcome IN ('ok','error','pending')),
     error TEXT,
     details_json TEXT,
     undone_at TEXT,
@@ -163,6 +168,19 @@ const APPDATA_SCHEMA: readonly string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_audit_log_agent ON audit_log(agent_id)`,
   `CREATE INDEX IF NOT EXISTS idx_audit_log_kind ON audit_log(kind)`,
+  // Lane-job journal (v8, crash-safety): the storage engine inserts one row per
+  // write lane job (jobStarted) and DELETES it on clean finish (jobFinished), so
+  // any row present at boot is a lane job the process died mid-execution. The boot
+  // sweep flags a non-audited interrupted job (raw ingest withWrite) from these —
+  // audited writes are reconciled from their 'pending' audit_log row instead. Tiny
+  // and self-pruning (~empty in steady state). finished_at is retained for schema
+  // fidelity but stays NULL in practice (a finished job's row is deleted).
+  `CREATE TABLE IF NOT EXISTS lane_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT,
+    started_at TEXT,
+    finished_at TEXT
+  )`,
   // Injection-scan findings (§13 detection layer, phase 09): documents whose
   // ingest scan flagged embedded instructions. The content still ingests as
   // inert data (§21 rule 5) — these rows exist for the dashboard review
@@ -258,7 +276,7 @@ const APPDATA_SCHEMA: readonly string[] = [
  * Current SQLite schema version. Exported so the boot-time data manifest can
  * record which schema the on-disk store carries (docs/DATA-MIGRATION.md).
  */
-export const APPDATA_USER_VERSION = 7
+export const APPDATA_USER_VERSION = 8
 
 /**
  * Column additions to tables that predate them (CREATE IF NOT EXISTS skips an
@@ -279,6 +297,51 @@ const APPDATA_COLUMN_ADDITIONS: readonly { table: string; column: string; ddl: s
   { table: 'tasks', column: 'waiting_approval_id', ddl: 'ALTER TABLE tasks ADD COLUMN waiting_approval_id TEXT' },
   { table: 'mcp_calls', column: 'session_kind', ddl: 'ALTER TABLE mcp_calls ADD COLUMN session_kind TEXT' }
 ]
+
+/**
+ * v8 (this build): audit_log.outcome gains 'pending' as a legal value. SQLite
+ * cannot ALTER a column CHECK, so an EXISTING store's audit_log (created with the
+ * v4 two-value CHECK) is rebuilt in place — copy every row into a table carrying
+ * the widened CHECK, swap, recreate the indexes — inside one transaction so a
+ * crash mid-rebuild rolls back to the original table (the pre-upgrade snapshot in
+ * openAppData is the outer safety net). Guarded + idempotent: it runs only when
+ * the on-disk CHECK still lacks 'pending' (a fresh install already carries it from
+ * APPDATA_SCHEMA, so this is a no-op there). audit_log has no incoming foreign
+ * keys, so the DROP+RENAME is safe with foreign_keys ON.
+ */
+function migrateAuditLogOutcomeCheck(db: BetterSqlite3.Database): void {
+  const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit_log'`).get() as
+    | { sql: string }
+    | undefined
+  if (row === undefined) return // fresh install — the schema loop already created it with 'pending'
+  if (/'pending'/.test(row.sql)) return // already widened (fresh v8, or a prior upgrade)
+  db.transaction(() => {
+    db.exec(`CREATE TABLE audit_log_v8 (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      kind TEXT NOT NULL
+        CHECK (kind IN ('action','graph-write','file-write','file-delete','undo')),
+      description TEXT NOT NULL,
+      reversible INTEGER NOT NULL DEFAULT 0,
+      inverse_json TEXT,
+      backup_dir TEXT,
+      outcome TEXT NOT NULL DEFAULT 'ok' CHECK (outcome IN ('ok','error','pending')),
+      error TEXT,
+      details_json TEXT,
+      undone_at TEXT,
+      undo_action_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    )`)
+    db.exec(`INSERT INTO audit_log_v8
+      (id, agent_id, kind, description, reversible, inverse_json, backup_dir, outcome, error, details_json, undone_at, undo_action_id, created_at)
+      SELECT id, agent_id, kind, description, reversible, inverse_json, backup_dir, outcome, error, details_json, undone_at, undo_action_id, created_at
+      FROM audit_log`)
+    db.exec(`DROP TABLE audit_log`)
+    db.exec(`ALTER TABLE audit_log_v8 RENAME TO audit_log`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_log_agent ON audit_log(agent_id)`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_log_kind ON audit_log(kind)`)
+  })()
+}
 
 /** The binding that loaded successfully in this runtime (cached). */
 let resolvedBinding: string | null | undefined
@@ -432,15 +495,21 @@ export function openAppData(dbPath: string, backupsDir?: string): AppData {
     const columns = db.pragma(`table_info(${addition.table})`) as { name: string }[]
     if (!columns.some((c) => c.name === addition.column)) db.exec(addition.ddl)
   }
+  // v8: widen audit_log.outcome's CHECK to allow 'pending' on stores that predate
+  // it (guarded + idempotent — a no-op on a fresh install). Non-additive, so it
+  // cannot ride the CREATE-IF-NOT-EXISTS / guarded-ADD-COLUMN lists above.
+  migrateAuditLogOutcomeCheck(db)
   if (existingVersion < APPDATA_USER_VERSION) {
-    // Every schema change so far is additive (CREATE IF NOT EXISTS tables +
-    // guarded ADD COLUMNs above), so applying the full list upgrades any older
-    // version in place (v1 → v2: workflow_checkpoint* tables, phase 04;
+    // Every schema change is additive (CREATE IF NOT EXISTS tables + guarded ADD
+    // COLUMNs above) EXCEPT the v8 audit_log CHECK widening (migrateAuditLogOutcomeCheck,
+    // its own guarded/idempotent rebuild), so applying the full list upgrades any
+    // older version in place (v1 → v2: workflow_checkpoint* tables, phase 04;
     // v2 → v3: mcp_calls.args_hash, phase 05; v3 → v4: approvals + audit_log +
     // injection_flags, phase 09; v4 → v5: tasks.priority +
     // tasks.waiting_approval_id, phase 11; v5 → v6: skill_settings +
     // skill_improvements, phase 12; v6 → v7: mcp_calls.session_kind +
-    // runner_runs + runner_submissions, phase 14).
+    // runner_runs + runner_submissions, phase 14; v7 → v8: audit_log.outcome
+    // 'pending' + lane_jobs — the crash-safety write-intent journal).
     db.pragma(`user_version = ${APPDATA_USER_VERSION}`)
   }
   return {

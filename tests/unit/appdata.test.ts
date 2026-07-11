@@ -18,7 +18,8 @@ const TABLES = [
   'skill_settings',
   'skill_improvements',
   'runner_runs',
-  'runner_submissions'
+  'runner_submissions',
+  'lane_jobs'
 ] as const
 
 describe('appdata.db (SQLite side of §20 app data)', () => {
@@ -27,13 +28,13 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('creates the db in WAL mode with all tables and user_version 7', () => {
+  it('creates the db in WAL mode with all tables and user_version 8', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const appData = openAppData(join(dir, 'nested', 'appdata.db'))
     try {
       expect(existsSync(appData.path)).toBe(true)
       expect(appData.db.pragma('journal_mode', { simple: true })).toBe('wal')
-      expect(appData.db.pragma('user_version', { simple: true })).toBe(7)
+      expect(appData.db.pragma('user_version', { simple: true })).toBe(8)
       expect(appData.db.pragma('foreign_keys', { simple: true })).toBe(1)
       const names = appData.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -132,7 +133,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const second = openAppData(dbPath)
     try {
-      expect(second.db.pragma('user_version', { simple: true })).toBe(7)
+      expect(second.db.pragma('user_version', { simple: true })).toBe(8)
       expect((second.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(1)
     } finally {
       second.close()
@@ -183,7 +184,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(7)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(8)
       const names = upgraded.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .all()
@@ -237,7 +238,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(7)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(8)
       // The v6 row survives; the new nullable column reads NULL on it.
       const old = upgraded.db
         .prepare('SELECT tool, args_hash, session_kind FROM mcp_calls WHERE session_id = ?')
@@ -267,12 +268,104 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
       const snapshot = upgraded.backupCreated
       expect(snapshot).not.toBeNull()
       expect(existsSync(snapshot as string)).toBe(true)
-      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v7$/)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v8$/)
       const header = readFileSync(snapshot as string)
       expect(header.subarray(0, 16).toString('latin1')).toBe(`SQLite format 3${String.fromCharCode(0)}`)
       expect(header.readUInt32BE(60)).toBe(6)
     } finally {
       upgraded.close()
+    }
+  })
+
+  it('upgrades a v7 db to v8: audit_log.outcome gains pending (CHECK rebuilt in place) + lane_jobs, snapshot first', () => {
+    dir = mkdtempSync(join(tmpdir(), 'appdata-'))
+    const dbPath = join(dir, 'appdata.db')
+    // Simulate a real phase-09..14 install at v7: audit_log carries the OLD
+    // two-value outcome CHECK and there is no lane_jobs table.
+    const first = openAppData(dbPath)
+    first.db.exec('DROP TABLE lane_jobs')
+    first.db.exec(`DROP TABLE audit_log;
+      CREATE TABLE audit_log (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        kind TEXT NOT NULL
+          CHECK (kind IN ('action','graph-write','file-write','file-delete','undo')),
+        description TEXT NOT NULL,
+        reversible INTEGER NOT NULL DEFAULT 0,
+        inverse_json TEXT,
+        backup_dir TEXT,
+        outcome TEXT NOT NULL DEFAULT 'ok' CHECK (outcome IN ('ok','error')),
+        error TEXT,
+        details_json TEXT,
+        undone_at TEXT,
+        undo_action_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      );
+      CREATE INDEX idx_audit_log_agent ON audit_log(agent_id);
+      CREATE INDEX idx_audit_log_kind ON audit_log(kind)`)
+    first.db
+      .prepare(`INSERT INTO audit_log (id, agent_id, kind, description, reversible, outcome) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run('a-old', 'agent', 'graph-write', 'a settled write', 1, 'ok')
+    // The old CHECK really rejects 'pending'.
+    expect(() =>
+      first.db
+        .prepare(`INSERT INTO audit_log (id, agent_id, kind, description, outcome) VALUES (?, ?, ?, ?, ?)`)
+        .run('a-bad', 'agent', 'graph-write', 'x', 'pending')
+    ).toThrow(/CHECK/)
+    first.db.pragma('user_version = 7')
+    first.close()
+
+    const upgraded = openAppData(dbPath)
+    try {
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(8)
+      // lane_jobs now exists; the pre-existing audit row survived the rebuild.
+      const names = upgraded.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .all()
+        .map((r) => (r as { name: string }).name)
+      expect(names).toEqual([...TABLES].sort())
+      const old = upgraded.db.prepare('SELECT description, outcome FROM audit_log WHERE id = ?').get('a-old') as {
+        description: string
+        outcome: string
+      }
+      expect(old).toEqual({ description: 'a settled write', outcome: 'ok' })
+      // The widened CHECK now accepts 'pending' (and its indexes were recreated).
+      upgraded.db
+        .prepare(`INSERT INTO audit_log (id, agent_id, kind, description, outcome) VALUES (?, ?, ?, ?, ?)`)
+        .run('a-pending', 'agent', 'graph-write', 'in flight', 'pending')
+      expect(
+        (upgraded.db.prepare('SELECT outcome FROM audit_log WHERE id = ?').get('a-pending') as { outcome: string }).outcome
+      ).toBe('pending')
+      const auditIndexes = upgraded.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_audit_log_%' ORDER BY name")
+        .all()
+        .map((r) => (r as { name: string }).name)
+      expect(auditIndexes).toEqual(['idx_audit_log_agent', 'idx_audit_log_kind'])
+      // §21 rule 9: the pre-upgrade snapshot exists and is frozen at v7.
+      const snapshot = upgraded.backupCreated
+      expect(snapshot).not.toBeNull()
+      expect(existsSync(snapshot as string)).toBe(true)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v8$/)
+      expect(readFileSync(snapshot as string).readUInt32BE(60)).toBe(7)
+    } finally {
+      upgraded.close()
+    }
+
+    // Idempotent: a second open touches nothing (no re-rebuild, no new snapshot)
+    // and 'pending' still round-trips.
+    const reopened = openAppData(dbPath)
+    try {
+      expect(reopened.db.pragma('user_version', { simple: true })).toBe(8)
+      expect(reopened.backupCreated).toBeNull()
+      reopened.db
+        .prepare(`INSERT INTO audit_log (id, agent_id, kind, description, outcome) VALUES (?, ?, ?, ?, ?)`)
+        .run('a-pending-2', 'agent', 'graph-write', 'again', 'pending')
+      expect(
+        (reopened.db.prepare('SELECT outcome FROM audit_log WHERE id = ?').get('a-pending-2') as { outcome: string })
+          .outcome
+      ).toBe('pending')
+    } finally {
+      reopened.close()
     }
   })
 
@@ -299,15 +392,15 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     const upgraded = openAppData(dbPath)
     try {
       // Main db really upgraded in place.
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(7)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(8)
       expect(
         upgraded.db.prepare("SELECT count(*) AS c FROM sqlite_master WHERE name = 'skill_settings'").get()
       ).toEqual({ c: 1 })
-      // Snapshot at the derived default location: <db parent>/backups/<stamp>-pre-appdata-v7/appdata.db.
+      // Snapshot at the derived default location: <db parent>/backups/<stamp>-pre-appdata-v8/appdata.db.
       const snapshot = upgraded.backupCreated
       expect(snapshot).not.toBeNull()
       expect(existsSync(snapshot as string)).toBe(true)
-      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v7$/)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v8$/)
       expect(dirname(dirname(snapshot as string))).toBe(join(dir, 'backups'))
       // The snapshot is a valid sqlite db frozen at the OLD version: header
       // magic + user_version (byte 60, big-endian) read straight off disk —
@@ -344,7 +437,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     const elsewhere = join(dir, 'elsewhere')
     const upgraded = openAppData(dbPath, elsewhere)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(7)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(8)
       expect(upgraded.backupCreated).not.toBeNull()
       expect(dirname(dirname(upgraded.backupCreated as string))).toBe(elsewhere)
       expect(existsSync(upgraded.backupCreated as string)).toBe(true)
@@ -367,7 +460,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     snapshotAppDataDb(dbPath, snap)
 
     // The read-only snapshot did not disturb the live source (still v7, 2 rows).
-    expect(live.db.pragma('user_version', { simple: true })).toBe(7)
+    expect(live.db.pragma('user_version', { simple: true })).toBe(8)
     expect((live.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(2)
     live.close()
 
@@ -377,7 +470,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     const reopened = openAppData(snap)
     try {
       expect((reopened.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(2)
-      expect(reopened.db.pragma('user_version', { simple: true })).toBe(7)
+      expect(reopened.db.pragma('user_version', { simple: true })).toBe(8)
     } finally {
       reopened.close()
     }

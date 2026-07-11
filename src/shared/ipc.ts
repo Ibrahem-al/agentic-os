@@ -685,6 +685,14 @@ export interface UpdaterStatusDto {
   readonly error?: string
   /** Why the updater is 'disabled' (dev build / unavailable). */
   readonly detail?: string
+  /**
+   * Set by `updater.install` when the install was DEFERRED because a write was
+   * still in flight after the quiesce bound (§21.9 crash-safety). The state stays
+   * 'downloaded' (additive — the renderer switch is unchanged); the downloaded
+   * update still applies automatically on the next ordinary quit
+   * (autoInstallOnAppQuit). Absent on every other path.
+   */
+  readonly installDeferred?: boolean
 }
 
 // ── triggers & automation (phase 11) ─────────────────────────────────────────

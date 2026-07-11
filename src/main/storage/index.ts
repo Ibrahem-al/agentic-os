@@ -5,6 +5,7 @@
 export type {
   CypherParams,
   EdgeProps,
+  LaneJournal,
   NodeProps,
   NodeRef,
   Row,

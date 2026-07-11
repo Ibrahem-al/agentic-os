@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { bootUpdater, type UpdaterLike } from '../../src/main/updater'
+import { bootUpdater, quiesceForInstall, type UpdaterLike } from '../../src/main/updater'
 import type { UpdaterStatusDto } from '../../src/shared/ipc'
 
 /**
@@ -199,6 +199,15 @@ describe('bootUpdater — controller lifecycle (Settings "Updates")', () => {
     expect(cb).toHaveBeenCalledTimes(1)
   })
 
+  it('DTO additivity: installDeferred is an optional field spread onto a downloaded snapshot', () => {
+    const downloaded: UpdaterStatusDto = { state: 'downloaded', percent: 100, version: '2.0.0' }
+    const deferred: UpdaterStatusDto = { ...downloaded, installDeferred: true, detail: 'finishing a write' }
+    // The existing 'downloaded' snapshot is unchanged when the field is absent…
+    expect(downloaded.installDeferred).toBeUndefined()
+    // …and additive when present (state stays 'downloaded' — the renderer switch is untouched).
+    expect(deferred).toMatchObject({ state: 'downloaded', installDeferred: true, detail: 'finishing a write' })
+  })
+
   it('throttles download-progress notifications to ~4/second (snapshot stays current)', () => {
     const updater = fakeUpdater()
     let clock = 10_000
@@ -221,5 +230,118 @@ describe('bootUpdater — controller lifecycle (Settings "Updates")', () => {
     expect(percents).toEqual([5, 99])
     // Even the throttled ticks updated the snapshot, so status() is current.
     expect(controller.status().percent).toBe(99)
+  })
+})
+
+describe('quiesceForInstall — pre-install drain (§21.9 G5+G6)', () => {
+  /**
+   * A fake storage engine whose lane goes idle after `idleAfter` laneIdle()
+   * probes, counting checkpoint() calls. A manual clock is driven by the fake
+   * sleep (advances by pollMs each poll), so the bounded wait is deterministic.
+   */
+  function fakeEngine(opts: { idleAfter?: number; checkpointRejects?: boolean } = {}): {
+    laneIdle(): boolean
+    checkpoint(): Promise<void>
+    checkpointCalls: number
+  } {
+    const idleAfter = opts.idleAfter ?? 0
+    let probes = 0
+    const engine = {
+      checkpointCalls: 0,
+      laneIdle(): boolean {
+        return probes++ >= idleAfter
+      },
+      async checkpoint(): Promise<void> {
+        engine.checkpointCalls += 1
+        if (opts.checkpointRejects) throw new Error('checkpoint boom')
+      }
+    }
+    return engine
+  }
+
+  function clock() {
+    let t = 0
+    return {
+      now: () => t,
+      sleep: (ms: number) => {
+        t += ms
+        return Promise.resolve()
+      }
+    }
+  }
+
+  it('idle immediately (nothing in flight): checkpoints and reports safe to install', async () => {
+    const engine = fakeEngine({ idleAfter: 0 })
+    const c = clock()
+    const result = await quiesceForInstall({
+      engine,
+      queue: { runningTaskId: null },
+      now: c.now,
+      sleep: c.sleep
+    })
+    expect(result).toEqual({ idle: true, checkpointed: true })
+    expect(engine.checkpointCalls).toBe(1)
+  })
+
+  it('busy then idle: waits for the queue task + lane to drain, then checkpoints', async () => {
+    const engine = fakeEngine({ idleAfter: 3 }) // lane idle only on the 4th probe
+    const c = clock()
+    const result = await quiesceForInstall({
+      engine,
+      queue: { runningTaskId: null },
+      pollMs: 200,
+      timeoutMs: 30_000,
+      now: c.now,
+      sleep: c.sleep
+    })
+    expect(result).toEqual({ idle: true, checkpointed: true })
+    expect(engine.checkpointCalls).toBe(1)
+    expect(c.now()).toBe(600) // three 200ms polls before it drained
+  })
+
+  it('a running queue task keeps it busy: defers after the bound WITHOUT installing or checkpointing', async () => {
+    const engine = fakeEngine({ idleAfter: 0 }) // lane is idle, but the QUEUE is not
+    const c = clock()
+    const result = await quiesceForInstall({
+      engine,
+      queue: { runningTaskId: 'task-in-flight' },
+      pollMs: 200,
+      timeoutMs: 1_000,
+      now: c.now,
+      sleep: c.sleep
+    })
+    expect(result).toEqual({ idle: false, checkpointed: false })
+    // Deferred → the in-flight write is never interrupted and no checkpoint runs.
+    expect(engine.checkpointCalls).toBe(0)
+    expect(c.now()).toBe(1_000)
+  })
+
+  it('a busy write lane also defers even when the queue is idle', async () => {
+    const engine = fakeEngine({ idleAfter: 999 }) // lane never idle within the bound
+    const c = clock()
+    const result = await quiesceForInstall({
+      engine,
+      queue: { runningTaskId: null },
+      pollMs: 200,
+      timeoutMs: 1_000,
+      now: c.now,
+      sleep: c.sleep
+    })
+    expect(result.idle).toBe(false)
+    expect(engine.checkpointCalls).toBe(0)
+  })
+
+  it('a failed checkpoint is best-effort: still idle:true, never throws', async () => {
+    const engine = fakeEngine({ idleAfter: 0, checkpointRejects: true })
+    const log = vi.fn()
+    const result = await quiesceForInstall({ engine, queue: null, log })
+    expect(result).toEqual({ idle: true, checkpointed: false })
+    expect(engine.checkpointCalls).toBe(1)
+    expect(log.mock.calls.some((cc) => String(cc[0]).includes('pre-install checkpoint failed'))).toBe(true)
+  })
+
+  it('no engine wired (storage down): nothing to drain — idle:true, no checkpoint', async () => {
+    const result = await quiesceForInstall({ engine: null, queue: null })
+    expect(result).toEqual({ idle: true, checkpointed: false })
   })
 })
