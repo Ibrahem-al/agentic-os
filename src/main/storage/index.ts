@@ -53,6 +53,12 @@ export {
 } from './migrations'
 export { exportGraph, type ExportResult } from './export'
 export { APPDATA_USER_VERSION, appDataIntegrityOk, openAppData, snapshotAppDataDb, type AppData } from './appdata'
+export {
+  LocalLlmUsageStore,
+  pruneLocalLlmUsage,
+  type LocalLlmUsageEntry,
+  type LocalLlmUsageRecorder
+} from './localUsage'
 export { WriteLane, type WriteJobRecord } from './writeLane'
 export {
   collectAssets,

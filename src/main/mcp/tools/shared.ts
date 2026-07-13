@@ -77,8 +77,11 @@ export interface McpReadContext {
    * return a clean INVALID_STATE rather than crashing.
    */
   readonly queue?: DurableTaskQueue
-  /** Live Ollama health for get_app_status (null = model layer absent this launch). */
-  readonly ollama?: Pick<OllamaClient, 'status'> | null
+  /**
+   * Live Ollama probes: `status` for get_app_status, `ps` for get_local_usage's
+   * loaded-model snapshot (null = model layer absent this launch).
+   */
+  readonly ollama?: Pick<OllamaClient, 'status' | 'ps'> | null
   /** Keychain — PRESENCE reads only — for get_settings_summary (null = absent). */
   readonly keychain?: Pick<Keychain, 'getApiKey'> | null
   /** Static app-status facts (version/platform/userDataDir/subsystems/mcpUrl). */

@@ -27,6 +27,7 @@ export type IconName =
   | 'chevron'
   | 'info'
   | 'alert'
+  | 'lock'
 
 // Each entry is the inner geometry for a 16×16 viewBox; the wrapper supplies
 // the shared stroke grammar. Zero-length "h.01" segments render as round dots.
@@ -137,6 +138,12 @@ const PATHS: Record<IconName, React.JSX.Element> = {
       <path d="M8 3 14 13H2z" />
       <path d="M8 6.6v3" />
       <path d="M8 11.3h.01" />
+    </>
+  ),
+  lock: (
+    <>
+      <path d="M4.5 7.5h7v5.5h-7z" />
+      <path d="M6 7.5V5.75a2 2 0 0 1 4 0V7.5" />
     </>
   )
 }

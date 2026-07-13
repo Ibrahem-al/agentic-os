@@ -202,6 +202,23 @@ export const OLLAMA_INSTALL_URL = 'https://ollama.com/download'
 /** The models the one-click pull installs (§4 setup): embeddings + small LLM. */
 export const OLLAMA_REQUIRED_MODELS: readonly string[] = [EMBEDDING_MODEL, SMALL_LLM_MODEL]
 
+// ── Local-LLM usage tracking (§4 "see & control what runs on this computer") ──
+/**
+ * Retention for the appdata v9 `local_llm_usage` telemetry ledger (one row per
+ * local qwen3 reasoning call). NOT a §20 value — a conservative rule-12 pick,
+ * recorded in the local-LLM-control report: this ledger is observability only
+ * (never a data asset), so rows older than this are pruned on boot
+ * (pruneLocalLlmUsage). Wider than the §20 14-day transcript window because the
+ * usage panel wants a month of trend at negligible size.
+ */
+export const LOCAL_LLM_USAGE_RETENTION_DAYS = 30
+/** Default aggregation window (days) for usage.local.summary when the caller passes none (rule-12). */
+export const LOCAL_LLM_USAGE_SUMMARY_DEFAULT_DAYS = 30
+/** Max aggregation window the summary honors — bounds the query even though retention already caps rows (rule-12). */
+export const LOCAL_LLM_USAGE_SUMMARY_MAX_DAYS = 365
+/** Recent local calls shipped in a usage summary (the disclosure table) — rule-12. */
+export const LOCAL_LLM_USAGE_RECENT_LIMIT = 20
+
 // ── Reranker distribution (int8 ONNX of BAAI/bge-reranker-v2-m3) ────────────
 /**
  * Pinned int8 ONNX export of RERANKER_MODEL plus its tokenizer, downloaded to

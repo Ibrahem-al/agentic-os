@@ -208,7 +208,9 @@ beforeAll(async () => {
         installedModels: ['bge-m3', 'qwen3:4b'],
         missingModels: [],
         installUrl: 'https://ollama.com/download'
-      })
+      }),
+      // get_local_usage's live snapshot probes ps() too (empty here — no models loaded).
+      ps: async () => []
     },
     keychain: { getApiKey: (provider) => (provider === 'anthropic' ? 'sk-test-key' : undefined) },
     appStatus: {
@@ -387,6 +389,20 @@ describe('§4.D review / observability reads', () => {
     expect(reply.body.totalUsd).toBeCloseTo(0.12, 6)
     expect(reply.body.runner.totalRuns).toBe(1)
     expect(reply.body.runner.recent[0].id).toBe('rr-read')
+  })
+
+  it('get_local_usage is read-tier dispatchable and returns the local usage summary + live snapshot', async () => {
+    const reply = await call(client, 'get_local_usage', { since_days: 7 })
+    // Reaching a non-error reply proves it is in READ_TOOLS (the §13 scope check
+    // fails closed on an untiered tool) and its handler is wired.
+    expect(reply.isError).toBe(false)
+    expect(reply.body.sinceDays).toBe(7)
+    expect(typeof reply.body.totals.calls).toBe('number')
+    expect(Array.isArray(reply.body.byRole)).toBe(true)
+    expect(Array.isArray(reply.body.recent)).toBe(true)
+    // Live snapshot composed from the read context's Ollama stub (status ready, ps []).
+    expect(reply.body.loaded).toEqual([])
+    expect(reply.body.ollamaState).toBe('ready')
   })
 })
 

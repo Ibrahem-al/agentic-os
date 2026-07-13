@@ -25,6 +25,14 @@ export interface ReasoningSettings {
   backend: ReasoningBackend
   overrides?: Partial<Record<RoleKey, ReasoningBackend>>
   models?: Partial<Record<RoleKey, string>>
+  /**
+   * Stage-2 sensitive-egress consent (extends the §10.7 egress-consent pattern).
+   * Absent/false = today (DEFAULT == TODAY): the §11.4 HARD-local roles stay
+   * local under every backend setting. Set true only via the settings panel's
+   * consent modal; the router (provider.ts) then lets a HARD-local role follow a
+   * non-local global backend or explicit override off this computer.
+   */
+  allowSensitiveNonLocal?: boolean
 }
 
 /**
@@ -197,6 +205,15 @@ function parseReasoning(value: unknown, filePath: string): ReasoningSettings {
       parsed[role as RoleKey] = model
     }
     result.models = parsed
+  }
+  // Stage-2 sensitive-egress consent. Only materialized when present on disk — a
+  // section without it stays flag-free (DEFAULT == TODAY / consent absent).
+  const allowSensitiveNonLocal = value['allowSensitiveNonLocal']
+  if (allowSensitiveNonLocal !== undefined) {
+    if (typeof allowSensitiveNonLocal !== 'boolean') {
+      throw new Error(`${filePath}: reasoning.allowSensitiveNonLocal must be a boolean`)
+    }
+    result.allowSensitiveNonLocal = allowSensitiveNonLocal
   }
   return result
 }

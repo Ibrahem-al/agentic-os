@@ -7,6 +7,7 @@ export {
   type FetchLike,
   type GenerateOptions,
   type GenerateResult,
+  type LoadedModel,
   type OllamaState,
   type OllamaStatus,
   type PullProgress

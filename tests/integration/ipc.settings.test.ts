@@ -132,6 +132,25 @@ describe('ipc settings mutators (phase-16b)', () => {
     expect(dto.reasoning).toEqual(expected)
   })
 
+  it('settings.save round-trips reasoning.allowSensitiveNonLocal and PRESERVES it across a backend-only patch (Stage 2)', async () => {
+    // Grant the sensitive-egress consent.
+    const dto = dataOf(
+      await invoke('settings.save', { reasoning: { backend: 'subscription-claude', allowSensitiveNonLocal: true } })
+    )
+    expect(dto.reasoning?.allowSensitiveNonLocal).toBe(true)
+    expect(loadModelSettings(settingsPath(dir)).reasoning?.allowSensitiveNonLocal).toBe(true)
+
+    // A later backend-only patch (the runner toggle shape) must NOT drop the flag.
+    await invoke('settings.save', { reasoning: { backend: 'local-qwen3' } })
+    const onDisk = loadModelSettings(settingsPath(dir))
+    expect(onDisk.reasoning).toEqual({ backend: 'local-qwen3', allowSensitiveNonLocal: true })
+
+    // Revoking consent is an explicit false (not an omission) and persists.
+    const revoked = dataOf(await invoke('settings.save', { reasoning: { backend: 'local-qwen3', allowSensitiveNonLocal: false } }))
+    expect(revoked.reasoning?.allowSensitiveNonLocal).toBe(false)
+    expect(loadModelSettings(settingsPath(dir)).reasoning?.allowSensitiveNonLocal).toBe(false)
+  })
+
   it('settings.save preserves an on-disk section when a later patch omits it (DEFAULT == TODAY)', async () => {
     await invoke('settings.save', {
       reasoning: { backend: 'subscription-claude', overrides: { 'skills.rewrite': 'local-qwen3' } }
@@ -211,6 +230,24 @@ describe('ipc settings mutators (phase-16b)', () => {
     const dto: SettingsDto = dataOf(await invoke('settings.get'))
     expect(dto.reasoning).toBeUndefined()
     expect(dto.runner).toBeUndefined()
+  })
+
+  it('reasoning.roles enumerates all 14 roles with plain groups + the sensitive flag; effectiveBackend is null with no router wired (DEFAULT == TODAY)', async () => {
+    const roles = dataOf(await invoke('reasoning.roles'))
+    // Every §2.2 role, canonical order, no dupes.
+    expect(roles).toHaveLength(14)
+    expect(new Set(roles.map((r) => r.role)).size).toBe(14)
+    // The five HARD-local roles are exactly the ones marked sensitive.
+    const sensitive = roles.filter((r) => r.sensitive).map((r) => r.role)
+    expect(new Set(sensitive)).toEqual(
+      new Set(['retrieval.critic', 'retrieval.rewrite', 'scanner.llmVerdict', 'skills.executor', 'skills.grader'])
+    )
+    // Every row carries a plain group; no router this rig → effectiveBackend null.
+    const GROUPS = new Set(['Understanding your sessions', 'Improving skills', 'Search & retrieval', 'Safety scanning', 'Summaries'])
+    for (const r of roles) {
+      expect(GROUPS.has(r.group), r.role).toBe(true)
+      expect(r.effectiveBackend, r.role).toBeNull()
+    }
   })
 })
 

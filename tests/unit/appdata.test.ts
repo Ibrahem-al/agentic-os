@@ -19,7 +19,8 @@ const TABLES = [
   'skill_improvements',
   'runner_runs',
   'runner_submissions',
-  'lane_jobs'
+  'lane_jobs',
+  'local_llm_usage'
 ] as const
 
 describe('appdata.db (SQLite side of §20 app data)', () => {
@@ -28,13 +29,13 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('creates the db in WAL mode with all tables and user_version 8', () => {
+  it('creates the db in WAL mode with all tables and user_version 9', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const appData = openAppData(join(dir, 'nested', 'appdata.db'))
     try {
       expect(existsSync(appData.path)).toBe(true)
       expect(appData.db.pragma('journal_mode', { simple: true })).toBe('wal')
-      expect(appData.db.pragma('user_version', { simple: true })).toBe(8)
+      expect(appData.db.pragma('user_version', { simple: true })).toBe(9)
       expect(appData.db.pragma('foreign_keys', { simple: true })).toBe(1)
       const names = appData.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -133,7 +134,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const second = openAppData(dbPath)
     try {
-      expect(second.db.pragma('user_version', { simple: true })).toBe(8)
+      expect(second.db.pragma('user_version', { simple: true })).toBe(9)
       expect((second.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(1)
     } finally {
       second.close()
@@ -184,7 +185,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(8)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(9)
       const names = upgraded.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .all()
@@ -238,7 +239,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(8)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(9)
       // The v6 row survives; the new nullable column reads NULL on it.
       const old = upgraded.db
         .prepare('SELECT tool, args_hash, session_kind FROM mcp_calls WHERE session_id = ?')
@@ -268,7 +269,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
       const snapshot = upgraded.backupCreated
       expect(snapshot).not.toBeNull()
       expect(existsSync(snapshot as string)).toBe(true)
-      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v8$/)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v9$/)
       const header = readFileSync(snapshot as string)
       expect(header.subarray(0, 16).toString('latin1')).toBe(`SQLite format 3${String.fromCharCode(0)}`)
       expect(header.readUInt32BE(60)).toBe(6)
@@ -277,7 +278,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     }
   })
 
-  it('upgrades a v7 db to v8: audit_log.outcome gains pending (CHECK rebuilt in place) + lane_jobs, snapshot first', () => {
+  it('upgrades a v7 db to current: audit_log.outcome gains pending (CHECK rebuilt in place) + lane_jobs, snapshot first', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const dbPath = join(dir, 'appdata.db')
     // Simulate a real phase-09..14 install at v7: audit_log carries the OLD
@@ -317,7 +318,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(8)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(9)
       // lane_jobs now exists; the pre-existing audit row survived the rebuild.
       const names = upgraded.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -345,7 +346,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
       const snapshot = upgraded.backupCreated
       expect(snapshot).not.toBeNull()
       expect(existsSync(snapshot as string)).toBe(true)
-      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v8$/)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v9$/)
       expect(readFileSync(snapshot as string).readUInt32BE(60)).toBe(7)
     } finally {
       upgraded.close()
@@ -355,7 +356,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     // and 'pending' still round-trips.
     const reopened = openAppData(dbPath)
     try {
-      expect(reopened.db.pragma('user_version', { simple: true })).toBe(8)
+      expect(reopened.db.pragma('user_version', { simple: true })).toBe(9)
       expect(reopened.backupCreated).toBeNull()
       reopened.db
         .prepare(`INSERT INTO audit_log (id, agent_id, kind, description, outcome) VALUES (?, ?, ?, ?, ?)`)
@@ -366,6 +367,56 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
       ).toBe('pending')
     } finally {
       reopened.close()
+    }
+  })
+
+  it('upgrades a v8 db to v9: additive local_llm_usage table + index, snapshot frozen at v8', () => {
+    dir = mkdtempSync(join(tmpdir(), 'appdata-'))
+    const dbPath = join(dir, 'appdata.db')
+    // Simulate a real phase-09..14 (crash-failsafes) install at v8: everything
+    // present EXCEPT the v9 local_llm_usage ledger and its index.
+    const first = openAppData(dbPath)
+    first.db.exec('DROP INDEX IF EXISTS idx_local_llm_usage_ts; DROP TABLE local_llm_usage')
+    first.db.prepare('INSERT INTO tasks (id, kind) VALUES (?, ?)').run('v8-marker', 'probe')
+    first.db.pragma('user_version = 8')
+    first.close()
+
+    const upgraded = openAppData(dbPath)
+    try {
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(9)
+      // The full table set (incl. the new ledger) exists and the marker survived.
+      const names = upgraded.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .all()
+        .map((r) => (r as { name: string }).name)
+      expect(names).toEqual([...TABLES].sort())
+      expect((upgraded.db.prepare('SELECT kind FROM tasks WHERE id = ?').get('v8-marker') as { kind: string }).kind).toBe(
+        'probe'
+      )
+      // The ledger's ts-index exists and the table really takes rows now.
+      expect(
+        upgraded.db
+          .prepare("SELECT count(*) AS c FROM sqlite_master WHERE type = 'index' AND name = 'idx_local_llm_usage_ts'")
+          .get()
+      ).toEqual({ c: 1 })
+      upgraded.db
+        .prepare(
+          `INSERT INTO local_llm_usage (ts, role, model, prompt_tokens, eval_tokens, duration_ms, ok)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run('2026-07-05T00:00:00.000Z', 'context.summarize', 'qwen3:4b', 100, 40, 1200, 1)
+      const row = upgraded.db
+        .prepare('SELECT role, model, ok FROM local_llm_usage WHERE model = ?')
+        .get('qwen3:4b') as { role: string; model: string; ok: number }
+      expect(row).toEqual({ role: 'context.summarize', model: 'qwen3:4b', ok: 1 })
+      // §21 rule 9: the pre-upgrade snapshot exists and is frozen at v8.
+      const snapshot = upgraded.backupCreated
+      expect(snapshot).not.toBeNull()
+      expect(existsSync(snapshot as string)).toBe(true)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v9$/)
+      expect(readFileSync(snapshot as string).readUInt32BE(60)).toBe(8)
+    } finally {
+      upgraded.close()
     }
   })
 
@@ -392,7 +443,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     const upgraded = openAppData(dbPath)
     try {
       // Main db really upgraded in place.
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(8)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(9)
       expect(
         upgraded.db.prepare("SELECT count(*) AS c FROM sqlite_master WHERE name = 'skill_settings'").get()
       ).toEqual({ c: 1 })
@@ -400,7 +451,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
       const snapshot = upgraded.backupCreated
       expect(snapshot).not.toBeNull()
       expect(existsSync(snapshot as string)).toBe(true)
-      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v8$/)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v9$/)
       expect(dirname(dirname(snapshot as string))).toBe(join(dir, 'backups'))
       // The snapshot is a valid sqlite db frozen at the OLD version: header
       // magic + user_version (byte 60, big-endian) read straight off disk —
@@ -437,7 +488,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     const elsewhere = join(dir, 'elsewhere')
     const upgraded = openAppData(dbPath, elsewhere)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(8)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(9)
       expect(upgraded.backupCreated).not.toBeNull()
       expect(dirname(dirname(upgraded.backupCreated as string))).toBe(elsewhere)
       expect(existsSync(upgraded.backupCreated as string)).toBe(true)
@@ -460,7 +511,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     snapshotAppDataDb(dbPath, snap)
 
     // The read-only snapshot did not disturb the live source (still v7, 2 rows).
-    expect(live.db.pragma('user_version', { simple: true })).toBe(8)
+    expect(live.db.pragma('user_version', { simple: true })).toBe(9)
     expect((live.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(2)
     live.close()
 
@@ -470,7 +521,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     const reopened = openAppData(snap)
     try {
       expect((reopened.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(2)
-      expect(reopened.db.pragma('user_version', { simple: true })).toBe(8)
+      expect(reopened.db.pragma('user_version', { simple: true })).toBe(9)
     } finally {
       reopened.close()
     }

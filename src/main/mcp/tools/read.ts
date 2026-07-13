@@ -22,6 +22,7 @@ import { scanDuplicates, DEDUPE_LABELS } from '../../memory'
 import { IPC_NODE_LABELS } from '../../../shared/ipc'
 import {
   getAppStatus,
+  getLocalUsage,
   getNode,
   getPendingWork,
   getSettingsSummary,
@@ -180,6 +181,16 @@ const GetTraceInput = z.object({
 const GetTaskInput = z.object({
   id: z.string().min(1).describe('Task id (list_tasks shows them).'),
   include_workflow: z.boolean().optional().describe('Also fetch the `<taskId>-wf` workflow job state.')
+})
+
+const GetLocalUsageInput = z.object({
+  since_days: z
+    .number()
+    .int()
+    .min(1)
+    .max(365)
+    .optional()
+    .describe('Window in days for totals/byRole/byDay (default 30; recent + live snapshot ignore it).')
 })
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -428,6 +439,16 @@ async function getUsageTool(args: unknown, ctx: ToolContext): Promise<unknown> {
   return getUsage(ctx.db)
 }
 
+async function getLocalUsageTool(args: unknown, ctx: ToolContext): Promise<unknown> {
+  const input = parse(GetLocalUsageInput, args, 'get_local_usage')
+  // ctx.ollama (status + ps) is present only once the model layer is wired; absent
+  // ⇒ the DB-only aggregation still returns, with an empty live snapshot.
+  return getLocalUsage(
+    { db: ctx.db, ollama: ctx.ollama ?? null },
+    input.since_days !== undefined ? { sinceDays: input.since_days } : {}
+  )
+}
+
 // ── §4.E tasks / triggers ────────────────────────────────────────────────────────
 
 async function listTasksTool(args: unknown, ctx: ToolContext): Promise<unknown> {
@@ -616,6 +637,13 @@ export const READ_TOOL_DEFS: readonly McpToolDef[] = [
       'Usage summary: metered cloud spend (real dollars) plus the runner_runs rollup (shadow cost is an estimate; empty until subscription runs exist).',
     inputSchema: jsonSchema(NO_INPUT),
     handle: getUsageTool
+  },
+  {
+    name: 'get_local_usage',
+    description:
+      'What the LOCAL qwen3 reasoning tier has done (aggregated over since_days, default 30): totals (calls, prompt/eval tokens, compute ms), per-role and per-day breakdowns, the newest 20 calls, plus a live resource snapshot (currently loaded models + daemon state). Search indexing (embeddings) is NOT counted — that tier always runs locally and is out of scope.',
+    inputSchema: jsonSchema(GetLocalUsageInput),
+    handle: getLocalUsageTool
   },
   {
     name: 'list_tasks',

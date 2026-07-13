@@ -269,14 +269,35 @@ const APPDATA_SCHEMA: readonly string[] = [
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_runner_submissions_task ON runner_submissions(task_id)`
+  `CREATE INDEX IF NOT EXISTS idx_runner_submissions_task ON runner_submissions(task_id)`,
+  // Local-LLM usage ledger (v9, local-LLM visibility feature): ONE row per local
+  // qwen3 reasoning call through the Ollama generate() chokepoint — the §2.2 role
+  // it served (NULL ⇒ a direct deps.llm call with no role context, surfaced as
+  // 'other'), the model, Ollama's own counters (prompt_eval_count/eval_count and
+  // total_duration → duration_ms) and whether the call succeeded. EMBEDDINGS are
+  // deliberately NOT recorded — the embedder (bge-m3) is schema-pinned and out of
+  // scope; this ledger is the qwen3 REASONING tier only. Observability only (never
+  // a data asset): rows older than LOCAL_LLM_USAGE_RETENTION_DAYS are pruned on
+  // boot (storage/localUsage.ts pruneLocalLlmUsage). The recorder NEVER fails the
+  // call — a write error is swallowed at the Ollama seam.
+  `CREATE TABLE IF NOT EXISTS local_llm_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    role TEXT,
+    model TEXT NOT NULL,
+    prompt_tokens INTEGER,
+    eval_tokens INTEGER,
+    duration_ms INTEGER,
+    ok INTEGER NOT NULL DEFAULT 1
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_local_llm_usage_ts ON local_llm_usage(ts)`
 ]
 
 /**
  * Current SQLite schema version. Exported so the boot-time data manifest can
  * record which schema the on-disk store carries (docs/DATA-MIGRATION.md).
  */
-export const APPDATA_USER_VERSION = 8
+export const APPDATA_USER_VERSION = 9
 
 /**
  * Column additions to tables that predate them (CREATE IF NOT EXISTS skips an
@@ -509,7 +530,8 @@ export function openAppData(dbPath: string, backupsDir?: string): AppData {
     // tasks.waiting_approval_id, phase 11; v5 → v6: skill_settings +
     // skill_improvements, phase 12; v6 → v7: mcp_calls.session_kind +
     // runner_runs + runner_submissions, phase 14; v7 → v8: audit_log.outcome
-    // 'pending' + lane_jobs — the crash-safety write-intent journal).
+    // 'pending' + lane_jobs — the crash-safety write-intent journal; v8 → v9:
+    // local_llm_usage — the additive local-LLM usage ledger).
     db.pragma(`user_version = ${APPDATA_USER_VERSION}`)
   }
   return {

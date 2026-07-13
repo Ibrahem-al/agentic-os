@@ -64,6 +64,13 @@ export {
 } from './observability'
 
 export {
+  getLocalUsage,
+  type LocalUsageArgs,
+  type LocalUsageDeps,
+  type LocalUsageOllama
+} from './localUsage'
+
+export {
   getTask,
   getTriggersStatus,
   listTasks,
@@ -82,3 +89,5 @@ export {
 } from './status'
 
 export { getRunnerStatus, type RunnerStatusDeps, type RunnerStatusSource } from './runner'
+
+export { getReasoningRoles, type ReasoningRolesDeps } from './reasoningRoles'

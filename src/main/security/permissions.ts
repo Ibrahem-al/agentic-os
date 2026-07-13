@@ -91,6 +91,7 @@ export const READ_TOOLS = new Set([
   'list_traces',
   'get_trace',
   'get_usage',
+  'get_local_usage',
   'list_tasks',
   'get_task',
   'get_triggers_status',

@@ -63,7 +63,7 @@ const PANELS: Record<PanelKey, PanelDef> = {
   memory: { label: 'Memory', icon: 'memory', component: MemoryPanel },
   review: { label: 'Approvals', icon: 'approvals', component: ReviewPanel },
   audit: { label: 'History', icon: 'history', component: AuditPanel },
-  spend: { label: 'Spending', icon: 'spending', component: SpendPanel },
+  spend: { label: 'Usage & spending', icon: 'spending', component: SpendPanel },
   tasks: { label: 'Background work', icon: 'tasks', component: TasksPanel },
   traces: { label: 'Agent runs', icon: 'runs', component: TracesPanel },
   skills: { label: 'Skills', icon: 'skills', component: SkillsPanel },

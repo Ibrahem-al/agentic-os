@@ -37,7 +37,17 @@ Full design: [`docs/spec.md`](docs/spec.md). Build history: [`docs/PROGRESS.md`]
 
 ## Privacy — what leaves your machine
 
-**Your memory graph, embeddings, and search index never leave your machine.** With the subscription runner enabled (optional, off by default — see [Subscription runner](#subscription-runner-optional-off-by-default) below), the text being reasoned about — session transcripts, skill feedback, and, if you opt those roles in, retrieved memory snippets — is sent to Anthropic under your Claude account, the same vendor your Claude Code sessions already go to. A default install turns none of this on: with the runner off and no cloud API key set, nothing is sent anywhere.
+**Your memory graph, embeddings, and search index never leave your machine.** Search indexing (the `bge-m3` embeddings) always runs locally, whatever else you choose.
+
+Background reasoning has one obvious control in **Settings → AI processing**: run it *on this computer* (the local `qwen3`, private and free — the default), through *your cloud API key*, or through *your Claude subscription* (the [subscription runner](#subscription-runner-optional-off-by-default)). When you pick a non-local backend, the text being reasoned about — session transcripts, skill feedback, and project summaries — is sent to that service (Anthropic under your Claude account for the subscription, the same vendor your Claude Code sessions already go to; or your chosen provider for a cloud key).
+
+**A few roles handle raw session text and are kept on this computer even then.** The retrieval critic/rewrite, skill test execution and grading, and the safety scanner never leave your machine on the default path — regardless of the backend you chose above. They move off only if you deliberately turn on **"Allow sensitive work to leave this computer"** (off by default, behind a one-time consent dialog that names exactly what leaves and to where); with it off, those five roles resolve local under every backend, provably.
+
+A default install turns none of this on: with the AI-processing backend left on *this computer*, the runner off, no cloud API key set, and the sensitive-egress toggle off, nothing is sent anywhere.
+
+### Seeing what runs locally
+
+**Settings → AI processing → "What runs where"** shows, in plain words, where each kind of background work runs right now given your choices — with a lock on the roles that stay on this computer. The **Usage & spending** panel opens with an **"On this computer"** section: which local model is loaded and how much memory it is using (live, from Ollama), how many local calls and how much compute time today, tokens processed and the busiest work over the last 7 days, a 14-day compute chart, and a recent-calls list. Nothing here phones home — it reads the local usage ledger (kept 30 days) and Ollama's own status.
 
 ## Requirements
 

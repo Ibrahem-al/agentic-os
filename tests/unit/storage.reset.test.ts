@@ -98,11 +98,11 @@ describe('performPendingReset (installer-requested, recoverable, backup-first)',
     expect(existsSync(join(backup, 'graph'))).toBe(true)
     expect(readdirSync(join(backup, 'graph')).length).toBe(graphFiles)
 
-    // appdata snapshot: valid, integrity ok, user_version preserved (== 8).
+    // appdata snapshot: valid, integrity ok, user_version preserved (== 9).
     const snap = join(backup, 'appdata.db')
     expect(existsSync(snap)).toBe(true)
     expect(appDataIntegrityOk(snap)).toBe(true)
-    expect(userVersionOnDisk(snap)).toBe(8)
+    expect(userVersionOnDisk(snap)).toBe(9)
     // The snapshot really carries the row we seeded (open a scratch copy so the
     // backup file itself is never mutated).
     const scratch = join(dir, 'restore-check', 'appdata.db')

@@ -121,7 +121,9 @@ import {
   type TriggerWatchers
 } from './triggers'
 import {
+  getLocalUsage,
   getNode,
+  getReasoningRoles,
   getRunnerStatus,
   getSettingsSummary,
   getSkillDetail,
@@ -544,6 +546,13 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   register('spend.summary', () => getSpendSummary(need.db()))
 
+  // Local-LLM usage + live resource snapshot (local-LLM visibility). deps.ollama
+  // may be null (model layer down) — the DB aggregation still answers with an
+  // empty live snapshot. sinceDays is clamped server-side.
+  register('usage.local.summary', (req) =>
+    getLocalUsage({ db: need.db(), ollama: deps.ollama }, req?.sinceDays !== undefined ? { sinceDays: req.sinceDays } : {})
+  )
+
   // ── tasks & watched folders ────────────────────────────────────────────────
 
   register('tasks.list', () => listTasks(need.db()))
@@ -948,6 +957,11 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   register('runner.status', () =>
     getRunnerStatus({ runner: deps.runner ?? null, db: need.db(), router: deps.router ?? null })
   )
+
+  // The §2.2 reasoning roles projected for the settings "What runs where" table
+  // (Stage 2). Live effective backend per role from the router; a launch without
+  // a router reports effectiveBackend:null for every role (DEFAULT == TODAY).
+  register('reasoning.roles', () => getReasoningRoles({ router: deps.router ?? null }))
 
   // The manual 1-turn canary — the closest thing to an auth probe (§3.7). Only
   // ever user-triggered from the settings panel, NEVER scheduled.

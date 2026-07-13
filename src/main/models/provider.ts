@@ -142,6 +142,13 @@ export interface ReasoningRequest {
   readonly taskId: string
   /** Resolved model id; the router sets this. Omit for the backend default. */
   readonly model?: string
+  /**
+   * The §2.2 role this request serves. The router stamps it (ProviderRouter.
+   * complete) so the local backend can thread it into the Ollama usage recorder;
+   * cloud/subscription ignore it. Metadata only — it never changes routing here
+   * (role → backend resolution already happened) and is never sent to a model.
+   */
+  readonly role?: RoleKey
 }
 
 export interface ReasoningResult {
@@ -187,6 +194,8 @@ export interface OllamaLike {
       maxTokens?: number
       temperature?: number
       format?: 'json' | Record<string, unknown>
+      /** The §2.2 role, threaded to the local usage recorder (see ReasoningRequest.role). */
+      role?: string
     }
   ): Promise<{ text: string; inputTokens?: number; outputTokens?: number }>
 }
@@ -250,7 +259,10 @@ export class LocalQwen3Provider implements ReasoningProvider {
       ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),
       ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
       think: false,
-      ...(req.schema !== undefined ? { format: req.schema } : {})
+      ...(req.schema !== undefined ? { format: req.schema } : {}),
+      // Thread the role to the Ollama usage recorder (local-LLM visibility). Only
+      // the local backend records; cloud/subscription have their own §14 ledgers.
+      ...(req.role !== undefined ? { role: req.role } : {})
     })
     return {
       text: res.text,
@@ -436,22 +448,37 @@ export class ProviderRouter {
   private desiredBackend(role: RoleKey, s: ModelSettings): ReasoningBackend {
     const def = ROLE_DEFAULTS[role]
     const override = s.reasoning?.overrides?.[role]
+    const globalBackend = s.reasoning?.backend
+    // Stage-2 sensitive-egress consent (extends the §10.7 egress-consent pattern).
+    // ABSENT/false ⇒ today's behavior EXACTLY (the branch and the clamp below both
+    // read it, so a user who never grants it is provably unaffected under every
+    // global backend). When the user grants it, a §11.4 HARD-local (sensitive)
+    // role is unlocked to leave local: it may follow a NON-local global backend
+    // (HARD roles are subscribable=false, so the global toggle otherwise never
+    // moves them) and its subscription clamp below is lifted. Non-sensitive roles
+    // ignore the flag entirely — they already route by backend/override.
+    const sensitiveUnlocked = def.hardLocal && s.reasoning?.allowSensitiveNonLocal === true
     let desired: ReasoningBackend
     if (override !== undefined) {
       desired = override
-    } else if (s.reasoning?.backend === 'subscription-claude' && def.subscribable) {
+    } else if (globalBackend === 'subscription-claude' && def.subscribable) {
       desired = 'subscription-claude'
+    } else if (sensitiveUnlocked && globalBackend !== undefined && globalBackend !== 'local-qwen3') {
+      // Consent granted + a non-local GLOBAL backend → the HARD-local role follows
+      // it (cloud-api or subscription-claude), subject to the availability chain.
+      desired = globalBackend
     } else {
       desired = def.today
     }
-    // §11.4 HARD-local clamp. phase-20 §10.4: an EXPLICIT per-role override to
-    // subscription is HONORED for the two retrieval roles (the retrieval loop then
-    // forces a single critic pass — see retrievalForcesSingleIteration — so a live
-    // get_context can't fan out to ~9 subscription spawns). Every OTHER HARD-local
-    // role stays clamped to local, and the GLOBAL toggle never moves any HARD-local
-    // role (subscribable=false, handled above) — so a default install is unchanged
-    // and only a deliberate retrieval override reaches the subscription tier.
-    if (def.hardLocal && desired === 'subscription-claude') {
+    // §11.4 HARD-local clamp. WITHOUT the sensitive-egress consent (sensitiveUnlocked
+    // false): subscription is clamped to local for every HARD-local role EXCEPT an
+    // EXPLICIT per-role retrieval override — phase-20 §10.4 HONORS that (the retrieval
+    // loop then forces a single critic pass — see retrievalForcesSingleIteration — so a
+    // live get_context can't fan out to ~9 subscription spawns); a cloud-api override
+    // passes through unchanged. The GLOBAL toggle never moves a HARD-local role here
+    // (subscribable=false). WITH consent the clamp is lifted (the role already resolved
+    // to its non-local tier above under the guard), so the sensitive role reaches it.
+    if (def.hardLocal && desired === 'subscription-claude' && !sensitiveUnlocked) {
       const honoredRetrievalOverride =
         override === 'subscription-claude' && (role === 'retrieval.critic' || role === 'retrieval.rewrite')
       if (!honoredRetrievalOverride) desired = 'local-qwen3'
@@ -565,7 +592,9 @@ export class ProviderRouter {
   /** Resolve the role and complete the request against its backend. */
   async complete(role: RoleKey, req: ReasoningRequest): Promise<ReasoningResult> {
     const r = this.route(role)
-    return r.provider.complete({ ...req, model: r.model })
+    // Stamp the role so the local backend can thread it to the usage recorder
+    // (local-LLM visibility); an explicit req.role is preserved if a caller set one.
+    return r.provider.complete({ ...req, model: r.model, role: req.role ?? role })
   }
 
   /**

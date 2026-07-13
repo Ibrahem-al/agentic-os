@@ -133,4 +133,25 @@ describe('phase-16 reasoning + runner settings', () => {
     writeFileSync(filePath, JSON.stringify({ runner: { mode: 'telepathy' } }))
     expect(() => loadModelSettings(filePath)).toThrow(/runner\.mode/)
   })
+
+  // ── Stage-2 sensitive-egress consent (reasoning.allowSensitiveNonLocal) ──────
+
+  it('accepts + round-trips reasoning.allowSensitiveNonLocal (and a section without it stays flag-free)', () => {
+    // Present + true survives save/load losslessly.
+    const settings = defaultModelSettings()
+    settings.reasoning = { backend: 'subscription-claude', allowSensitiveNonLocal: true }
+    saveModelSettings(filePath, settings)
+    expect(loadModelSettings(filePath)).toEqual(settings)
+    expect(loadModelSettings(filePath).reasoning?.allowSensitiveNonLocal).toBe(true)
+
+    // Absent on disk → absent after load (DEFAULT == TODAY / consent absent, never false-materialized).
+    writeFileSync(filePath, JSON.stringify({ reasoning: { backend: 'local-qwen3' } }))
+    expect(loadModelSettings(filePath).reasoning).toEqual({ backend: 'local-qwen3' })
+    expect('allowSensitiveNonLocal' in (loadModelSettings(filePath).reasoning ?? {})).toBe(false)
+  })
+
+  it('rejects a non-boolean reasoning.allowSensitiveNonLocal loudly', () => {
+    writeFileSync(filePath, JSON.stringify({ reasoning: { allowSensitiveNonLocal: 'yes' } }))
+    expect(() => loadModelSettings(filePath)).toThrow(/reasoning\.allowSensitiveNonLocal must be a boolean/)
+  })
 })

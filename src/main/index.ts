@@ -33,12 +33,14 @@ import {
   APPDATA_USER_VERSION,
   backupRequestPending,
   isAutoBackupDue,
+  LocalLlmUsageStore,
   openAppData,
   openRyuGraphEngine,
   openRyuGraphEngineWithLockRetry,
   performPendingBackup,
   performPendingReset,
   performPendingRestore,
+  pruneLocalLlmUsage,
   requestBackup,
   verifyDataManifest,
   writeDataManifest,
@@ -534,7 +536,20 @@ async function bootModels(): Promise<void> {
   const settings = loadModelSettings(settingsPath(userDataDir))
   console.log(`[models] active cloud provider: ${settings.cloudProvider}`)
 
-  ollama = new OllamaClient()
+  // Local-LLM visibility: inject the appdata-backed usage recorder into the ONE
+  // shared OllamaClient (every agent/router/read path uses this instance), so each
+  // local qwen3 generate() records one local_llm_usage row. appData boots first
+  // (storage step); if it is somehow absent the client runs recorder-less =
+  // today's behavior. Prune the ledger to its retention window once per boot.
+  if (appData !== null) {
+    try {
+      const pruned = pruneLocalLlmUsage(appData.db)
+      if (pruned > 0) console.log(`[models] local-usage ledger pruned ${pruned} row(s) past retention`)
+    } catch (err) {
+      console.warn('[models] local-usage retention prune failed (ignored)', err)
+    }
+  }
+  ollama = new OllamaClient(appData !== null ? { recorder: new LocalLlmUsageStore(appData.db) } : {})
   const status = await ollama.status()
   if (status.state === 'ready') {
     console.log(`[models] ollama ready (${status.installedModels.length} models incl. required)`)

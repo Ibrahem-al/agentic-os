@@ -471,3 +471,112 @@ describe('§10.4 — retrieval roles honor a subscription override, and force si
     expect(makeRouter().retrievalForcesSingleIteration()).toBe(false)
   })
 })
+
+// ── Stage-2 sensitive-egress consent (reasoning.allowSensitiveNonLocal) ───────
+//
+// The consent gate that lets a §11.4 HARD-local (sensitive) role leave this
+// computer. The PRIME DIRECTIVE pins: with the flag ABSENT, every HARD-local role
+// resolves local under EVERY global backend — a user who never grants consent is
+// provably unaffected. With it granted, a sensitive role follows a non-local
+// global backend or an explicit override, still bounded by the availability chain.
+
+describe('Stage-2 sensitive-egress consent — allowSensitiveNonLocal gates the HARD-local roles', () => {
+  const NON_LOCAL_GLOBALS = ['cloud-api', 'subscription-claude'] as const
+
+  it('flag ABSENT → every HARD-local role stays local under EVERY non-local global backend (DEFAULT == TODAY)', () => {
+    // Subscription genuinely available (enabled + healthy + injected) and a cloud key
+    // present, so nothing but the missing consent keeps the sensitive roles home.
+    for (const backend of NON_LOCAL_GLOBALS) {
+      snapshot = {
+        ...defaultModelSettings(),
+        reasoning: { backend }, // NO allowSensitiveNonLocal
+        runner: { ...runnerDefaults(), enabled: true }
+      }
+      healthy = true
+      hasKey = true
+      const router = makeRouter()
+      for (const role of HARD_ROLES) {
+        expect(router.resolve(role).backend, `${role} @ global=${backend}`).toBe('local-qwen3')
+      }
+      // Control: a subscribable role in the SAME snapshot DOES leave local.
+      expect(router.resolve('skills.testset').backend).toBe(backend === 'subscription-claude' ? 'subscription-claude' : 'cloud-api')
+    }
+  })
+
+  it('flag ABSENT preserves today exactly — a cloud-api HARD override is honored, a subscription HARD override is clamped', () => {
+    snapshot = { ...defaultModelSettings(), reasoning: { backend: 'local-qwen3', overrides: { 'skills.grader': 'cloud-api' } } }
+    expect(makeRouter().resolve('skills.grader').backend).toBe('cloud-api')
+
+    snapshot = {
+      ...defaultModelSettings(),
+      reasoning: { backend: 'subscription-claude', overrides: { 'scanner.llmVerdict': 'subscription-claude' } },
+      runner: { ...runnerDefaults(), enabled: true }
+    }
+    healthy = true
+    expect(makeRouter().resolve('scanner.llmVerdict').backend).toBe('local-qwen3')
+  })
+
+  it('flag TRUE + a non-local GLOBAL backend → the sensitive roles FOLLOW it', () => {
+    // subscription global, available → all five HARD roles ride the subscription.
+    snapshot = {
+      ...defaultModelSettings(),
+      reasoning: { backend: 'subscription-claude', allowSensitiveNonLocal: true },
+      runner: { ...runnerDefaults(), enabled: true }
+    }
+    healthy = true
+    hasKey = true
+    let router = makeRouter()
+    for (const role of HARD_ROLES) {
+      expect(router.resolve(role).backend, role).toBe('subscription-claude')
+    }
+
+    // cloud-api global, key present → all five HARD roles ride cloud-api.
+    snapshot = { ...defaultModelSettings(), reasoning: { backend: 'cloud-api', allowSensitiveNonLocal: true } }
+    router = makeRouter()
+    for (const role of HARD_ROLES) {
+      expect(router.resolve(role).backend, role).toBe('cloud-api')
+    }
+  })
+
+  it('flag TRUE but a LOCAL global backend leaves the sensitive roles local (consent granted, nothing configured to move them)', () => {
+    snapshot = { ...defaultModelSettings(), reasoning: { backend: 'local-qwen3', allowSensitiveNonLocal: true } }
+    const router = makeRouter()
+    for (const role of HARD_ROLES) {
+      expect(router.resolve(role).backend, role).toBe('local-qwen3')
+    }
+  })
+
+  it('flag TRUE + subscription global but the runner is UNHEALTHY → falls back per chain (cloud with a key, else local)', () => {
+    snapshot = {
+      ...defaultModelSettings(),
+      reasoning: { backend: 'subscription-claude', allowSensitiveNonLocal: true },
+      runner: { ...runnerDefaults(), enabled: true }
+    }
+    healthy = false
+    hasKey = true
+    expect(makeRouter().resolve('skills.grader').backend).toBe('cloud-api')
+    hasKey = false
+    expect(makeRouter().resolve('skills.grader').backend).toBe('local-qwen3') // local is the final fallback
+  })
+
+  it('flag TRUE lifts the subscription clamp for a NON-retrieval HARD override (which is clamped to local without consent)', () => {
+    const reasoning = { backend: 'local-qwen3' as const, overrides: { 'skills.grader': 'subscription-claude' as const } }
+    // Without consent: clamped to local (unchanged §11.4).
+    snapshot = { ...defaultModelSettings(), reasoning, runner: { ...runnerDefaults(), enabled: true } }
+    healthy = true
+    expect(makeRouter().resolve('skills.grader').backend).toBe('local-qwen3')
+    // With consent: the override is honored.
+    snapshot = { ...defaultModelSettings(), reasoning: { ...reasoning, allowSensitiveNonLocal: true }, runner: { ...runnerDefaults(), enabled: true } }
+    expect(makeRouter().resolve('skills.grader').backend).toBe('subscription-claude')
+  })
+
+  it('the flag NEVER moves a NON-sensitive role — those resolve to today under a local global with or without it', () => {
+    for (const allowSensitiveNonLocal of [undefined, true] as const) {
+      snapshot = { ...defaultModelSettings(), reasoning: { backend: 'local-qwen3', ...(allowSensitiveNonLocal !== undefined ? { allowSensitiveNonLocal } : {}) } }
+      const router = makeRouter()
+      for (const role of ROLE_KEYS.filter((r) => !ROLE_DEFAULTS[r].hardLocal)) {
+        expect(router.resolve(role).backend, `${role} flag=${String(allowSensitiveNonLocal)}`).toBe(ROLE_DEFAULTS[role].today)
+      }
+    }
+  })
+})

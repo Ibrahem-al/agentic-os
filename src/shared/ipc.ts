@@ -347,6 +347,71 @@ export interface SpendSummaryDto {
   readonly recent: readonly SpendEntryDto[]
 }
 
+// ── local-LLM usage (what runs on this computer — local qwen3 reasoning) ──────
+
+/** Windowed totals across the local reasoning ledger. `computeMs` is Ollama's own duration sum. */
+export interface LocalUsageTotalsDto {
+  readonly calls: number
+  readonly promptTokens: number
+  readonly evalTokens: number
+  readonly computeMs: number
+}
+
+/** One §2.2 role's slice of the window (`role` is the plain role key, or 'other' for un-attributed calls). */
+export interface LocalUsageRoleDto {
+  readonly role: string
+  readonly calls: number
+  readonly computeMs: number
+}
+
+/** One calendar day's slice (`day` is the UTC date `YYYY-MM-DD` of the row's ts). */
+export interface LocalUsageDayDto {
+  readonly day: string
+  readonly calls: number
+  readonly computeMs: number
+}
+
+/** One recent local reasoning call (newest first). `role` null ⇒ an un-attributed direct call. */
+export interface LocalUsageCallDto {
+  readonly id: number
+  readonly ts: string
+  readonly role: string | null
+  readonly model: string
+  readonly promptTokens: number | null
+  readonly evalTokens: number | null
+  readonly durationMs: number | null
+  readonly ok: boolean
+}
+
+/** One currently-loaded model from Ollama's live `/api/ps` snapshot. */
+export interface LocalLoadedModelDto {
+  readonly name: string
+  readonly sizeBytes: number
+  readonly sizeVramBytes: number
+  /** ISO-8601 idle-unload time, null when the daemon did not report one. */
+  readonly expiresAt: string | null
+}
+
+/**
+ * usage.local.summary / get_local_usage: what the LOCAL qwen3 reasoning tier has
+ * done (aggregated over `sinceDays`) plus a live resource snapshot. Search
+ * indexing (embeddings) is NOT counted here — that tier always runs locally and
+ * is out of this ledger's scope. `loaded`/`ollamaState` come from a live daemon
+ * probe (empty + 'daemon-not-running' when the helper is off).
+ */
+export interface LocalUsageSummaryDto {
+  /** The aggregation window actually used (echoes the request; clamped server-side). */
+  readonly sinceDays: number
+  readonly totals: LocalUsageTotalsDto
+  readonly byRole: readonly LocalUsageRoleDto[]
+  readonly byDay: readonly LocalUsageDayDto[]
+  /** Newest-first, capped (LOCAL_LLM_USAGE_RECENT_LIMIT) — independent of `sinceDays`. */
+  readonly recent: readonly LocalUsageCallDto[]
+  readonly loaded: readonly LocalLoadedModelDto[]
+  /** Live daemon state (the same three-state machine settings.ollamaStatus reports). */
+  readonly ollamaState: 'daemon-not-running' | 'models-missing' | 'ready'
+}
+
 // ── tasks & watched folders ───────────────────────────────────────────────────
 
 export interface TaskDto {
@@ -537,6 +602,42 @@ export interface ReasoningSettingsDto {
   readonly backend: IpcReasoningBackend
   readonly overrides?: Readonly<Record<string, IpcReasoningBackend>>
   readonly models?: Readonly<Record<string, string>>
+  /**
+   * Sensitive-egress consent (Stage 2, extending the §10.7 egress-consent
+   * pattern). Absent/false on a default install (DEFAULT == TODAY) — the §11.4
+   * HARD-local roles then stay local under EVERY backend setting. Only when the
+   * user grants this may a HARD-local (sensitive) role follow a non-local global
+   * backend or an explicit per-role override off this computer; the router still
+   * clamps local as the final fallback everywhere.
+   */
+  readonly allowSensitiveNonLocal?: boolean
+}
+
+/**
+ * A plain, user-facing grouping of the §2.2 reasoning roles for the "What runs
+ * where" UI. Derived from the role list — not a spec concept — so the settings
+ * panel can present roles in five human categories instead of 14 dotted keys.
+ */
+export type ReasoningRoleGroupDto =
+  | 'Understanding your sessions'
+  | 'Improving skills'
+  | 'Search & retrieval'
+  | 'Safety scanning'
+  | 'Summaries'
+
+/**
+ * One §2.2 reasoning role projected for the settings "What runs where" table
+ * (reasoning.roles). `sensitive` marks the §11.4 HARD-local roles (raw session
+ * text / scanned content — kept on this computer unless the user allows
+ * otherwise). `effectiveBackend` is the LIVE router.resolve() result — where the
+ * role runs right now given settings + key/health; null only when no router
+ * booted this launch (a degraded state the renderer reads as the local default).
+ */
+export interface ReasoningRoleDto {
+  readonly role: string
+  readonly group: ReasoningRoleGroupDto
+  readonly sensitive: boolean
+  readonly effectiveBackend: IpcReasoningBackend | null
 }
 
 /** Renderer-safe mirror of RunnerSettings (headless runner / subscription). */
@@ -852,6 +953,15 @@ export interface IpcChannels {
 
   'spend.summary': { req: void; res: SpendSummaryDto }
 
+  /**
+   * Local-LLM usage + live resource snapshot (local-LLM visibility). Read-only:
+   * aggregates the appdata `local_llm_usage` ledger over `sinceDays` (default
+   * LOCAL_LLM_USAGE_SUMMARY_DEFAULT_DAYS) and probes the daemon (ps + status) for
+   * `loaded`/`ollamaState`. Always answerable — an off daemon reports [] + not
+   * running.
+   */
+  'usage.local.summary': { req: { sinceDays?: number }; res: LocalUsageSummaryDto }
+
   'tasks.list': { req: void; res: readonly TaskDto[] }
   'watch.list': { req: void; res: readonly WatchedFolderDto[] }
   'watch.add': {
@@ -896,6 +1006,15 @@ export interface IpcChannels {
   'settings.revealMcpToken': { req: void; res: { token: string } }
   'settings.ollamaStatus': { req: void; res: OllamaStatusDto }
   'settings.ollamaPull': { req: { model: string; runId: string }; res: null }
+
+  /**
+   * The §2.2 reasoning roles projected for the settings "What runs where" table
+   * (Stage 2). Each row carries a plain group name, whether it is §11.4
+   * HARD-local (sensitive), and its LIVE effective backend (router.resolve). Pure
+   * read — never mutates. A launch without a router reports `effectiveBackend:
+   * null` for every role (DEFAULT == TODAY / local default).
+   */
+  'reasoning.roles': { req: void; res: readonly ReasoningRoleDto[] }
 
   /** Phase-17 headless subscription runner. Enable/model are saved via settings.save. */
   'runner.status': { req: void; res: RunnerStatusDto }

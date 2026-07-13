@@ -128,6 +128,61 @@ export function plural(n: number, singular: string, pluralWord?: string): string
 }
 
 /**
+ * Where a reasoning backend runs, in plain words (the "What runs where" badge
+ * and the AI-processing radio). A null backend (no router this launch) reads as
+ * the local default — DEFAULT == TODAY. Keeps the raw backend id out of the UI.
+ */
+export function plainBackend(backend: string | null): string {
+  switch (backend) {
+    case 'cloud-api':
+      return 'cloud'
+    case 'subscription-claude':
+      return 'subscription'
+    default:
+      // 'local-qwen3' and the null/degraded path both mean this computer.
+      return 'this computer'
+  }
+}
+
+/**
+ * A §2.2 reasoning role key → its plain user-facing group name (the same five
+ * groups the settings "What runs where" table uses, so the vocabulary is one
+ * language across Settings and Usage). A null/'other' role (an un-attributed
+ * direct call) and any unknown key fall back to "Other".
+ */
+const ROLE_GROUP: Readonly<Record<string, string>> = {
+  'extraction.fuzzy': 'Understanding your sessions',
+  'extraction.tiebreak': 'Understanding your sessions',
+  'extraction.verify': 'Understanding your sessions',
+  'retrieval.critic': 'Search & retrieval',
+  'retrieval.rewrite': 'Search & retrieval',
+  'skills.testset': 'Improving skills',
+  'skills.rewrite': 'Improving skills',
+  'skills.comparator': 'Improving skills',
+  'skills.executor': 'Improving skills',
+  'skills.grader': 'Improving skills',
+  'ingest.skillProposal': 'Improving skills',
+  'scanner.llmVerdict': 'Safety scanning',
+  'ingest.projectSummary': 'Summaries',
+  'context.summarize': 'Summaries'
+}
+
+export function plainRoleGroup(role: string | null): string {
+  if (role === null || role === '' || role === 'other') return 'Other'
+  return ROLE_GROUP[role] ?? 'Other'
+}
+
+/** Day keys for the last `n` days in UTC, oldest → newest, ending today (UTC). */
+export function lastNUtcDays(n: number): readonly string[] {
+  const now = Date.now()
+  const keys: string[] = []
+  for (let i = n - 1; i >= 0; i--) {
+    keys.push(new Date(now - i * 86_400_000).toISOString().slice(0, 10))
+  }
+  return keys
+}
+
+/**
  * Friendly label for a raw graph property key (readability addendum R2). A few
  * high-traffic keys get a hand-written phrase; everything else falls back to the
  * key with underscores turned to spaces (`content_hash` → "content hash"). The

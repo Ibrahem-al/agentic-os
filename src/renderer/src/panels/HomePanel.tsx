@@ -14,6 +14,7 @@ import type {
   AuditActionDto,
   InjectionFlagDto,
   LabelCountDto,
+  LocalUsageSummaryDto,
   SkillSummaryDto,
   SpendSummaryDto,
   StagedWriteDto,
@@ -21,7 +22,7 @@ import type {
 } from '../../../shared/ipc'
 import type { PanelProps } from '../App'
 import { call } from '../lib/ipc'
-import { dayKey, lastNDays, plainStatus, plainUsd, plural } from '../lib/plain'
+import { dayKey, lastNDays, lastNUtcDays, plainDuration, plainStatus, plainUsd, plural } from '../lib/plain'
 import { Badge, Button, PanelHeader, SectionHeader, Timestamp } from '../ui/kit'
 import { Icon } from '../ui/icons'
 import { BarChart, StatStrip } from '../ui/viz'
@@ -46,6 +47,8 @@ interface HomeData {
   readonly audit: Slice<readonly AuditActionDto[]>
   /** All staged rows (any status) — the week readout counts staged vs decided. */
   readonly week: Slice<readonly StagedWriteDto[]>
+  /** Local reasoning usage over a 1-day window — the "Local AI today" stat. */
+  readonly localUsage: Slice<LocalUsageSummaryDto>
 }
 
 const EMPTY: Slice<never> = { data: null, errored: false }
@@ -59,7 +62,8 @@ const INITIAL: HomeData = {
   tasks: EMPTY,
   skills: EMPTY,
   audit: EMPTY,
-  week: EMPTY
+  week: EMPTY,
+  localUsage: EMPTY
 }
 
 type Settled<T> = { readonly value: T } | { readonly error: true }
@@ -84,18 +88,20 @@ function useHomeData(): HomeData {
   useEffect(() => {
     let cancelled = false
     const refresh = async (): Promise<void> => {
-      const [status, staged, approvals, flags, spend, counts, tasks, skills, audit, week] = await Promise.all([
-        settle(call('app.status', undefined)),
-        settle(call('review.staged.list', { status: 'staged' })),
-        settle(call('review.approvals.list', { status: 'pending' })),
-        settle(call('review.flags.list', undefined)),
-        settle(call('spend.summary', undefined)),
-        settle(call('memory.counts', undefined)),
-        settle(call('tasks.list', undefined)),
-        settle(call('skills.list', undefined)),
-        settle(call('audit.list', {})),
-        settle(call('review.staged.list', {}))
-      ])
+      const [status, staged, approvals, flags, spend, counts, tasks, skills, audit, week, localUsage] =
+        await Promise.all([
+          settle(call('app.status', undefined)),
+          settle(call('review.staged.list', { status: 'staged' })),
+          settle(call('review.approvals.list', { status: 'pending' })),
+          settle(call('review.flags.list', undefined)),
+          settle(call('spend.summary', undefined)),
+          settle(call('memory.counts', undefined)),
+          settle(call('tasks.list', undefined)),
+          settle(call('skills.list', undefined)),
+          settle(call('audit.list', {})),
+          settle(call('review.staged.list', {})),
+          settle(call('usage.local.summary', { sinceDays: 1 }))
+        ])
       if (cancelled) return
       setState((prev) => ({
         status: fold(prev.status, status),
@@ -107,7 +113,8 @@ function useHomeData(): HomeData {
         tasks: fold(prev.tasks, tasks),
         skills: fold(prev.skills, skills),
         audit: fold(prev.audit, audit),
-        week: fold(prev.week, week)
+        week: fold(prev.week, week),
+        localUsage: fold(prev.localUsage, localUsage)
       }))
     }
     void refresh()
@@ -228,12 +235,14 @@ function HeadlineStats({
   spend,
   counts,
   tasks,
-  skills
+  skills,
+  localUsage
 }: {
   spend: Slice<SpendSummaryDto>
   counts: Slice<readonly LabelCountDto[]>
   tasks: Slice<readonly TaskDto[]>
   skills: Slice<readonly SkillSummaryDto[]>
+  localUsage: Slice<LocalUsageSummaryDto>
 }): React.JSX.Element {
   // Daily spend for the sparkline: bucket the recent-charges window by local day.
   const spendDays = lastNDays(14)
@@ -253,6 +262,12 @@ function HeadlineStats({
   const skillRows = skills.data ?? []
   const scored = skillRows.map((s) => s.activeBenchmarkScore).filter((v): v is number => v !== null)
   const avgScore = scored.length > 0 ? scored.reduce((sum, v) => sum + v, 0) / scored.length : null
+
+  // "Local AI today": today's bucket from the 1-day window (byDay keys are UTC).
+  const todayKey = lastNUtcDays(1)[0] ?? ''
+  const localToday = (localUsage.data?.byDay ?? []).find((d) => d.day === todayKey)
+  const localCalls = localToday?.calls ?? 0
+  const localComputeMs = localToday?.computeMs ?? 0
 
   return (
     <StatStrip
@@ -275,6 +290,13 @@ function HeadlineStats({
           label: 'Skills',
           value: skills.data !== null ? String(skillRows.length) : '—',
           ...(avgScore !== null ? { hint: `avg quality ${avgScore.toFixed(2)}` } : {})
+        },
+        {
+          label: 'Local AI today',
+          value: localUsage.data !== null ? String(localCalls) : '—',
+          ...(localUsage.data !== null && localComputeMs > 0
+            ? { hint: `${plainDuration(localComputeMs)} compute` }
+            : {})
         }
       ]}
     />
@@ -392,7 +414,13 @@ export default function HomePanel({ onNavigate }: PanelProps): React.JSX.Element
           </section>
 
           <section>
-            <HeadlineStats spend={data.spend} counts={data.counts} tasks={data.tasks} skills={data.skills} />
+            <HeadlineStats
+              spend={data.spend}
+              counts={data.counts}
+              tasks={data.tasks}
+              skills={data.skills}
+              localUsage={data.localUsage}
+            />
           </section>
 
           <section>

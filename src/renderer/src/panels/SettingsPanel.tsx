@@ -9,15 +9,18 @@ import type {
   BackupSettingsDto,
   InstallHookResultDto,
   IpcCloudProvider,
+  IpcReasoningBackend,
   ModelSettingsPatchDto,
   OllamaPullProgressDto,
+  ReasoningRoleDto,
+  ReasoningRoleGroupDto,
   RunnerSettingsDto,
   RunnerTestConnectionDto,
   SettingsDto,
   UpdaterStatusDto
 } from '../../../shared/ipc'
 import { call, IpcError, useIpc } from '../lib/ipc'
-import { plainBytes, plainStatus } from '../lib/plain'
+import { plainBackend, plainBytes, plainStatus } from '../lib/plain'
 import { Icon } from '../ui/icons'
 import {
   Badge,
@@ -52,6 +55,57 @@ const RUNNER_DEFAULTS: RunnerSettingsDto = {
 /** Claude CLI model aliases offered in the runner model select. */
 const RUNNER_MODEL_OPTIONS = ['sonnet', 'opus', 'haiku'] as const
 
+/**
+ * The three places background reasoning can run — the "AI processing" radio.
+ * Wired to `reasoning.backend`; the subscription choice reuses the runner-enable
+ * path (consent gate + the atomic backend coupling), so it is not a fork.
+ */
+const BACKEND_CHOICES: readonly {
+  readonly value: IpcReasoningBackend
+  readonly testId: string
+  readonly label: string
+  readonly hint: string
+}[] = [
+  {
+    value: 'local-qwen3',
+    testId: 'ai-processing-backend-local',
+    label: 'On this computer',
+    hint: 'Private and free. Needs the local AI helper (Ollama) running.'
+  },
+  {
+    value: 'cloud-api',
+    testId: 'ai-processing-backend-cloud',
+    label: 'My cloud API key',
+    hint: 'Faster; costs per use. Needs a key set under AI providers.'
+  },
+  {
+    value: 'subscription-claude',
+    testId: 'ai-processing-backend-subscription',
+    label: 'My Claude subscription',
+    hint: 'Uses your existing Claude plan through the runner.'
+  }
+]
+
+/** Canonical render order for the "What runs where" group rows. */
+const ROLE_GROUP_ORDER: readonly ReasoningRoleGroupDto[] = [
+  'Understanding your sessions',
+  'Search & retrieval',
+  'Improving skills',
+  'Safety scanning',
+  'Summaries'
+]
+
+/** Backend ids in a fixed order for a group's "where it runs" badges. */
+const BACKEND_BADGE_ORDER: readonly IpcReasoningBackend[] = ['local-qwen3', 'cloud-api', 'subscription-claude']
+
+/** Slug a plain group name into a stable testid suffix. */
+function groupSlug(group: string): string {
+  return group
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '')
+}
+
 function errMessage(err: unknown): string {
   return err instanceof IpcError ? err.message : String(err)
 }
@@ -69,6 +123,7 @@ function mbPerSec(bytesPerSecond: number | undefined): string {
  */
 const SECTIONS = [
   { id: 'providers', label: 'AI providers' },
+  { id: 'ai-processing', label: 'AI processing' },
   { id: 'local-ai', label: 'Local AI helper' },
   { id: 'claude', label: 'Claude connection' },
   { id: 'reasoning', label: 'Advanced reasoning' },
@@ -194,6 +249,12 @@ export default function SettingsPanel(): React.JSX.Element {
   // First-enable §10.7 egress consent (P1.10).
   const [consentOpen, setConsentOpen] = useState(false)
   const [consentAck, setConsentAck] = useState(false)
+
+  // ── AI processing (Stage 3): where reasoning runs + sensitive-egress consent ──
+  const rolesQuery = useIpc('reasoning.roles', undefined)
+  const [sensitiveConsentOpen, setSensitiveConsentOpen] = useState(false)
+  const [sensitiveAck, setSensitiveAck] = useState(false)
+  const [sensitiveBusy, setSensitiveBusy] = useState(false)
 
   // ── data & backups ───────────────────────────────────────────────────────────
   const backupsQuery = useIpc('backups.list', undefined)
@@ -443,6 +504,100 @@ export default function SettingsPanel(): React.JSX.Element {
     void saveRunner({ enabled: true })
   }
 
+  /**
+   * Switch the global reasoning backend to a NON-subscription tier (local/cloud).
+   * Mirrors the runner-toggle coupling: turns the runner OFF (a stale enabled
+   * runner would surface its health banner while sitting unused) and sets
+   * reasoning.backend in the same atomic save. Only touches the runner section
+   * when it is actually on, so a keyless install switching local↔cloud never
+   * materializes it. The main-side merge preserves overrides/models AND the
+   * allowSensitiveNonLocal flag (a backend-only reasoning patch — Stage 2).
+   */
+  const saveBackend = async (backend: IpcReasoningBackend): Promise<void> => {
+    if (dto === null) return
+    const currentRunner = dto.runner ?? RUNNER_DEFAULTS
+    const save: ModelSettingsPatchDto = currentRunner.enabled
+      ? { runner: { ...currentRunner, enabled: false }, reasoning: { backend } }
+      : { reasoning: { backend } }
+    setRunnerBusy(true)
+    try {
+      const fresh = await call('settings.save', save)
+      applyDto(fresh)
+      runnerStatus.reload()
+      toast.notify(
+        'ok',
+        backend === 'cloud-api'
+          ? 'background reasoning now uses your cloud api key'
+          : 'background reasoning now runs on this computer'
+      )
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setRunnerBusy(false)
+    }
+  }
+
+  /**
+   * Pick where background reasoning runs. Subscription reuses the runner-enable
+   * path verbatim (consent gate + the atomic subscription-claude coupling);
+   * local/cloud go through saveBackend, which also switches the runner off.
+   */
+  const selectBackend = (backend: IpcReasoningBackend): void => {
+    if (dto === null || runnerBusy) return
+    if (backend === (dto.reasoning?.backend ?? 'local-qwen3')) return
+    if (backend === 'subscription-claude') {
+      handleRunnerToggle(true)
+      return
+    }
+    void saveBackend(backend)
+  }
+
+  /**
+   * Persist the sensitive-egress consent flag. The current backend is echoed so
+   * the main-side merge sets ONLY the flag; a revoke sends `false` EXPLICITLY
+   * (Stage 2 gotcha 1 — an omitted key would preserve a prior true).
+   */
+  const saveSensitive = async (allow: boolean): Promise<void> => {
+    if (dto === null) return
+    const backend = dto.reasoning?.backend ?? 'local-qwen3'
+    setSensitiveBusy(true)
+    try {
+      const fresh = await call('settings.save', { reasoning: { backend, allowSensitiveNonLocal: allow } })
+      applyDto(fresh)
+      toast.notify(
+        'ok',
+        allow ? 'sensitive work may now leave this computer' : 'sensitive work is kept on this computer'
+      )
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setSensitiveBusy(false)
+    }
+  }
+
+  /** Turning ON gates behind the consent modal; turning OFF revokes immediately. */
+  const handleSensitiveToggle = (next: boolean): void => {
+    if (next) {
+      setSensitiveAck(false)
+      setSensitiveConsentOpen(true)
+      return
+    }
+    void saveSensitive(false)
+  }
+
+  const confirmSensitiveConsent = (): void => {
+    setSensitiveConsentOpen(false)
+    void saveSensitive(true)
+  }
+
+  // Re-fetch the live role map after any settings change (the router re-resolves
+  // post-invalidate on settings.save), so "What runs where" reflects the new
+  // backend/consent/key without a restart (Stage 2 gotcha 6).
+  const reloadRoles = rolesQuery.reload
+  useEffect(() => {
+    if (dto !== null) reloadRoles()
+  }, [dto, reloadRoles])
+
   /** Manual 1-turn canary (§3.7 — never scheduled); refresh the status after. */
   const testRunnerConnection = async (): Promise<void> => {
     setTesting(true)
@@ -606,6 +761,10 @@ export default function SettingsPanel(): React.JSX.Element {
   }
 
   const runnerCfg = dto.runner ?? RUNNER_DEFAULTS
+  // AI-processing: the persisted global backend + sensitive-egress consent.
+  const currentBackend: IpcReasoningBackend = dto.reasoning?.backend ?? 'local-qwen3'
+  const sensitiveAllowed = dto.reasoning?.allowSensitiveNonLocal === true
+  const roles: readonly ReasoningRoleDto[] | null = rolesQuery.data
   // Keep the current model selectable even if it is a custom id not in the presets.
   const runnerModelOptions = (
     (RUNNER_MODEL_OPTIONS as readonly string[]).includes(runnerCfg.model)
@@ -725,6 +884,118 @@ export default function SettingsPanel(): React.JSX.Element {
                 </div>
               </div>
             ))}
+          </div>
+        </SettingsSection>
+
+        {/* ── AI processing (where reasoning runs + sensitive consent) ──────── */}
+        <SettingsSection
+          id="ai-processing"
+          title="AI processing"
+          blurb="Where your background agents do their thinking. Search indexing (embeddings) always runs on this computer, whatever you choose here."
+          innerRef={registerSection('ai-processing')}
+        >
+          <div className="flex flex-col gap-5">
+            {/* Primary choice: a plain vertical radio list, not a card grid. */}
+            <fieldset className="flex flex-col gap-2" data-testid="ai-processing-backend">
+              <legend className="sr-only">Where background reasoning runs</legend>
+              {BACKEND_CHOICES.map((choice) => {
+                const selected = currentBackend === choice.value
+                return (
+                  <label
+                    key={choice.value}
+                    data-testid={choice.testId}
+                    className={`flex cursor-pointer items-start gap-3 rounded-md border p-3 transition-colors duration-120 ${
+                      selected ? 'border-accent bg-accent/5' : 'border-line-strong hover:bg-raised'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="ai-processing-backend"
+                      value={choice.value}
+                      checked={selected}
+                      disabled={runnerBusy}
+                      onChange={() => selectBackend(choice.value)}
+                      className="mt-0.5 size-3.5"
+                      style={{ accentColor: 'var(--color-accent)' }}
+                    />
+                    <span className="flex min-w-0 flex-col gap-0.5">
+                      <span className="text-[13px] text-ink">{choice.label}</span>
+                      <span className="text-[12px] text-ink-mute">{choice.hint}</span>
+                    </span>
+                  </label>
+                )
+              })}
+            </fieldset>
+
+            <p className="text-[12px] text-ink-mute">
+              Search indexing (embeddings) always runs on this computer, whatever you choose here.
+            </p>
+
+            {/* What runs where — the live reasoning.roles map, grouped in plain words. */}
+            <div className="flex flex-col gap-2 border-t border-line pt-4">
+              <div className="text-[13px] font-medium">What runs where</div>
+              <p className="text-[12px] text-ink-mute">
+                Where each kind of background work runs right now, given your choice above.
+              </p>
+              {roles === null ? (
+                <div className="py-2 text-[12px] text-ink-mute">Loading…</div>
+              ) : (
+                <div data-testid="ai-processing-runs">
+                  {ROLE_GROUP_ORDER.map((group) => {
+                    const groupRoles = roles.filter((r) => r.group === group)
+                    if (groupRoles.length === 0) return null
+                    const present = new Set(groupRoles.map((r) => r.effectiveBackend ?? 'local-qwen3'))
+                    const backends = BACKEND_BADGE_ORDER.filter((b) => present.has(b))
+                    const sensitive = groupRoles.some((r) => r.sensitive)
+                    return (
+                      <div
+                        key={group}
+                        className="flex flex-col gap-1 border-b border-line py-2.5"
+                        data-testid={`ai-processing-role-${groupSlug(group)}`}
+                      >
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="min-w-0 flex-1 text-[13px]">{group}</span>
+                          {sensitive && <Icon name="lock" size={13} className="shrink-0 text-ink-mute" />}
+                          {backends.map((b) => (
+                            <Badge key={b} status={b} label={plainBackend(b)} title={`Runs on ${plainBackend(b)}.`} />
+                          ))}
+                        </div>
+                        {sensitive && (
+                          <p className="text-[12px] text-ink-mute">
+                            Handles raw session text — kept on this computer unless you allow otherwise.
+                          </p>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Sensitive-egress override (extends the §10.7 consent pattern). */}
+            <div className="flex flex-col gap-2 border-t border-line pt-4">
+              <div className="flex items-center gap-3">
+                <Toggle
+                  label="Allow sensitive work to leave this computer"
+                  testId="ai-processing-sensitive-toggle"
+                  checked={sensitiveAllowed}
+                  disabled={sensitiveBusy}
+                  onChange={handleSensitiveToggle}
+                />
+                <span className="text-[13px]">{sensitiveAllowed ? 'on' : 'off'}</span>
+              </div>
+              {sensitiveAllowed ? (
+                <p className="text-[12px] text-ink-mute">
+                  Sensitive work (raw session text and scanned content) may follow your choice above off this
+                  computer. Turn this off to keep it local again.
+                </p>
+              ) : (
+                <p className="text-[12px] text-ink-mute">
+                  Sensitive work (raw session text and scanned content) stays on this computer, even when everything
+                  else uses the cloud or your subscription.
+                </p>
+              )}
+            </div>
           </div>
         </SettingsSection>
 
@@ -1356,6 +1627,55 @@ export default function SettingsPanel(): React.JSX.Element {
                 style={{ accentColor: 'var(--color-accent)' }}
               />
               <span>I understand what is sent to Anthropic.</span>
+            </label>
+          </div>
+        </Modal>
+      )}
+
+      {sensitiveConsentOpen && (
+        <Modal
+          title="allow sensitive work to leave this computer"
+          onClose={() => setSensitiveConsentOpen(false)}
+          footer={
+            <>
+              <Button onClick={() => setSensitiveConsentOpen(false)}>Cancel</Button>
+              <Button
+                variant="primary"
+                testId="ai-processing-sensitive-consent-confirm"
+                disabled={!sensitiveAck}
+                onClick={confirmSensitiveConsent}
+              >
+                Allow
+              </Button>
+            </>
+          }
+        >
+          <div className="flex flex-col gap-3 text-[13px] leading-6" data-testid="ai-processing-sensitive-consent">
+            <p>
+              Some background work handles raw session text: the transcripts of your sessions and the content the
+              safety scanner reviews. By default this work always runs on this computer, even when everything else
+              uses the cloud or your subscription.
+            </p>
+            <p>
+              Allow it to leave, and that raw text is sent to whichever service you chose above — your cloud API
+              provider, or Anthropic under your Claude subscription — the same place your other background reasoning
+              already goes.
+            </p>
+            <p className="text-ink-mute">
+              Your memory graph, embeddings, and search index never leave your machine. You can turn this back off at
+              any time.
+            </p>
+            <label className="mt-1 flex items-center gap-2 text-[12px]">
+              <input
+                type="checkbox"
+                aria-label="I understand sensitive text will leave this computer"
+                data-testid="ai-processing-sensitive-consent-ack"
+                checked={sensitiveAck}
+                onChange={(e) => setSensitiveAck(e.target.checked)}
+                className="size-3.5"
+                style={{ accentColor: 'var(--color-accent)' }}
+              />
+              <span>I understand what leaves this computer.</span>
             </label>
           </div>
         </Modal>
