@@ -47,6 +47,7 @@ export const statusColor: Readonly<Record<string, keyof typeof color>> = {
   done: 'ok',
   failed: 'err',
   deferred: 'warn',
+  paused: 'undo',
   // audit / traces / generic
   ok: 'ok',
   // degraded-but-up: the BootDiagnosticDto.level 'warn' rung (subsystem health)

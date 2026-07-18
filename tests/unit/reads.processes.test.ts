@@ -113,5 +113,80 @@ describe('getTaskProcesses', () => {
     expect(data.running).toBe(false)
     expect(data.children).toEqual([])
     expect(data.host).toEqual(HOST)
+    expect(data.summary).toBeNull() // no task in view → no summary
+  })
+})
+
+describe('getTaskProcesses summary (the Resources "averages and time it took")', () => {
+  const insertTaskRow = (
+    id: string,
+    kind: string,
+    status: string,
+    startedAt: string | null,
+    updatedAt: string,
+    attempts = 1
+  ): void => {
+    appData.db
+      .prepare(
+        `INSERT INTO tasks (id, kind, status, attempts, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(id, kind, status, attempts, startedAt, updatedAt)
+  }
+
+  it('summarizes a finished task: duration, kind average, cloud + runner usage', async () => {
+    // Two prior done extraction runs (10s, 30s) plus the one under inspection (20s).
+    insertTaskRow('e-old1', 'extraction', 'done', '2026-07-17T00:00:00.000Z', '2026-07-17T00:00:10.000Z')
+    insertTaskRow('e-old2', 'extraction', 'done', '2026-07-17T00:00:00.000Z', '2026-07-17T00:00:30.000Z')
+    insertTaskRow('e-x', 'extraction', 'done', '2026-07-17T01:00:00.000Z', '2026-07-17T01:00:20.000Z', 2)
+    appData.db
+      .prepare(
+        `INSERT INTO spend (task_id, provider, model, input_tokens, output_tokens, usd) VALUES ('e-x','anthropic','claude',800,200,0.05)`
+      )
+      .run()
+    appData.db
+      .prepare(
+        `INSERT INTO runner_runs (id, task_id, mode, started_at, input_tokens, output_tokens, is_error, exit_code)
+         VALUES ('rr','e-x','completion','2026-07-17T01:00:00.000Z',1000,300,0,0)`
+      )
+      .run()
+
+    const s = (await getTaskProcesses(baseDeps(), { id: 'e-x' })).summary
+    expect(s).not.toBeNull()
+    expect(s?.status).toBe('done')
+    expect(s?.running).toBe(false)
+    expect(s?.durationMs).toBe(20_000)
+    expect(s?.finishedAt).toBe('2026-07-17T01:00:20.000Z')
+    expect(s?.attempts).toBe(2)
+    expect(s?.kindSampleSize).toBe(3)
+    expect(s?.kindAvgDurationMs).toBe((10_000 + 30_000 + 20_000) / 3)
+    expect(s?.cloud).toEqual({ calls: 1, inputTokens: 800, outputTokens: 200, usd: 0.05 })
+    expect(s?.runner).toEqual({ runs: 1, inputTokens: 1000, outputTokens: 300 })
+  })
+
+  it('a running task reports live duration and no finishedAt', async () => {
+    insertTaskRow('r-run', 'skill', 'running', '2026-07-17T00:00:00.000Z', '2026-07-17T00:00:00.000Z')
+    const s = (await getTaskProcesses(baseDeps({ runningTaskId: () => 'r-run' }), { id: 'r-run' })).summary
+    expect(s?.running).toBe(true)
+    expect(s?.finishedAt).toBeNull()
+    expect(s?.durationMs).not.toBeNull() // now − started_at
+  })
+
+  it('does not report a duration for a paused/deferred task (updated_at is not a reliable run-end)', async () => {
+    // Ran (started 00:00), then paused later at 00:05 — updated_at moved past the run-end,
+    // so a naive updated−started would span the idle gap. Must report null instead.
+    insertTaskRow('p-x', 'skill', 'paused', '2026-07-17T00:00:00.000Z', '2026-07-17T00:05:00.000Z')
+    const s = (await getTaskProcesses(baseDeps(), { id: 'p-x' })).summary
+    expect(s?.status).toBe('paused')
+    expect(s?.durationMs).toBeNull()
+    expect(s?.finishedAt).toBeNull()
+  })
+
+  it('a never-run task reports null duration and no attributable usage', async () => {
+    insertTaskRow('r-pending', 'skill', 'pending', null, '2026-07-17T00:00:00.000Z')
+    const s = (await getTaskProcesses(baseDeps(), { id: 'r-pending' })).summary
+    expect(s?.durationMs).toBeNull()
+    expect(s?.cloud).toBeNull()
+    expect(s?.runner).toBeNull()
+    expect(s?.kindAvgDurationMs).toBeNull() // no finished 'skill' runs to average
   })
 })

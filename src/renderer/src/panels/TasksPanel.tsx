@@ -7,9 +7,9 @@
  * them. Re-skin only: every IPC call, the scan/add/remove flows, and the
  * `watch-scan-<name>` + "N ingested" contracts are unchanged.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useState } from 'react'
 import { call, IpcError, useIpc } from '../lib/ipc'
-import { truncate } from '../lib/format'
+import { tokens, truncate } from '../lib/format'
 import {
   Badge,
   Button,
@@ -17,6 +17,7 @@ import {
   Disclosure,
   ErrorState,
   LoadingRows,
+  Modal,
   PanelHeader,
   SectionHeader,
   TextInput,
@@ -26,10 +27,11 @@ import {
 import type { Column } from '../ui/kit'
 import { Icon } from '../ui/icons'
 import { CompositionBar } from '../ui/viz'
-import { plainBytes, plainStatus, plural } from '../lib/plain'
+import { plainBytes, plainDuration, plainStatus, plainUsd, plural } from '../lib/plain'
 import type {
   TaskDto,
   TaskProcessesDto,
+  TaskSummaryDto,
   TriggersStatusDto,
   WatchScanResultDto,
   WatchedFolderDto
@@ -49,9 +51,19 @@ function canRunNow(status: TaskDto['status']): boolean {
   return status === 'deferred' || status === 'failed' || status === 'cancelled' || status === 'pending'
 }
 
-/** "Cancel" applies to a job that is in progress or queued. */
+/** "Cancel" applies to a job that is in progress, queued, or paused. */
 function canCancel(status: TaskDto['status']): boolean {
+  return status === 'running' || status === 'pending' || status === 'deferred' || status === 'paused'
+}
+
+/** "Pause" (hold without ending) applies to a job that is in progress or queued. */
+function canPause(status: TaskDto['status']): boolean {
   return status === 'running' || status === 'pending' || status === 'deferred'
+}
+
+/** "Resume" applies only to a paused job. */
+function canResume(status: TaskDto['status']): boolean {
+  return status === 'paused'
 }
 
 // ── jobs table ────────────────────────────────────────────────────────────────
@@ -108,17 +120,19 @@ function JobsBody({
     done: 0,
     failed: 0,
     deferred: 0,
-    cancelled: 0
+    cancelled: 0,
+    paused: 0
   }
   for (const task of rows) counts[task.status] += 1
 
   // Semantic tints (brief §P5): running = accent, waiting = mute, finished = ok,
-  // postponed = warn, failed = err, cancelled = mute. Labels match lib/plain.
+  // postponed = warn, paused = undo, cancelled = mute, failed = err. Labels match lib/plain.
   const segments = [
     { label: 'in progress', count: counts.running, tint: 'accent' as const },
     { label: 'waiting', count: counts.pending, tint: 'mute' as const },
     { label: 'finished', count: counts.done, tint: 'ok' as const },
     { label: 'postponed', count: counts.deferred, tint: 'warn' as const },
+    { label: 'paused', count: counts.paused, tint: 'undo' as const },
     { label: 'cancelled', count: counts.cancelled, tint: 'mute' as const },
     { label: 'failed', count: counts.failed, tint: 'err' as const }
   ]
@@ -153,7 +167,7 @@ function JobsBody({
   )
 }
 
-// ── processes & resources ───────────────────────────────────────────────────────
+// ── resources & summary (per-task modal) ─────────────────────────────────────────
 
 /** One CPU/RAM line — cpu% and memory, each shown only when the OS reported it. */
 function ResourceMeter({ cpuPercent, memoryBytes }: { cpuPercent: number | null; memoryBytes: number | null }): React.JSX.Element {
@@ -163,36 +177,75 @@ function ResourceMeter({ cpuPercent, memoryBytes }: { cpuPercent: number | null;
   return <span className="font-mono text-[11px] text-ink">{parts.length > 0 ? parts.join(' · ') : '—'}</span>
 }
 
+/** A hairline-separated label → value row in the summary. */
+function StatLine({ label, children }: { label: string; children: React.ReactNode }): React.JSX.Element {
+  return (
+    <div className="flex items-baseline justify-between gap-4 border-b border-line py-1.5 last:border-0">
+      <span className="shrink-0 text-[12px] text-ink-mute">{label}</span>
+      <span className="text-right text-[12px] text-ink">{children}</span>
+    </div>
+  )
+}
+
+const TOKENS_TITLE = 'units of AI text, roughly ¾ of a word'
+
+/** The "averages and time it took" summary — meaningful even for a finished job. */
+function TaskSummaryView({ summary }: { summary: TaskSummaryDto }): React.JSX.Element {
+  const { durationMs, running, kindAvgDurationMs, kindSampleSize, attempts, cloud, runner } = summary
+  const durationText =
+    durationMs === null
+      ? summary.status === 'pending'
+        ? "Hasn't run yet."
+        : 'Not recorded.'
+      : running
+        ? `${plainDuration(durationMs)} so far`
+        : plainDuration(durationMs)
+  return (
+    <div className="flex flex-col" data-testid="task-summary">
+      <StatLine label={running ? 'Running for' : 'Time it took'}>{durationText}</StatLine>
+      {kindAvgDurationMs !== null && (
+        <StatLine label={`Similar jobs (${plural(kindSampleSize, 'run')})`}>
+          typically {plainDuration(kindAvgDurationMs)}
+        </StatLine>
+      )}
+      <StatLine label="Tries">{attempts > 1 ? `${attempts} (retried)` : '1'}</StatLine>
+      {cloud !== null && (
+        <StatLine label="Cloud AI">
+          <span title={TOKENS_TITLE} className="font-mono">
+            {tokens(cloud.inputTokens)} / {tokens(cloud.outputTokens)}
+          </span>{' '}
+          · {plainUsd(cloud.usd)} · {plural(cloud.calls, 'call')}
+        </StatLine>
+      )}
+      {runner !== null && (
+        <StatLine label="Subscription AI">
+          <span title={TOKENS_TITLE} className="font-mono">
+            {tokens(runner.inputTokens)} / {tokens(runner.outputTokens)}
+          </span>{' '}
+          · {plural(runner.runs, 'run')}
+        </StatLine>
+      )}
+      {cloud === null && runner === null && (
+        <StatLine label="AI used">on‑device model (not itemized per job)</StatLine>
+      )}
+      {summary.lastError !== null && summary.lastError !== '' && (
+        <div className="mt-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 font-mono text-[11px] break-words text-err">
+          {summary.lastError}
+        </div>
+      )}
+    </div>
+  )
+}
+
 /**
- * "What's running & resources" — the OS processes doing a task's work and their
- * RAM/CPU: the app's own process (where in-process jobs run), the shared Ollama
- * models the local tier holds, and any child processes the task spawned.
+ * Live OS processes for a RUNNING task: the app's own process (where in-process
+ * jobs run), the shared Ollama models the local tier holds, and any child
+ * processes the task spawned. Shown only while the task is in flight.
  */
-function ResourcesBody({
-  data,
-  onRefresh,
-  refreshing
-}: {
-  data: TaskProcessesDto
-  onRefresh: () => void
-  refreshing: boolean
-}): React.JSX.Element {
+function LiveProcessesView({ data }: { data: TaskProcessesDto }): React.JSX.Element {
   const models = data.localRuntime.loadedModels
   return (
     <div className="flex flex-col gap-3" data-testid="task-processes">
-      <div className="flex items-center justify-between">
-        <p className="text-[13px] text-ink-mute">
-          {data.taskId === null
-            ? 'Nothing is running right now — showing the app and local models.'
-            : data.running
-              ? <>Running now: <span className="font-mono text-[11px]">{data.taskId}</span></>
-              : <>Last known for <span className="font-mono text-[11px]">{data.taskId}</span> (not running now).</>}
-        </p>
-        <Button variant="ghost" onClick={onRefresh} disabled={refreshing} testId="task-processes-refresh">
-          {refreshing ? 'Refreshing…' : 'Refresh'}
-        </Button>
-      </div>
-
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="rounded-md border border-line px-4 py-3">
           <div className="mb-1 text-[12px] font-medium text-ink">This app</div>
@@ -247,6 +300,96 @@ function ResourcesBody({
         </div>
       )}
     </div>
+  )
+}
+
+/** Per-task "Resources" modal: the summary always, plus live processes while it runs. */
+function TaskResourcesModal({ taskId, kind, onClose }: { taskId: string; kind: string; onClose: () => void }): React.JSX.Element {
+  const proc = useIpc('tasks.processes', { id: taskId })
+  return (
+    <Modal
+      title={`Resources — ${plainKind(kind)}`}
+      onClose={onClose}
+      wide
+      footer={
+        <>
+          <Button onClick={() => proc.reload()}>Refresh</Button>
+          <Button variant="primary" onClick={onClose}>
+            Close
+          </Button>
+        </>
+      }
+    >
+      {proc.error !== null ? (
+        <ErrorState error={proc.error} onRetry={proc.reload} />
+      ) : proc.data === null ? (
+        <LoadingRows rows={3} />
+      ) : (
+        <div className="flex flex-col gap-4" data-testid="task-resources">
+          <div className="font-mono text-[11px] break-all text-ink-mute">{taskId}</div>
+          {proc.data.summary !== null ? (
+            <TaskSummaryView summary={proc.data.summary} />
+          ) : (
+            <p className="text-[12px] text-ink-mute">No summary available for this job.</p>
+          )}
+          {proc.data.running && (
+            <div className="flex flex-col gap-2">
+              <SectionHeader>Running now — processes &amp; resources</SectionHeader>
+              <LiveProcessesView data={proc.data} />
+            </div>
+          )}
+        </div>
+      )}
+    </Modal>
+  )
+}
+
+/** Confirm the destructive cancel, offering Pause as the non-destructive alternative. */
+function CancelConfirmModal({
+  task,
+  busy,
+  onPause,
+  onConfirm,
+  onClose
+}: {
+  task: TaskDto
+  busy: boolean
+  onPause: () => void
+  onConfirm: () => void
+  onClose: () => void
+}): React.JSX.Element {
+  const pausable = canPause(task.status)
+  return (
+    <Modal
+      title="Stop this job?"
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose} disabled={busy}>
+            Keep it
+          </Button>
+          {pausable && (
+            <Button variant="primary" testId="task-cancel-pause-instead" disabled={busy} onClick={onPause}>
+              Pause instead
+            </Button>
+          )}
+          <Button variant="danger" testId="task-cancel-confirm" disabled={busy} onClick={onConfirm}>
+            Cancel job
+          </Button>
+        </>
+      }
+    >
+      <p className="text-[13px]">
+        Cancelling stops <span className="font-mono text-[11px]">{plainKind(task.kind)}</span> and discards its
+        progress. You can revive it later with Run now, but it starts over.
+      </p>
+      {pausable && (
+        <p className="mt-2 text-[12px] leading-5 text-ink-mute">
+          To hold it without losing your place, <strong className="text-ink">Pause</strong> it instead — a paused job
+          waits until you resume it.
+        </p>
+      )}
+    </Modal>
   )
 }
 
@@ -331,28 +474,11 @@ export default function TasksPanel(): React.JSX.Element {
   const [tags, setTags] = useState('')
   const [adding, setAdding] = useState(false)
 
-  // Job controls (run now / cancel) + the live process/resource view.
+  // Job controls. busyTaskId guards a row's buttons during a call; the two modals
+  // hold the target task for the Resources view and the cancel confirmation.
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null)
-  const [procData, setProcData] = useState<TaskProcessesDto | null>(null)
-  const [procLoading, setProcLoading] = useState(false)
-  /** null ⇒ show the current in-flight task; a taskId targets that job's processes. */
-  const [procTarget, setProcTarget] = useState<string | null>(null)
-
-  const loadProcesses = useCallback(async (target: string | null): Promise<void> => {
-    setProcLoading(true)
-    try {
-      const data = await call('tasks.processes', target !== null ? { id: target } : {})
-      setProcData(data)
-    } catch {
-      // A resource read is best-effort; leave the last snapshot rather than error out.
-    } finally {
-      setProcLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    void loadProcesses(procTarget)
-  }, [loadProcesses, procTarget])
+  const [resourcesTask, setResourcesTask] = useState<{ id: string; kind: string } | null>(null)
+  const [cancelTask, setCancelTask] = useState<TaskDto | null>(null)
 
   const runNowJob = async (id: string): Promise<void> => {
     setBusyTaskId(id)
@@ -376,7 +502,34 @@ export default function TasksPanel(): React.JSX.Element {
       const stopped = result.killedChildren > 0 ? ` (${plural(result.killedChildren, 'process', 'processes')} stopped)` : ''
       toast.notify('ok', result.wasRunning ? `Cancelling…${stopped}` : `Job cancelled${stopped}`)
       tasks.reload()
-      void loadProcesses(procTarget)
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setBusyTaskId(null)
+    }
+  }
+
+  const pauseJob = async (id: string): Promise<void> => {
+    setBusyTaskId(id)
+    try {
+      const result = await call('tasks.pause', { id })
+      const stopped =
+        result.killedChildren > 0 ? ` (${plural(result.killedChildren, 'process', 'processes')} stopped)` : ''
+      toast.notify('ok', result.wasRunning ? `Pausing…${stopped}` : `Job paused${stopped}`)
+      tasks.reload()
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setBusyTaskId(null)
+    }
+  }
+
+  const resumeJob = async (id: string): Promise<void> => {
+    setBusyTaskId(id)
+    try {
+      await call('tasks.resume', { id })
+      toast.notify('ok', 'Job resumed')
+      tasks.reload()
     } catch (err) {
       toast.notify('err', errMessage(err))
     } finally {
@@ -454,9 +607,10 @@ export default function TasksPanel(): React.JSX.Element {
       header: '',
       render: (row) => {
         const busy = busyTaskId === row.id
+        const isWorkflow = row.kind === 'workflow'
         return (
           <span className="flex items-center justify-end gap-1.5">
-            {row.kind !== 'workflow' && canRunNow(row.status) && (
+            {!isWorkflow && canRunNow(row.status) && (
               <Button
                 variant="ghost"
                 disabled={busy}
@@ -466,17 +620,41 @@ export default function TasksPanel(): React.JSX.Element {
                 {busy ? '…' : 'Run now'}
               </Button>
             )}
-            {row.kind !== 'workflow' && canCancel(row.status) && (
+            {!isWorkflow && canResume(row.status) && (
+              <Button
+                variant="primary"
+                disabled={busy}
+                onClick={() => void resumeJob(row.id)}
+                testId={`task-resume-${row.id}`}
+              >
+                {busy ? '…' : 'Resume'}
+              </Button>
+            )}
+            {!isWorkflow && canPause(row.status) && (
+              <Button
+                variant="ghost"
+                disabled={busy}
+                onClick={() => void pauseJob(row.id)}
+                testId={`task-pause-${row.id}`}
+              >
+                Pause
+              </Button>
+            )}
+            {!isWorkflow && canCancel(row.status) && (
               <Button
                 variant="danger-ghost"
                 disabled={busy}
-                onClick={() => void cancelJob(row.id)}
+                onClick={() => setCancelTask(row)}
                 testId={`task-cancel-${row.id}`}
               >
                 Cancel
               </Button>
             )}
-            <Button variant="ghost" onClick={() => setProcTarget(row.id)} testId={`task-resources-${row.id}`}>
+            <Button
+              variant="ghost"
+              onClick={() => setResourcesTask({ id: row.id, kind: row.kind })}
+              testId={`task-resources-${row.id}`}
+            >
               Resources
             </Button>
           </span>
@@ -551,26 +729,6 @@ export default function TasksPanel(): React.JSX.Element {
             <LoadingRows rows={3} />
           ) : (
             <JobsBody rows={tasks.data} columns={taskColumns} />
-          )}
-        </section>
-
-        <section>
-          <SectionHeader meta="The processes doing the work, and how much CPU and memory they use">
-            What&apos;s running &amp; resources
-          </SectionHeader>
-          {procData === null ? (
-            <LoadingRows rows={2} />
-          ) : (
-            <>
-              {procTarget !== null && (
-                <div className="mb-2">
-                  <Button variant="ghost" onClick={() => setProcTarget(null)} testId="task-processes-clear">
-                    ← Back to what&apos;s running now
-                  </Button>
-                </div>
-              )}
-              <ResourcesBody data={procData} onRefresh={() => void loadProcesses(procTarget)} refreshing={procLoading} />
-            </>
           )}
         </section>
 
@@ -707,6 +865,31 @@ export default function TasksPanel(): React.JSX.Element {
           )}
         </section>
       </div>
+
+      {resourcesTask !== null && (
+        <TaskResourcesModal
+          taskId={resourcesTask.id}
+          kind={resourcesTask.kind}
+          onClose={() => setResourcesTask(null)}
+        />
+      )}
+      {cancelTask !== null && (
+        <CancelConfirmModal
+          task={cancelTask}
+          busy={busyTaskId === cancelTask.id}
+          onPause={() => {
+            const id = cancelTask.id
+            setCancelTask(null)
+            void pauseJob(id)
+          }}
+          onConfirm={() => {
+            const id = cancelTask.id
+            setCancelTask(null)
+            void cancelJob(id)
+          }}
+          onClose={() => setCancelTask(null)}
+        />
+      )}
     </>
   )
 }

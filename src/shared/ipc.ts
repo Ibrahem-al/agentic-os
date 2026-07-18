@@ -500,7 +500,7 @@ export interface LocalUsageSummaryDto {
 export interface TaskDto {
   readonly id: string
   readonly kind: string
-  readonly status: 'pending' | 'running' | 'done' | 'failed' | 'deferred' | 'cancelled'
+  readonly status: 'pending' | 'running' | 'done' | 'failed' | 'deferred' | 'cancelled' | 'paused'
   readonly attempts: number
   readonly notBeforeUnixMs: number | null
   readonly lastError: string | null
@@ -531,8 +531,52 @@ export interface TaskChildProcessDto extends ProcResourceDto {
   readonly live: boolean
 }
 
+/** Metered cloud usage attributed to one task (spend rows keyed on task_id). */
+export interface TaskCloudUsageDto {
+  readonly calls: number
+  readonly inputTokens: number
+  readonly outputTokens: number
+  readonly usd: number
+}
+
+/** Subscription-runner usage attributed to one task (runner_runs keyed on task_id). */
+export interface TaskRunnerUsageDto {
+  readonly runs: number
+  readonly inputTokens: number
+  readonly outputTokens: number
+}
+
 /**
- * tasks.processes / get_task_processes: what is running for a task and its RAM/CPU.
+ * A completed/running task's summary — the "averages and time it took" readout.
+ * `durationMs` is the last run's execution time — live for a running task, and the
+ * started→finished span for a terminal (done/failed/cancelled) one; it is null for a
+ * paused/deferred/pending row, whose run-end can't be read reliably from timestamps.
+ * `kindAvgDurationMs` is the mean execution time of recent finished tasks OF THE SAME
+ * KIND (the "typically ~Ns" comparison), null under 2 samples.
+ * `cloud`/`runner` are the AI usage attributable to this task (null when none —
+ * note the local reasoning tier is not itemized per task). Everything null-tolerant:
+ * an old task with no started_at reports durationMs null (its time is simply unknown).
+ */
+export interface TaskSummaryDto {
+  readonly status: TaskDto['status']
+  readonly kind: string
+  readonly attempts: number
+  readonly startedAt: string | null
+  /** When the last run ended (terminal tasks); null while running or never-run. */
+  readonly finishedAt: string | null
+  readonly durationMs: number | null
+  readonly running: boolean
+  readonly kindAvgDurationMs: number | null
+  readonly kindSampleSize: number
+  readonly lastError: string | null
+  readonly cloud: TaskCloudUsageDto | null
+  readonly runner: TaskRunnerUsageDto | null
+}
+
+/**
+ * tasks.processes / get_task_processes: what is running for a task and its RAM/CPU,
+ * plus a `summary` (duration, typical-for-kind, attributable AI usage) so a FINISHED
+ * task — which has no live process — still shows meaningful "averages and time it took".
  * `host` is the app's main process (Electron-measured — cross-platform CPU), where
  * in-process background tasks actually run; `localRuntime` is the SHARED Ollama
  * daemon's loaded models (the local-model work a task drives — memory per model);
@@ -543,6 +587,8 @@ export interface TaskProcessesDto {
   readonly taskId: string | null
   /** Is this task the queue's in-flight task right now. */
   readonly running: boolean
+  /** Historical summary for the task (null when taskId is null / no such task). */
+  readonly summary: TaskSummaryDto | null
   readonly host: TaskHostProcessDto | null
   readonly localRuntime: {
     readonly reachable: boolean
@@ -1109,11 +1155,22 @@ export interface IpcChannels {
   'tasks.list': { req: void; res: readonly TaskDto[] }
   /** Force a task to run now (deferred/failed/cancelled/backoff-pending) — §8 "run now". */
   'tasks.runNow': { req: { id: string }; res: { taskId: string; status: 'pending' } }
-  /** Cancel a task (running/pending/deferred) — §8 cooperative cancel; kills its child processes. */
+  /** Cancel a task (running/pending/deferred/paused) — §8 cooperative cancel; kills its child processes. */
   'tasks.cancel': {
     req: { id: string }
     res: { taskId: string; status: 'cancelled'; wasRunning: boolean; killedChildren: number }
   }
+  /**
+   * Pause a task (running/pending/deferred) without ending it — the non-destructive
+   * alternative to cancel. A running task stops at its next safe boundary and is
+   * revived by tasks.resume (a workflow from its checkpoint; a plain handler re-runs).
+   */
+  'tasks.pause': {
+    req: { id: string }
+    res: { taskId: string; status: 'paused'; wasRunning: boolean; killedChildren: number }
+  }
+  /** Resume a paused task — re-queue it to run again. */
+  'tasks.resume': { req: { id: string }; res: { taskId: string; status: 'pending' } }
   /** What is running for a task + its RAM/CPU (id omitted = the current in-flight task). */
   'tasks.processes': { req: { id?: string }; res: TaskProcessesDto }
   'watch.list': { req: void; res: readonly WatchedFolderDto[] }

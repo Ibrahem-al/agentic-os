@@ -47,12 +47,13 @@ const APPDATA_SCHEMA: readonly string[] = [
     kind TEXT NOT NULL,
     payload_json TEXT,
     status TEXT NOT NULL DEFAULT 'pending'
-      CHECK (status IN ('pending','running','done','failed','deferred','cancelled')),
+      CHECK (status IN ('pending','running','done','failed','deferred','cancelled','paused')),
     attempts INTEGER NOT NULL DEFAULT 0,
     not_before_unix_ms INTEGER,
     priority INTEGER NOT NULL DEFAULT 0,
     waiting_approval_id TEXT,
     last_error TEXT,
+    started_at TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
@@ -297,7 +298,7 @@ const APPDATA_SCHEMA: readonly string[] = [
  * Current SQLite schema version. Exported so the boot-time data manifest can
  * record which schema the on-disk store carries (docs/DATA-MIGRATION.md).
  */
-export const APPDATA_USER_VERSION = 10
+export const APPDATA_USER_VERSION = 11
 
 /**
  * Column additions to tables that predate them (CREATE IF NOT EXISTS skips an
@@ -403,6 +404,46 @@ function migrateTasksStatusCheck(db: BetterSqlite3.Database): void {
       FROM tasks`)
     db.exec(`DROP TABLE tasks`)
     db.exec(`ALTER TABLE tasks_v10 RENAME TO tasks`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`)
+  })()
+}
+
+/**
+ * v11: widen tasks.status's CHECK to allow 'paused' (user pause/resume) AND add
+ * the `started_at` column (per-run execution start, for the Resources "time it
+ * took" readout). SQLite cannot ALTER a CHECK, so this is a guarded/idempotent
+ * in-place rebuild mirroring migrateTasksStatusCheck; a fresh v11 install already
+ * has both, making this a no-op. The 11 pre-v11 columns copy across; started_at
+ * defaults NULL for existing rows (their execution time is simply unknown).
+ */
+function migrateTasksV11(db: BetterSqlite3.Database): void {
+  const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'`).get() as
+    | { sql: string }
+    | undefined
+  if (row === undefined) return // fresh install — the schema loop created it in the v11 shape
+  if (/'paused'/.test(row.sql)) return // already at the v11 shape
+  db.transaction(() => {
+    db.exec(`CREATE TABLE tasks_v11 (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      payload_json TEXT,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','running','done','failed','deferred','cancelled','paused')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      not_before_unix_ms INTEGER,
+      priority INTEGER NOT NULL DEFAULT 0,
+      waiting_approval_id TEXT,
+      last_error TEXT,
+      started_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    )`)
+    db.exec(`INSERT INTO tasks_v11
+      (id, kind, payload_json, status, attempts, not_before_unix_ms, priority, waiting_approval_id, last_error, created_at, updated_at)
+      SELECT id, kind, payload_json, status, attempts, not_before_unix_ms, priority, waiting_approval_id, last_error, created_at, updated_at
+      FROM tasks`)
+    db.exec(`DROP TABLE tasks`)
+    db.exec(`ALTER TABLE tasks_v11 RENAME TO tasks`)
     db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`)
   })()
 }
@@ -566,6 +607,9 @@ export function openAppData(dbPath: string, backupsDir?: string): AppData {
   // v10: widen tasks.status's CHECK to allow 'cancelled' (same non-additive,
   // guarded, idempotent in-place rebuild).
   migrateTasksStatusCheck(db)
+  // v11: widen tasks.status's CHECK to allow 'paused' + add tasks.started_at
+  // (same guarded/idempotent in-place rebuild — a CHECK cannot be ALTERed).
+  migrateTasksV11(db)
   if (existingVersion < APPDATA_USER_VERSION) {
     // Every schema change is additive (CREATE IF NOT EXISTS tables + guarded ADD
     // COLUMNs above) EXCEPT the v8 audit_log CHECK widening (migrateAuditLogOutcomeCheck,
@@ -578,7 +622,9 @@ export function openAppData(dbPath: string, backupsDir?: string): AppData {
     // runner_runs + runner_submissions, phase 14; v7 → v8: audit_log.outcome
     // 'pending' + lane_jobs — the crash-safety write-intent journal; v8 → v9:
     // local_llm_usage — the additive local-LLM usage ledger; v9 → v10:
-    // tasks.status 'cancelled' — user task-cancel, migrateTasksStatusCheck).
+    // tasks.status 'cancelled' — user task-cancel, migrateTasksStatusCheck;
+    // v10 → v11: tasks.status 'paused' + tasks.started_at — user pause/resume
+    // + the Resources "time it took" readout, migrateTasksV11).
     db.pragma(`user_version = ${APPDATA_USER_VERSION}`)
   }
   return {

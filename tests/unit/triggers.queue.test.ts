@@ -698,4 +698,116 @@ describe('DurableTaskQueue task control (runNow / cancel — §8 user actions)',
     expect(row('rev1').status).toBe('done')
     expect(ran).toEqual(['z'])
   })
+
+  it('pause holds a queued task (not run), and resume re-queues it', async () => {
+    const queue = makeQueue()
+    const ran: string[] = []
+    queue.registerHandler('probe', (payload) => {
+      ran.push(String(payload['tag']))
+      return Promise.resolve()
+    })
+    queue.enqueue({ id: 'p1', kind: 'probe', payload: { tag: 'a' }, notBeforeUnixMs: Date.now() + 10_000 })
+    queue.start()
+    const result = queue.pause('p1')
+    expect(result).toMatchObject({ taskId: 'p1', status: 'paused', wasRunning: false, killedChildren: 0 })
+    expect(row('p1').status).toBe('paused')
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(ran).toEqual([]) // held, never dispatched
+    // Resume re-queues it and it runs.
+    expect(queue.resume('p1')).toEqual({ taskId: 'p1', status: 'pending' })
+    expect(row('p1').status).toBe('pending')
+    await tick()
+    expect(row('p1').status).toBe('done')
+    expect(ran).toEqual(['a'])
+  })
+
+  it('pause of the in-flight task marks it paused — recordFailure never overwrites it', async () => {
+    const killed: string[] = []
+    const queue = new DurableTaskQueue({ db: appData.db, killChildrenForTask: (id) => (killed.push(id), 2) })
+    queues.push(queue)
+    let sawSignal: AbortSignal | undefined
+    queue.registerHandler('slow', (_payload, ctx) => {
+      sawSignal = ctx.signal
+      return new Promise<void>((_resolve, reject) => {
+        ctx.signal.addEventListener('abort', () => reject(new Error('handler saw the pause')), { once: true })
+      })
+    })
+    queue.start()
+    queue.enqueue({ id: 'run-p', kind: 'slow' })
+    await tick()
+    expect(queue.runningTaskId).toBe('run-p')
+
+    const result = queue.pause('run-p')
+    expect(result).toMatchObject({ taskId: 'run-p', status: 'paused', wasRunning: true, killedChildren: 2 })
+    expect(killed).toEqual(['run-p'])
+    expect(sawSignal?.aborted).toBe(true)
+
+    await tick()
+    // The settle path — NOT recordFailure — wrote 'paused'.
+    expect(row('run-p').status).toBe('paused')
+    expect(row('run-p').last_error).toBe('paused by user')
+  })
+
+  it('cancel wins over pause when both target the in-flight task', async () => {
+    const queue = makeQueue()
+    queue.registerHandler(
+      'slow',
+      (_payload, ctx) =>
+        new Promise<void>((_resolve, reject) => {
+          ctx.signal.addEventListener('abort', () => reject(new Error('stopped')), { once: true })
+        })
+    )
+    queue.start()
+    queue.enqueue({ id: 'cw', kind: 'slow' })
+    await tick()
+    queue.pause('cw')
+    queue.cancel('cw') // cancel after pause → cancel wins (the terminal action)
+    await tick()
+    expect(row('cw').status).toBe('cancelled')
+  })
+
+  it('pause rejects a finished/unknown/approval-parked task; resume rejects a non-paused task', async () => {
+    const queue = makeQueue()
+    queue.registerHandler('probe', () => Promise.resolve())
+    queue.start()
+    expect(codeOf(() => queue.pause('ghost'))).toBe('NOT_FOUND')
+    insertTask('pz-done', 'done')
+    expect(codeOf(() => queue.pause('pz-done'))).toBe('INVALID_STATE')
+    insertTask('pz-parked', 'deferred', 'apr-z')
+    expect(codeOf(() => queue.pause('pz-parked'))).toBe('INVALID_STATE')
+    expect(() => queue.pause('pz-parked')).toThrow(/decide it in Approvals/)
+    // resume only accepts a 'paused' row.
+    insertTask('pz-pending', 'pending')
+    expect(codeOf(() => queue.resume('pz-pending'))).toBe('INVALID_STATE')
+    expect(codeOf(() => queue.resume('ghost2'))).toBe('NOT_FOUND')
+    await tick()
+  })
+
+  it('a paused task is not reloaded by start() (the hold survives a restart)', async () => {
+    const queue = makeQueue()
+    const ran: string[] = []
+    queue.registerHandler('probe', (payload) => {
+      ran.push(String(payload['tag']))
+      return Promise.resolve()
+    })
+    insertTask('held', 'paused')
+    queue.start()
+    await tick()
+    expect(ran).toEqual([]) // paused rows are ignored on reload
+    expect(row('held').status).toBe('paused')
+  })
+
+  it('records started_at when a task begins running (for the Resources duration)', async () => {
+    const queue = makeQueue()
+    queue.registerHandler('probe', () => Promise.resolve())
+    queue.enqueue({ id: 'sa1', kind: 'probe' })
+    queue.start()
+    await tick()
+    const r = appData.db.prepare('SELECT status, started_at FROM tasks WHERE id = ?').get('sa1') as {
+      status: string
+      started_at: string | null
+    }
+    expect(r.status).toBe('done')
+    expect(r.started_at).not.toBeNull()
+  })
 })

@@ -635,6 +635,13 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   // spine is off-limits (a parked task returns INVALID_STATE — decide it in Approvals).
   register('tasks.cancel', ({ id }) => needQueue().cancel(id))
 
+  // Pause a task without ending it (the non-destructive alternative to cancel):
+  // a running task stops at its next boundary; a queued/deferred one is held. Revived
+  // by tasks.resume. TaskRetryError → NOT_FOUND/INVALID_STATE.
+  register('tasks.pause', ({ id }) => needQueue().pause(id))
+  // Resume a paused task — re-queue it (a workflow resumes from its checkpoint).
+  register('tasks.resume', ({ id }) => needQueue().resume(id))
+
   // What is running for a task + its RAM/CPU: the app's own main process (Electron
   // metrics — where in-process tasks run), the shared Ollama daemon's loaded models,
   // and the task's runner child processes sampled by pid. Best-effort throughout.

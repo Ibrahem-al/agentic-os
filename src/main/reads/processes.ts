@@ -17,7 +17,13 @@
  * degrades to empty/null — a resource read never throws.
  */
 import type BetterSqlite3 from 'better-sqlite3'
-import type { LocalLoadedModelDto, TaskChildProcessDto, TaskHostProcessDto, TaskProcessesDto } from '../../shared/ipc'
+import type {
+  LocalLoadedModelDto,
+  TaskChildProcessDto,
+  TaskHostProcessDto,
+  TaskProcessesDto,
+  TaskSummaryDto
+} from '../../shared/ipc'
 import type { LocalUsageOllama } from './localUsage'
 import type { ProcResourceSample } from './processSampler'
 
@@ -40,6 +46,123 @@ export interface TaskProcessesArgs {
 
 /** Cap on child rows sampled per read (a task rarely spawns more than a couple). */
 const MAX_CHILDREN = 20
+
+/** LIKE-prefix for a task's own workflow/runner children (`<id>-...`), wildcards escaped. */
+const childLikePrefix = (taskId: string): string => `${taskId.replace(/[\\%_]/g, '\\$&')}-%`
+
+/** Parse two ISO stamps into a non-negative elapsed-ms, or null when either is unusable. */
+function elapsedMs(fromIso: string | null, toMs: number): number | null {
+  if (fromIso === null) return null
+  const from = Date.parse(fromIso)
+  if (Number.isNaN(from)) return null
+  const ms = toMs - from
+  return Number.isFinite(ms) && ms >= 0 ? ms : null
+}
+
+interface TaskSummaryRow {
+  status: TaskSummaryDto['status']
+  kind: string
+  attempts: number
+  started_at: string | null
+  updated_at: string
+  last_error: string | null
+}
+
+/**
+ * The "averages and time it took" summary for one task — duration (last run),
+ * the typical duration for its kind, and any AI usage keyed to it (cloud spend +
+ * runner_runs; the local reasoning tier is not attributable per task). Pure DB,
+ * fully guarded: a missing row or query hiccup yields null rather than throwing.
+ */
+function buildTaskSummary(db: BetterSqlite3.Database, taskId: string, running: boolean): TaskSummaryDto | null {
+  let row: TaskSummaryRow | undefined
+  try {
+    row = db
+      .prepare(`SELECT status, kind, attempts, started_at, updated_at, last_error FROM tasks WHERE id = ?`)
+      .get(taskId) as TaskSummaryRow | undefined
+  } catch {
+    return null
+  }
+  if (row === undefined) return null
+
+  // Duration = the last run's execution time. `updated_at` is a reliable run-end
+  // ONLY for a genuinely terminal row (done/failed/cancelled) — its timestamp is
+  // frozen at settle. A paused/deferred/pending row can have `updated_at` bumped by
+  // a LATER transition (a pause, or a restart re-pend) while `started_at` stays put,
+  // which would inflate the span across the idle gap — so those report null rather
+  // than a fabricated duration. A running task is timed live.
+  const terminal = row.status === 'done' || row.status === 'failed' || row.status === 'cancelled'
+  const durationMs = running
+    ? elapsedMs(row.started_at, Date.now())
+    : terminal
+      ? elapsedMs(row.started_at, Date.parse(row.updated_at))
+      : null
+  const finishedAt = terminal && row.started_at !== null ? row.updated_at : null
+
+  // Typical duration for this KIND — mean over recent finished runs (JS avoids
+  // any julianday timezone-suffix ambiguity). Under 2 samples there is no "typical".
+  let kindAvgDurationMs: number | null = null
+  let kindSampleSize = 0
+  try {
+    const rows = db
+      .prepare(
+        `SELECT started_at, updated_at FROM tasks
+         WHERE kind = ? AND status = 'done' AND started_at IS NOT NULL
+         ORDER BY updated_at DESC LIMIT 50`
+      )
+      .all(row.kind) as { started_at: string; updated_at: string }[]
+    const durations = rows
+      .map((r) => elapsedMs(r.started_at, Date.parse(r.updated_at)))
+      .filter((d): d is number => d !== null)
+    kindSampleSize = durations.length
+    if (durations.length >= 2) kindAvgDurationMs = durations.reduce((a, b) => a + b, 0) / durations.length
+  } catch {
+    /* no kind average — leave null */
+  }
+
+  // Attributable AI usage: cloud spend (task_id) + runner_runs (task_id + its `<id>-*` children).
+  let cloud: TaskSummaryDto['cloud'] = null
+  try {
+    const c = db
+      .prepare(
+        `SELECT COUNT(*) AS calls, COALESCE(SUM(input_tokens),0) AS it,
+                COALESCE(SUM(output_tokens),0) AS ot, COALESCE(SUM(usd),0) AS usd
+         FROM spend WHERE task_id = ?`
+      )
+      .get(taskId) as { calls: number; it: number; ot: number; usd: number }
+    if (c.calls > 0) cloud = { calls: c.calls, inputTokens: c.it, outputTokens: c.ot, usd: c.usd }
+  } catch {
+    /* leave cloud null */
+  }
+
+  let runner: TaskSummaryDto['runner'] = null
+  try {
+    const r = db
+      .prepare(
+        `SELECT COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS it, COALESCE(SUM(output_tokens),0) AS ot
+         FROM runner_runs WHERE task_id = ? OR task_id LIKE ? ESCAPE '\\'`
+      )
+      .get(taskId, childLikePrefix(taskId)) as { runs: number; it: number; ot: number }
+    if (r.runs > 0) runner = { runs: r.runs, inputTokens: r.it, outputTokens: r.ot }
+  } catch {
+    /* leave runner null */
+  }
+
+  return {
+    status: row.status,
+    kind: row.kind,
+    attempts: row.attempts,
+    startedAt: row.started_at,
+    finishedAt,
+    durationMs,
+    running,
+    kindAvgDurationMs,
+    kindSampleSize,
+    lastError: row.last_error,
+    cloud,
+    runner
+  }
+}
 
 interface RunnerRunRow {
   task_id: string
@@ -105,6 +228,7 @@ export async function getTaskProcesses(deps: TaskProcessesDeps, args: TaskProces
   return {
     taskId,
     running,
+    summary: taskId !== null ? buildTaskSummary(deps.db, taskId, running) : null,
     host: safeHost(deps),
     localRuntime: { reachable, loadedModels },
     children,

@@ -32,6 +32,7 @@ const STATUS_MAP: Readonly<Record<string, PlainStatus>> = {
   failed: { label: 'failed', explain: 'Something went wrong and it stopped.' },
   deferred: { label: 'postponed', explain: 'Put off for now; it will try again later.' },
   cancelled: { label: 'cancelled', explain: 'You stopped this job before it finished.' },
+  paused: { label: 'paused', explain: 'Held for now — resume it to pick up where it left off.' },
 
   // staged writes (StagedWriteStatusDto) — a proposed memory change
   staged: { label: 'waiting for review', explain: 'A proposed memory change waiting for your decision.' },

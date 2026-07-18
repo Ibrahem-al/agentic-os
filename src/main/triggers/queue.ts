@@ -170,6 +170,12 @@ interface CurrentTask {
   readonly abort: AbortController
   /** Set by cancel(); read by runTask's settle path — the SINGLE writer of 'cancelled'. */
   cancelRequested: boolean
+  /**
+   * Set by pause(); read by runTask's settle path. Like cancelRequested but the
+   * task re-enters the queue on resume() instead of being terminal. cancel wins
+   * if BOTH are set (the stronger, terminal action).
+   */
+  pauseRequested: boolean
 }
 
 export class DurableTaskQueue {
@@ -204,7 +210,8 @@ export class DurableTaskQueue {
        WHERE id = ?`
     )
     this.markRunning = deps.db.prepare(
-      `UPDATE tasks SET status = 'running', attempts = attempts + 1, waiting_approval_id = NULL, updated_at = ?
+      `UPDATE tasks SET status = 'running', attempts = attempts + 1, waiting_approval_id = NULL,
+              started_at = ?, updated_at = ?
        WHERE id = ?`
     )
   }
@@ -542,6 +549,67 @@ export class DurableTaskQueue {
     return { taskId, status: 'cancelled', wasRunning: false, killedChildren }
   }
 
+  /**
+   * Pause a task (§8 user pause — the non-destructive alternative to cancel).
+   * Semantics by state:
+   *  - the in-flight task → set the pause flag + abort its signal (cooperative,
+   *    like cancel) and kill any OS child it spawned; runTask's settle path is the
+   *    SINGLE writer of the 'paused' row. A workflow resumes from its last
+   *    checkpoint on resume(); a plain handler re-runs (idempotent).
+   *  - a pending / deferred row → drop it from memory and mark it 'paused' now, so
+   *    the scheduler won't pick it up until resume() re-queues it. Paused rows are
+   *    NOT reloaded by start(), so a pause survives restarts.
+   * Rejects a finished task (done/failed/cancelled), an already-paused one, and one
+   * parked behind a §13 approval (decide it in Approvals). resume() reverses it.
+   */
+  pause(taskId: string): { taskId: string; status: 'paused'; wasRunning: boolean; killedChildren: number } {
+    const row = this.db.prepare('SELECT id, kind, status, waiting_approval_id FROM tasks WHERE id = ?').get(taskId) as
+      | { id: string; kind: string; status: string; waiting_approval_id: string | null }
+      | undefined
+    if (row === undefined) throw new TaskRetryError('NOT_FOUND', `no task with id '${taskId}'`)
+    // Redirect a live workflow (`<taskId>-wf`) row to its driver (same reasoning as cancel()).
+    if (row.kind === 'workflow' && row.id.endsWith('-wf')) {
+      const driverId = row.id.slice(0, -'-wf'.length)
+      if (this.current?.task.id === driverId) return this.pause(driverId)
+    }
+    const isCurrent = this.current?.task.id === taskId
+    if (!isCurrent && (row.status === 'done' || row.status === 'failed' || row.status === 'cancelled')) {
+      throw new TaskRetryError('INVALID_STATE', `task '${taskId}' is already '${row.status}' — nothing to pause`)
+    }
+    if (!isCurrent && row.status === 'paused') {
+      throw new TaskRetryError('INVALID_STATE', `task '${taskId}' is already paused`)
+    }
+    if (row.waiting_approval_id !== null) {
+      throw new TaskRetryError(
+        'INVALID_STATE',
+        `task '${taskId}' is waiting on approval '${row.waiting_approval_id}' — decide it in Approvals`
+      )
+    }
+    if (isCurrent && this.current !== null) {
+      // In flight: flag + abort; the settle path writes 'paused'. (Same single-writer
+      // discipline as cancel — do NOT write the row here.)
+      this.current.pauseRequested = true
+      this.current.abort.abort()
+      const killedChildren = this.killChildrenForTask?.(taskId) ?? 0
+      return { taskId, status: 'paused', wasRunning: true, killedChildren }
+    }
+    // Not in flight: drop from memory and hold the row.
+    this.pending.delete(taskId)
+    this.removeFromWaiting(taskId)
+    this.updateStatus.run('paused', null, null, 'paused by user', nowIso(), taskId)
+    const killedChildren = this.killChildrenForTask?.(taskId) ?? 0
+    return { taskId, status: 'paused', wasRunning: false, killedChildren }
+  }
+
+  /**
+   * Resume a 'paused' task — re-queue it with a fresh §20 round (a workflow picks
+   * up from its last checkpoint, a plain handler re-runs). Paused-only; other
+   * states use runNow(). Throws TaskRetryError with an MCP-mappable code.
+   */
+  resume(taskId: string): { taskId: string; status: 'pending' } {
+    return this.forceRun(taskId, new Set(['paused']), 'resumed (only paused tasks can be resumed)')
+  }
+
   /** Remove a task from every §13 approval-parked list it might sit in (cancel cleanup). */
   private removeFromWaiting(taskId: string): void {
     for (const [approvalId, parked] of this.waiting) {
@@ -613,7 +681,13 @@ export class DurableTaskQueue {
     this.yieldedMs = 0
     const task = best
     this.pending.delete(task.id)
-    const entry: CurrentTask = { task, done: Promise.resolve(), abort: new AbortController(), cancelRequested: false }
+    const entry: CurrentTask = {
+      task,
+      done: Promise.resolve(),
+      abort: new AbortController(),
+      cancelRequested: false,
+      pauseRequested: false
+    }
     this.current = entry
     entry.done = this.runTask(task, entry)
     void entry.done.finally(() => {
@@ -626,7 +700,8 @@ export class DurableTaskQueue {
     task.roundExecs += 1
     let attempts = task.roundExecs
     try {
-      this.markRunning.run(nowIso(), task.id)
+      const startIso = nowIso()
+      this.markRunning.run(startIso, startIso, task.id)
       const row = this.db.prepare('SELECT attempts FROM tasks WHERE id = ?').get(task.id) as
         | { attempts: number }
         | undefined
@@ -661,12 +736,25 @@ export class DurableTaskQueue {
       // §8 user cancel is the SINGLE writer of 'cancelled': cancel() only set the
       // flag + aborted the signal; here (the handler unwound via that abort) we
       // settle the row, so recordFailure never overwrites a cancel with retry/defer.
+      // Cancel wins over pause when both are set (the terminal action).
       if (entry.cancelRequested) {
         try {
           this.updateStatus.run('cancelled', null, null, 'cancelled by user', nowIso(), task.id)
           console.warn(`[triggers] task ${task.id} (${task.kind}) cancelled by user`)
         } catch (updateErr) {
           console.warn(`[triggers] could not record cancel of task ${task.id}: ${String(updateErr)}`)
+        }
+        return
+      }
+      // §8 user pause: like cancel, the settle path is the SINGLE writer of 'paused'
+      // (so recordFailure can't overwrite it). resume() re-pends the row later —
+      // a workflow resumes from its last checkpoint, a plain handler re-runs (idempotent).
+      if (entry.pauseRequested) {
+        try {
+          this.updateStatus.run('paused', null, null, 'paused by user', nowIso(), task.id)
+          console.warn(`[triggers] task ${task.id} (${task.kind}) paused by user`)
+        } catch (updateErr) {
+          console.warn(`[triggers] could not record pause of task ${task.id}: ${String(updateErr)}`)
         }
         return
       }
