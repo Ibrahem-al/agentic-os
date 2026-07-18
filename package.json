@@ -1,6 +1,6 @@
 {
   "name": "agentic-os",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Agentic OS — local-first memory-and-tool backend for AI agents (Electron, embedded RyuGraph).",
   "main": "out/main/index.js",
   "type": "module",
