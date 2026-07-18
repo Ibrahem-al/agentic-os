@@ -24,6 +24,8 @@ export {
   type ListNodesArgs
 } from './memory'
 
+export { graphOverview, type GraphOverviewArgs } from './graph'
+
 export {
   getSkillDetail,
   getSkillFull,

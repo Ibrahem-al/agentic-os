@@ -254,6 +254,45 @@ export interface MemoryDedupeMergeResultDto {
   readonly edgesDropped: number
 }
 
+// ── knowledge graph (visualization) ───────────────────────────────────────────
+
+/**
+ * One node in the graph-overview payload. `key` is the graph-wide identity
+ * `${label}:${id}` (node ids are unique only within a label table, so the raw
+ * id alone is not a safe key); edges reference nodes by this key. `display` is
+ * the same one-line human handle the memory browser shows (DISPLAY_PROPS
+ * projection); the embedding vector is never included. `degree` is the count of
+ * incident edges *within the returned set* — it drives node size.
+ */
+export interface GraphNodeDto {
+  readonly key: string
+  readonly label: IpcNodeLabel
+  readonly id: string
+  readonly display: string
+  readonly degree: number
+}
+
+/** One directed edge, endpoints referenced by GraphNodeDto.key. */
+export interface GraphEdgeDto {
+  readonly source: string
+  readonly target: string
+  readonly type: IpcEdgeType
+}
+
+/**
+ * graph.overview: the whole §18 graph projected for the visualization — every
+ * node (id/label/display/degree) and every edge between the returned nodes.
+ * Bounded: when the store holds more than the node cap, the most-recently-updated
+ * nodes are kept and `truncated` is true (edges to dropped nodes are omitted).
+ * `totalNodes` is the true store-wide node count so the UI can state what it hid.
+ */
+export interface GraphOverviewDto {
+  readonly nodes: readonly GraphNodeDto[]
+  readonly edges: readonly GraphEdgeDto[]
+  readonly totalNodes: number
+  readonly truncated: boolean
+}
+
 // ── review queue ──────────────────────────────────────────────────────────────
 
 export type StagedWriteStatusDto = 'staged' | 'approved' | 'rejected' | 'committed'
@@ -981,6 +1020,15 @@ export interface IpcChannels {
     req: { label: IpcNodeLabel; keepId: string; removeIds: readonly string[] }
     res: MemoryDedupeMergeResultDto
   }
+
+  /**
+   * The whole knowledge graph projected for the Obsidian-style visualization —
+   * nodes (id/label/display/degree) + edges between them. Read-only, dashboard
+   * only (never an MCP tool). `limit` is clamped server-side to
+   * [1, GRAPH_OVERVIEW_MAX_NODES]; when the store is larger the most-recently-
+   * updated nodes are kept and the result is flagged `truncated`.
+   */
+  'graph.overview': { req: { limit?: number }; res: GraphOverviewDto }
 
   'review.staged.list': { req: { status?: StagedWriteStatusDto }; res: readonly StagedWriteDto[] }
   'review.staged.diff': { req: { id: string }; res: string }

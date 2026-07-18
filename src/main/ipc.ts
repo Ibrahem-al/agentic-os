@@ -131,6 +131,7 @@ import {
 import {
   getLocalUsage,
   getNode,
+  graphOverview,
   getReasoningRoles,
   getRunnerStatus,
   getSettingsSummary,
@@ -451,6 +452,12 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   register('memory.dedupe.merge', ({ label, keepId, removeIds }) =>
     mergeDuplicates({ engine: need.engine(), audit: need.audit(), actor: DASHBOARD_USER }, { label, keepId, removeIds })
+  )
+
+  // ── knowledge graph (read-only overview for the visualization) ───────────────
+
+  register('graph.overview', (req) =>
+    graphOverview(need.engine(), req?.limit !== undefined ? { limit: req.limit } : {})
   )
 
   // ── review queue ───────────────────────────────────────────────────────────

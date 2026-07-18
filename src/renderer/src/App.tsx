@@ -14,6 +14,7 @@ import type { IconName } from './ui/icons'
 import TitleBar from './ui/TitleBar'
 import HomePanel from './panels/HomePanel'
 import MemoryPanel from './panels/MemoryPanel'
+import GraphPanel from './panels/GraphPanel'
 import ReviewPanel from './panels/ReviewPanel'
 import AuditPanel from './panels/AuditPanel'
 import SpendPanel from './panels/SpendPanel'
@@ -28,7 +29,18 @@ import SettingsPanel from './panels/SettingsPanel'
  * PanelProps without a type cycle. Every key keeps its historical `nav-<key>`
  * testid; only the visible labels moved to plain English.
  */
-type PanelKey = 'home' | 'memory' | 'review' | 'audit' | 'spend' | 'tasks' | 'traces' | 'skills' | 'ingest' | 'settings'
+type PanelKey =
+  | 'home'
+  | 'memory'
+  | 'graph'
+  | 'review'
+  | 'audit'
+  | 'spend'
+  | 'tasks'
+  | 'traces'
+  | 'skills'
+  | 'ingest'
+  | 'settings'
 
 /** A cross-panel deep-link target for the Memory inspector (addendum R3). */
 export interface InspectTarget {
@@ -61,6 +73,7 @@ interface PanelDef {
 const PANELS: Record<PanelKey, PanelDef> = {
   home: { label: 'Home', icon: 'home', component: HomePanel },
   memory: { label: 'Memory', icon: 'memory', component: MemoryPanel },
+  graph: { label: 'Knowledge graph', icon: 'graph', component: GraphPanel },
   review: { label: 'Approvals', icon: 'approvals', component: ReviewPanel },
   audit: { label: 'History', icon: 'history', component: AuditPanel },
   spend: { label: 'Usage & spending', icon: 'spending', component: SpendPanel },
@@ -75,7 +88,7 @@ const PANELS: Record<PanelKey, PanelDef> = {
 const NAV_GROUPS: readonly { readonly label: string | null; readonly keys: readonly PanelKey[] }[] = [
   { label: null, keys: ['home'] },
   { label: 'Decisions', keys: ['review', 'audit'] },
-  { label: 'Knowledge', keys: ['memory', 'ingest', 'skills'] },
+  { label: 'Knowledge', keys: ['memory', 'graph', 'ingest', 'skills'] },
   { label: 'Activity', keys: ['tasks', 'traces', 'spend'] }
 ]
 

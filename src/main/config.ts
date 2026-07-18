@@ -406,6 +406,18 @@ export const DEDUPE_SCAN_PER_LABEL_CAP = 2000
 /** k for each node's own-label vector probe during the near-duplicate scan (small — near-dups cluster tightly). Rule-12 pick. */
 export const DEDUPE_NEAR_NEIGHBOR_K = 10
 
+// ── Knowledge-graph visualization ─────────────────────────────────────────────
+/**
+ * Node cap for one graph.overview payload — the ceiling on what the renderer's
+ * force simulation must lay out and hit-test each frame. Above this the most-
+ * recently-updated nodes are kept and the payload is flagged truncated (the UI
+ * says so). A UI-render bound, not a §20 backend threshold; sized to stay smooth
+ * on the canvas sim while covering any realistic personal graph. Rule-12 pick.
+ */
+export const GRAPH_OVERVIEW_MAX_NODES = 2000
+/** Companion edge cap for graph.overview (a dense graph can hold far more edges than nodes). Rule-12 pick. */
+export const GRAPH_OVERVIEW_MAX_EDGES = 8000
+
 // ── Extraction ───────────────────────────────────────────────────────────────
 /** Escalate a session to the cloud tier below this local confidence. */
 export const EXTRACTION_ESCALATE_CONFIDENCE = 0.6
