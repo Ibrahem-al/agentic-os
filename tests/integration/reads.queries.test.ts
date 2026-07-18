@@ -232,9 +232,12 @@ describe('getUsage (spend summary + runner_runs rollup)', () => {
          VALUES (?, ?, 'completion', 'claude-sonnet', ?, ?, ?, ?, ?, ?)`
       )
       .run('rr-2', 'task-r', '2026-07-06T11:00:00.000Z', 500, 100, 0.02, 1, 1)
-    // A real (dollar) spend row rides the spend summary side.
+    // A real (dollar) spend row rides the spend summary side, carrying tokens.
     appData.db
-      .prepare(`INSERT INTO spend (task_id, provider, model, usd) VALUES ('task-s', 'anthropic', 'claude', 0.12)`)
+      .prepare(
+        `INSERT INTO spend (task_id, provider, model, input_tokens, output_tokens, usd)
+         VALUES ('task-s', 'anthropic', 'claude', 800, 200, 0.12)`
+      )
       .run()
 
     const usage = getUsage(appData.db)
@@ -246,5 +249,12 @@ describe('getUsage (spend summary + runner_runs rollup)', () => {
     expect(usage.runner.recent[0]?.id).toBe('rr-2')
     expect(usage.runner.recent[0]?.isError).toBe(true)
     expect(usage.totalUsd).toBeCloseTo(0.12, 6)
+    // Token totals (tokens-first metric): summed over the metered spend ledger.
+    expect(usage.totalInputTokens).toBe(800)
+    expect(usage.totalOutputTokens).toBe(200)
+    expect(usage.last24hInputTokens).toBe(800) // default created_at = now → inside the 24h window
+    const spendTask = usage.byTask.find((t) => t.taskId === 'task-s')
+    expect(spendTask?.inputTokens).toBe(800)
+    expect(spendTask?.outputTokens).toBe(200)
   })
 })

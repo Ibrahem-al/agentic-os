@@ -29,7 +29,10 @@
     // imports (TS6307). NOT a general renderer include: files here avoid DOM/React.
     "src/renderer/src/lib/plain.ts",
     "src/renderer/src/lib/stagedSummary.ts",
-    "src/renderer/src/lib/nodeSummary.ts"
+    "src/renderer/src/lib/nodeSummary.ts",
+    "src/renderer/src/lib/format.ts",
+    "src/renderer/src/ui/graph/model.ts",
+    "src/renderer/src/ui/graph/colors.ts"
   ],
   "exclude": [
     "tests/fixtures/mini-repo",

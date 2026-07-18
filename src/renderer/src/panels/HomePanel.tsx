@@ -22,6 +22,7 @@ import type {
 } from '../../../shared/ipc'
 import type { PanelProps } from '../App'
 import { call } from '../lib/ipc'
+import { tokens } from '../lib/format'
 import { dayKey, lastNDays, lastNUtcDays, plainDuration, plainStatus, plainUsd, plural } from '../lib/plain'
 import { Badge, Button, PanelHeader, SectionHeader, Timestamp } from '../ui/kit'
 import { Icon } from '../ui/icons'
@@ -244,14 +245,17 @@ function HeadlineStats({
   skills: Slice<readonly SkillSummaryDto[]>
   localUsage: Slice<LocalUsageSummaryDto>
 }): React.JSX.Element {
-  // Daily spend for the sparkline: bucket the recent-charges window by local day.
-  const spendDays = lastNDays(14)
-  const spendByDay = new Map<string, number>(spendDays.map((d) => [d, 0]))
+  // Daily AI usage for the sparkline: bucket the recent-charges window (tokens
+  // in + out) by local day — tokens are the tokens-first headline metric.
+  const usageDays = lastNDays(14)
+  const tokensByDay = new Map<string, number>(usageDays.map((d) => [d, 0]))
   for (const entry of spend.data?.recent ?? []) {
     const key = dayKey(entry.createdAt)
-    if (spendByDay.has(key)) spendByDay.set(key, (spendByDay.get(key) ?? 0) + entry.usd)
+    if (tokensByDay.has(key)) {
+      tokensByDay.set(key, (tokensByDay.get(key) ?? 0) + (entry.inputTokens ?? 0) + (entry.outputTokens ?? 0))
+    }
   }
-  const spark = spendDays.map((d) => spendByDay.get(d) ?? 0)
+  const spark = usageDays.map((d) => tokensByDay.get(d) ?? 0)
 
   const memoryTotal = (counts.data ?? []).reduce((sum, c) => sum + c.count, 0)
 
@@ -273,8 +277,9 @@ function HeadlineStats({
     <StatStrip
       stats={[
         {
-          label: 'Spending, last 24 h',
-          value: spend.data !== null ? plainUsd(spend.data.last24hUsd) : '—',
+          label: 'AI usage, last 24 h',
+          value: spend.data !== null ? tokens(spend.data.last24hInputTokens + spend.data.last24hOutputTokens) : '—',
+          ...(spend.data !== null ? { hint: `${plainUsd(spend.data.last24hUsd)} on paid models` } : {}),
           spark
         },
         {

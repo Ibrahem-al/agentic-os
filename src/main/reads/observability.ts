@@ -115,17 +115,32 @@ export function getTrace(db: BetterSqlite3.Database, { traceId }: { traceId: str
 
 /** ipc spend.summary: the metered cloud spend (real dollars, `spend` table). */
 export function getSpendSummary(db: BetterSqlite3.Database): SpendSummaryDto {
-  const total = db.prepare('SELECT COALESCE(SUM(usd), 0) AS t FROM spend').get() as { t: number }
+  const total = db
+    .prepare(
+      `SELECT COALESCE(SUM(usd), 0) AS t,
+              COALESCE(SUM(input_tokens), 0) AS in_t,
+              COALESCE(SUM(output_tokens), 0) AS out_t
+       FROM spend`
+    )
+    .get() as { t: number; in_t: number; out_t: number }
   const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-  const last24h = db.prepare('SELECT COALESCE(SUM(usd), 0) AS t FROM spend WHERE created_at >= ?').get(cutoff) as {
-    t: number
-  }
+  const last24h = db
+    .prepare(
+      `SELECT COALESCE(SUM(usd), 0) AS t,
+              COALESCE(SUM(input_tokens), 0) AS in_t,
+              COALESCE(SUM(output_tokens), 0) AS out_t
+       FROM spend WHERE created_at >= ?`
+    )
+    .get(cutoff) as { t: number; in_t: number; out_t: number }
   const byTask = db
     .prepare(
-      `SELECT task_id, SUM(usd) AS usd, COUNT(*) AS calls, MAX(created_at) AS last_at
+      `SELECT task_id, SUM(usd) AS usd,
+              COALESCE(SUM(input_tokens), 0) AS in_t,
+              COALESCE(SUM(output_tokens), 0) AS out_t,
+              COUNT(*) AS calls, MAX(created_at) AS last_at
        FROM spend WHERE task_id IS NOT NULL GROUP BY task_id ORDER BY usd DESC LIMIT 20`
     )
-    .all() as { task_id: string; usd: number; calls: number; last_at: string }[]
+    .all() as { task_id: string; usd: number; in_t: number; out_t: number; calls: number; last_at: string }[]
   const recent = db
     .prepare(
       `SELECT id, task_id, provider, model, input_tokens, output_tokens, usd, created_at
@@ -145,7 +160,18 @@ export function getSpendSummary(db: BetterSqlite3.Database): SpendSummaryDto {
     totalUsd: total.t,
     last24hUsd: last24h.t,
     ceilingUsd: SPEND_CEILING_USD_DEFAULT,
-    byTask: byTask.map((row) => ({ taskId: row.task_id, usd: row.usd, calls: row.calls, lastAt: row.last_at })),
+    totalInputTokens: total.in_t,
+    totalOutputTokens: total.out_t,
+    last24hInputTokens: last24h.in_t,
+    last24hOutputTokens: last24h.out_t,
+    byTask: byTask.map((row) => ({
+      taskId: row.task_id,
+      usd: row.usd,
+      inputTokens: row.in_t,
+      outputTokens: row.out_t,
+      calls: row.calls,
+      lastAt: row.last_at
+    })),
     recent: recent.map(
       (row): SpendEntryDto => ({
         id: row.id,

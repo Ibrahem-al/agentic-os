@@ -145,7 +145,8 @@ import {
   listNodes,
   listTasks,
   listTraces,
-  memoryCounts
+  memoryCounts,
+  runnerUsage
 } from './reads'
 import type { Runner, TestConnectionResult } from './runner'
 
@@ -593,6 +594,30 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   register('usage.local.summary', (req) =>
     getLocalUsage({ db: need.db(), ollama: deps.ollama }, req?.sinceDays !== undefined ? { sinceDays: req.sinceDays } : {})
   )
+
+  // Subscription-runner token usage (tokens + runs, no dollars). Maps the
+  // runner_runs rollup, dropping shadow_cost_usd (meaningless on a flat plan).
+  register('usage.runner', () => {
+    const usage = runnerUsage(need.db())
+    return {
+      totalRuns: usage.totalRuns,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      recent: usage.recent.map((run) => ({
+        id: run.id,
+        taskId: run.taskId,
+        mode: run.mode,
+        model: run.model,
+        startedAt: run.startedAt,
+        durationMs: run.durationMs,
+        numTurns: run.numTurns,
+        inputTokens: run.inputTokens,
+        outputTokens: run.outputTokens,
+        isError: run.isError,
+        exitCode: run.exitCode
+      }))
+    }
+  })
 
   // ── tasks & watched folders ────────────────────────────────────────────────
 

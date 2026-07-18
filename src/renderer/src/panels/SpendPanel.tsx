@@ -7,7 +7,7 @@
  * every number is mono. Fetch-on-mount with a manual refresh.
  */
 import { useIpc } from '../lib/ipc'
-import { truncate } from '../lib/format'
+import { tokens, truncate } from '../lib/format'
 import { dayKey, lastNDays, lastNUtcDays, plainBytes, plainDuration, plainRoleGroup, plainUsd } from '../lib/plain'
 import {
   Button,
@@ -27,13 +27,21 @@ import type {
   LocalUsageSummaryDto,
   SpendEntryDto,
   SpendSummaryDto,
-  SpendTaskAggregateDto
+  SpendTaskAggregateDto,
+  SubscriptionRunDto,
+  SubscriptionUsageDto
 } from '../../../shared/ipc'
 
-/** Token counts collapse to k past 1000 ("1.2k / 340"); null renders '—'. */
-function tokens(n: number | null): string {
-  if (n == null) return '—'
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+/** The one plain-language gloss for token figures, shown on first appearance. */
+const TOKENS_TOOLTIP = 'units of AI text, roughly ¾ of a word'
+
+/** A "{in} / {out}" token pair with the shared tooltip (font-mono cell). */
+function TokenPair({ input, output }: { input: number | null; output: number | null }): React.JSX.Element {
+  return (
+    <span title={TOKENS_TOOLTIP}>
+      {tokens(input)} / {tokens(output)}
+    </span>
+  )
 }
 
 const BY_TASK_COLUMNS: readonly Column<SpendTaskAggregateDto>[] = [
@@ -43,8 +51,14 @@ const BY_TASK_COLUMNS: readonly Column<SpendTaskAggregateDto>[] = [
     className: 'font-mono',
     render: (row) => <span title={row.taskId}>{truncate(row.taskId, 20)}</span>
   },
-  { key: 'usd', header: 'spent', className: 'font-mono text-right', render: (row) => plainUsd(row.usd) },
+  {
+    key: 'tokens',
+    header: 'tokens in / out',
+    className: 'font-mono',
+    render: (row) => <TokenPair input={row.inputTokens} output={row.outputTokens} />
+  },
   { key: 'calls', header: 'calls', className: 'font-mono text-right', render: (row) => row.calls },
+  { key: 'usd', header: 'spent', className: 'font-mono text-right', render: (row) => plainUsd(row.usd) },
   { key: 'last', header: 'last activity', render: (row) => <Timestamp iso={row.lastAt} /> }
 ]
 
@@ -56,12 +70,7 @@ const RECENT_COLUMNS: readonly Column<SpendEntryDto>[] = [
     key: 'tokens',
     header: 'tokens in / out',
     className: 'font-mono',
-    // "tokens" gets its one plain-language tooltip here (redesign dictionary).
-    render: (row) => (
-      <span title="units of AI text, roughly ¾ of a word">
-        {tokens(row.inputTokens)} / {tokens(row.outputTokens)}
-      </span>
-    )
+    render: (row) => <TokenPair input={row.inputTokens} output={row.outputTokens} />
   },
   { key: 'usd', header: 'cost', className: 'font-mono text-right', render: (row) => plainUsd(row.usd) }
 ]
@@ -86,11 +95,7 @@ const LOCAL_RECENT_COLUMNS: readonly Column<LocalUsageCallDto>[] = [
     key: 'tokens',
     header: 'tokens in / out',
     className: 'font-mono',
-    render: (row) => (
-      <span title="units of AI text, roughly ¾ of a word">
-        {tokens(row.promptTokens)} / {tokens(row.evalTokens)}
-      </span>
-    )
+    render: (row) => <TokenPair input={row.promptTokens} output={row.evalTokens} />
   },
   { key: 'duration', header: 'time', className: 'font-mono text-right', render: (row) => plainDuration(row.durationMs) }
 ]
@@ -292,12 +297,73 @@ function Budget({ data }: { data: SpendSummaryDto }): React.JSX.Element {
       )}
       <StatStrip
         stats={[
+          {
+            label: 'Tokens used',
+            value: tokens(data.totalInputTokens + data.totalOutputTokens),
+            hint: `${tokens(data.totalInputTokens)} in · ${tokens(data.totalOutputTokens)} out`
+          },
+          { label: 'Tokens, last 24 h', value: tokens(data.last24hInputTokens + data.last24hOutputTokens) },
           { label: 'Total spent', value: plainUsd(data.totalUsd) },
-          { label: 'Last 24 hours', value: plainUsd(data.last24hUsd) },
-          { label: 'Tasks with spending', value: String(data.byTask.length) }
+          { label: 'Last 24 hours', value: plainUsd(data.last24hUsd) }
         ]}
       />
     </div>
+  )
+}
+
+// ── subscription runner (flat plan → measured in tokens, never dollars) ───────
+
+const RUNNER_COLUMNS: readonly Column<SubscriptionRunDto>[] = [
+  { key: 'when', header: 'when', render: (row) => <Timestamp iso={row.startedAt} /> },
+  { key: 'mode', header: 'mode', className: 'font-mono', render: (row) => row.mode },
+  {
+    key: 'tokens',
+    header: 'tokens in / out',
+    className: 'font-mono',
+    render: (row) => <TokenPair input={row.inputTokens} output={row.outputTokens} />
+  },
+  { key: 'turns', header: 'turns', className: 'font-mono text-right', render: (row) => row.numTurns ?? '—' },
+  { key: 'time', header: 'time', className: 'font-mono text-right', render: (row) => plainDuration(row.durationMs) }
+]
+
+/**
+ * "Subscription runner": what background reasoning routed through the Claude
+ * subscription has consumed. A subscription is flat-fee, so this is measured in
+ * TOKENS + runs — never dollars (the runner's shadow-cost estimate is meaningless
+ * on a flat plan and is deliberately not shown). Off by default → an unused
+ * runner reports zeros, with copy pointing at Settings.
+ */
+function SubscriptionUsageSection({ data }: { data: SubscriptionUsageDto }): React.JSX.Element {
+  return (
+    <section className="flex flex-col gap-4 border-t border-line pt-6" data-testid="usage-runner">
+      <SectionHeader>Subscription runner</SectionHeader>
+      <p className="-mt-2 text-[12px] text-ink-mute">
+        Background reasoning routed through your Claude subscription — a flat plan, so this is measured in tokens, not
+        dollars.
+      </p>
+      {data.totalRuns === 0 ? (
+        <div className="text-[12px] text-ink-mute" data-testid="usage-runner-empty">
+          Nothing yet — the subscription runner is off by default. Turn it on in Settings to route background reasoning
+          through your Claude subscription.
+        </div>
+      ) : (
+        <>
+          <StatStrip
+            stats={[
+              {
+                label: 'Tokens used',
+                value: tokens(data.inputTokens + data.outputTokens),
+                hint: `${tokens(data.inputTokens)} in · ${tokens(data.outputTokens)} out`
+              },
+              { label: 'Runs', value: String(data.totalRuns) }
+            ]}
+          />
+          <Disclosure summary="Recent runs" testId="usage-runner-recent">
+            <DataTable columns={RUNNER_COLUMNS} rows={data.recent} rowKey={(row) => row.id} empty="No runs yet." />
+          </Disclosure>
+        </>
+      )}
+    </section>
   )
 }
 
@@ -307,11 +373,13 @@ export default function SpendPanel(): React.JSX.Element {
   // 7 days drives the token total + role-group composition (Stage 1 gotcha 3).
   const local14 = useIpc('usage.local.summary', { sinceDays: 14 })
   const local7 = useIpc('usage.local.summary', { sinceDays: 7 })
+  const runner = useIpc('usage.runner', undefined)
 
   const reloadAll = (): void => {
     summary.reload()
     local14.reload()
     local7.reload()
+    runner.reload()
   }
 
   return (
@@ -341,6 +409,16 @@ export default function SpendPanel(): React.JSX.Element {
               </div>
             ) : (
               <LocalUsageSection window14={local14.data} window7={local7.data} />
+            )}
+
+            {runner.error !== null ? (
+              <ErrorState error={runner.error} onRetry={reloadAll} />
+            ) : runner.data === null ? (
+              <div className="border-t border-line pt-6 text-[12px] text-ink-mute" data-testid="usage-runner">
+                Loading subscription runner usage…
+              </div>
+            ) : (
+              <SubscriptionUsageSection data={runner.data} />
             )}
 
             <section className="flex flex-col gap-4 border-t border-line pt-6">

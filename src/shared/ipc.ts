@@ -374,6 +374,9 @@ export interface SpendEntryDto {
 export interface SpendTaskAggregateDto {
   readonly taskId: string
   readonly usd: number
+  /** Tokens this task's metered calls consumed (in / out) — the primary metric. */
+  readonly inputTokens: number
+  readonly outputTokens: number
   readonly calls: number
   readonly lastAt: string
 }
@@ -382,8 +385,49 @@ export interface SpendSummaryDto {
   readonly totalUsd: number
   readonly last24hUsd: number
   readonly ceilingUsd: number
+  /**
+   * Token consumption across the metered cloud ledger — the tokens-first metric
+   * (subscription/local usage has no meaningful per-call dollar cost, so tokens
+   * are the honest common denominator). Dollars stay alongside because metered
+   * cloud spend is genuinely billed.
+   */
+  readonly totalInputTokens: number
+  readonly totalOutputTokens: number
+  readonly last24hInputTokens: number
+  readonly last24hOutputTokens: number
   readonly byTask: readonly SpendTaskAggregateDto[]
   readonly recent: readonly SpendEntryDto[]
+}
+
+// ── subscription runner usage (token-based — a flat plan has no per-call $) ────
+
+/** One subscription-runner run projected for the Usage panel; NO dollar field. */
+export interface SubscriptionRunDto {
+  readonly id: string
+  readonly taskId: string
+  readonly mode: string
+  readonly model: string | null
+  readonly startedAt: string
+  readonly durationMs: number | null
+  readonly numTurns: number | null
+  readonly inputTokens: number | null
+  readonly outputTokens: number | null
+  readonly isError: boolean | null
+  readonly exitCode: number | null
+}
+
+/**
+ * usage.runner: what the subscription (headless-Claude) runner has consumed,
+ * measured in TOKENS + runs. A subscription is flat-fee, so this deliberately
+ * carries no dollars (the runner's shadow-cost estimate is meaningless on a
+ * subscription and is not surfaced here). Always answerable — an unused runner
+ * reports zeros.
+ */
+export interface SubscriptionUsageDto {
+  readonly totalRuns: number
+  readonly inputTokens: number
+  readonly outputTokens: number
+  readonly recent: readonly SubscriptionRunDto[]
 }
 
 // ── local-LLM usage (what runs on this computer — local qwen3 reasoning) ──────
@@ -1054,6 +1098,13 @@ export interface IpcChannels {
    * running.
    */
   'usage.local.summary': { req: { sinceDays?: number }; res: LocalUsageSummaryDto }
+
+  /**
+   * Subscription-runner token usage for the Usage panel (tokens + runs, no
+   * dollars — a subscription is flat-fee). Read-only rollup over runner_runs;
+   * always answerable (zeros when the runner has never run).
+   */
+  'usage.runner': { req: void; res: SubscriptionUsageDto }
 
   'tasks.list': { req: void; res: readonly TaskDto[] }
   /** Force a task to run now (deferred/failed/cancelled/backoff-pending) — §8 "run now". */

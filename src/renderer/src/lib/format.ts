@@ -27,6 +27,21 @@ export function usd(value: number): string {
   return value < 0.01 ? `$${value.toFixed(4)}` : `$${value.toFixed(2)}`
 }
 
+/**
+ * Token counts, collapsed for density: "340" · "1.2k" · "4.5M"; null/undefined
+ * renders '—'. The tokens-first cost metric (a subscription plan has no per-call
+ * dollar cost, so tokens are the honest common denominator). One token ≈ ¾ of a
+ * word — pair a token figure with that tooltip where it first appears.
+ */
+export function tokens(n: number | null | undefined): string {
+  if (n == null) return '—'
+  if (n < 1000) return String(n)
+  // 999_950 not 1_000_000: values that would round to "1000.0k" under toFixed(1)
+  // promote to "1.0M" instead of showing a four-digit k figure.
+  if (n < 999_950) return `${(n / 1000).toFixed(1)}k`
+  return `${(n / 1_000_000).toFixed(1)}M`
+}
+
 /** Milliseconds with unit collapse: 840ms · 2.3s · 4m 12s. */
 export function duration(ms: number | null | undefined): string {
   if (ms == null) return '…'
