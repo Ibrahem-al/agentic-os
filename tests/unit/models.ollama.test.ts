@@ -7,6 +7,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { EMBEDDING_DIM, LOCAL_POOL_CONCURRENCY } from '../../src/main/config'
 import { OllamaClient, OllamaError } from '../../src/main/models'
+import { isTransientOllamaFault } from '../../src/main/models/ollama'
 
 type FetchMock = ReturnType<typeof vi.fn<(input: string, init?: RequestInit) => Promise<Response>>>
 
@@ -159,6 +160,92 @@ describe('ollama generate', () => {
   it('surfaces HTTP errors with status and detail', async () => {
     const fetchMock = vi.fn(async () => new Response('{"error":"boom"}', { status: 500 }))
     await expect(new OllamaClient({ fetch: fetchMock }).generate('x')).rejects.toThrow(/HTTP 500.*boom/)
+  })
+})
+
+describe('ollama transient-fault resilience (embed/generate retry)', () => {
+  const embedding = () => Array.from({ length: EMBEDDING_DIM }, () => 0.1)
+  /** The live-observed model-runner-crash body: a dial-refused to the runner's port. */
+  const RUNNER_CRASH_BODY = JSON.stringify({
+    error:
+      'Post "http://127.0.0.1:57279/tokenize": dial tcp 127.0.0.1:57279: connectex: No connection could be made because the target machine actively refused it.'
+  })
+
+  it('classifies transient runner faults but not permanent client errors', () => {
+    // The live 400 (runner crashed) → transient.
+    expect(isTransientOllamaFault(new OllamaError(`Ollama /api/embed returned HTTP 400: ${RUNNER_CRASH_BODY}`))).toBe(true)
+    // 5xx → always transient.
+    expect(isTransientOllamaFault(new OllamaError('Ollama /api/generate returned HTTP 503: overloaded'))).toBe(true)
+    // Daemon socket refused the connection → transient.
+    expect(isTransientOllamaFault(new OllamaError('Ollama daemon unreachable at http://127.0.0.1:11434 — is it running?'))).toBe(true)
+    // A plain 400 (bad request / unknown model) → permanent, must NOT retry.
+    expect(isTransientOllamaFault(new OllamaError('Ollama /api/embed returned HTTP 400: {"error":"invalid input"}'))).toBe(false)
+    expect(isTransientOllamaFault(new OllamaError('Ollama /api/generate returned HTTP 404: model "nope" not found'))).toBe(false)
+    // An abort is a caller cancel, never a fault to retry.
+    const abort = Object.assign(new Error('aborted'), { name: 'AbortError' })
+    expect(isTransientOllamaFault(abort)).toBe(false)
+    // A non-Ollama error is not our concern.
+    expect(isTransientOllamaFault(new Error('boom'))).toBe(false)
+  })
+
+  it('embed() retries the runner-crash 400 and then succeeds (the stuck-extraction fix)', async () => {
+    let calls = 0
+    const fetchMock = vi.fn(async () => {
+      calls += 1
+      return calls === 1 ? new Response(RUNNER_CRASH_BODY, { status: 400 }) : jsonResponse({ embeddings: [embedding()] })
+    })
+    const result = await new OllamaClient({ fetch: fetchMock }).embed(['x'])
+    expect(result).toHaveLength(1)
+    expect(calls).toBe(2) // one retry after the transient fault
+  })
+
+  it('generate() retries a 5xx then succeeds', async () => {
+    let calls = 0
+    const fetchMock = vi.fn(async () => {
+      calls += 1
+      return calls === 1 ? new Response('{"error":"loading"}', { status: 503 }) : jsonResponse({ response: 'pong' })
+    })
+    const result = await new OllamaClient({ fetch: fetchMock }).generate('ping?')
+    expect(result.text).toBe('pong')
+    expect(calls).toBe(2)
+  })
+
+  it('a per-request TIMEOUT is NOT retried (undici rejects with TimeoutError, not AbortError)', async () => {
+    // AbortSignal.timeout makes undici reject with a DOMException named 'TimeoutError'.
+    const timeoutErr = Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })
+    const fetchMock = vi.fn(async () => {
+      throw timeoutErr
+    })
+    await expect(new OllamaClient({ fetch: fetchMock }).embed(['x'])).rejects.toThrow(/timed out after \d+ms/)
+    expect(fetchMock).toHaveBeenCalledTimes(1) // a hang is NOT hammered as a transient fault
+  })
+
+  it('the timed-out message is classified non-transient (never re-hammered)', () => {
+    expect(isTransientOllamaFault(new OllamaError('Ollama /api/embed timed out after 120000ms — the daemon did not respond'))).toBe(false)
+  })
+
+  it('embed() does NOT retry a permanent 400 — it fails fast', async () => {
+    const fetchMock = vi.fn(async () => new Response('{"error":"invalid input"}', { status: 400 }))
+    await expect(new OllamaClient({ fetch: fetchMock }).embed(['x'])).rejects.toThrow(/HTTP 400.*invalid input/)
+    expect(fetchMock).toHaveBeenCalledTimes(1) // no retry storm on a client error
+  })
+
+  it('does not call the daemon at all when the signal is already aborted', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ embeddings: [embedding()] }))
+    const ac = new AbortController()
+    ac.abort()
+    await expect(new OllamaClient({ fetch: fetchMock }).embed(['x'], { signal: ac.signal })).rejects.toThrow(/abort/i)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('aborting during a retry backoff stops the retries (cooperative cancel)', async () => {
+    const fetchMock = vi.fn(async () => new Response(RUNNER_CRASH_BODY, { status: 400 }))
+    const ac = new AbortController()
+    const p = new OllamaClient({ fetch: fetchMock }).embed(['x'], { signal: ac.signal })
+    // The first attempt fails transient → enters the 300ms backoff; abort mid-wait.
+    setTimeout(() => ac.abort(), 40)
+    await expect(p).rejects.toThrow(/abort/i)
+    expect(fetchMock).toHaveBeenCalledTimes(1) // the second attempt never fired
   })
 })
 

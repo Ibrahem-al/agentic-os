@@ -22,7 +22,15 @@ export {
   type ScheduleSpec,
   type ScheduleStatus
 } from './schedules'
-export { registerMaintenanceHandlers, runPruneJob, type MaintenanceJobDeps, type PruneResult } from './jobs'
+export {
+  reconcileWorkflowJobs,
+  registerMaintenanceHandlers,
+  runPruneJob,
+  runTaskRetentionSweep,
+  type MaintenanceJobDeps,
+  type PruneResult,
+  type WorkflowReconcileResult
+} from './jobs'
 export {
   EXTRACTION_TASK_KIND,
   InactivityMonitor,

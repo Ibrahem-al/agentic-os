@@ -23,6 +23,7 @@ export {
 export { LangGraphRunner, type LangGraphRunnerDeps } from './runner'
 export { createInflightYield, type InflightYieldOptions } from './yield'
 export {
+  WorkflowCancelledError,
   WorkflowJobError,
   type ActionExecutor,
   type AuditEvent,
@@ -33,6 +34,7 @@ export {
   type KernelActionKind,
   type PermissionChecker,
   type PermissionDecision,
+  type ResumeWorkflowOptions,
   type RunWorkflowOptions,
   type SummarizerLlm,
   type WorkflowJobStatus,

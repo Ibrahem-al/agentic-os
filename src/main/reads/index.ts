@@ -82,6 +82,14 @@ export {
 } from './tasks'
 
 export {
+  getTaskProcesses,
+  type TaskProcessesArgs,
+  type TaskProcessesDeps
+} from './processes'
+
+export { sampleProcess, type ProcResourceSample } from './processSampler'
+
+export {
   getAppStatus,
   getSettingsSummary,
   type AppStatusDeps,

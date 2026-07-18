@@ -18,7 +18,11 @@ import {
   LOCAL_POOL_CONCURRENCY,
   OLLAMA_BASE_URL,
   OLLAMA_INSTALL_URL,
+  OLLAMA_EMBED_TIMEOUT_MS,
+  OLLAMA_GENERATE_TIMEOUT_MS,
   OLLAMA_REQUIRED_MODELS,
+  OLLAMA_RETRY_ATTEMPTS,
+  OLLAMA_RETRY_BACKOFF_MS,
   SMALL_LLM_MODEL
 } from '../config'
 import type { LocalLlmUsageEntry, LocalLlmUsageRecorder } from '../storage/localUsage'
@@ -113,6 +117,8 @@ export interface GenerateOptions {
    * string (not RoleKey) so ollama.ts imports no provider types.
    */
   role?: string
+  /** Cancel the in-flight request (§8 cooperative task cancel); aborts the fetch. */
+  signal?: AbortSignal
 }
 
 export interface GenerateResult {
@@ -141,6 +147,97 @@ export class OllamaError extends Error {
     super(message, cause === undefined ? undefined : { cause })
     this.name = 'OllamaError'
   }
+}
+
+/** True when `err` is an AbortError (a caller-requested cancel — never a fault to retry). */
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'AbortError'
+}
+
+/**
+ * True when `err` is a fetch timeout. `AbortSignal.timeout()` makes undici reject
+ * with a DOMException whose name is 'TimeoutError' (NOT 'AbortError') — so a timeout
+ * must be detected by this name (or by the timeout signal having fired), never by
+ * isAbortError, or it would be misread as a generic "unreachable" fault and retried.
+ */
+function isTimeoutError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'TimeoutError'
+}
+
+/**
+ * Read a signal's aborted state through a call so control-flow narrowing does not
+ * assume it is unchanged across an `await` (the signal can fire during the fetch).
+ */
+function isAborted(signal?: AbortSignal): boolean {
+  return signal?.aborted === true
+}
+
+/** An AbortError to reject with — prefers the signal's own reason when it is an Error. */
+function abortError(signal?: AbortSignal): Error {
+  if (signal?.reason instanceof Error) return signal.reason
+  const err = new Error('Ollama request aborted')
+  err.name = 'AbortError'
+  return err
+}
+
+/** abortable sleep — resolves after `ms`, or rejects with an AbortError if `signal` fires. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted === true) {
+      reject(abortError(signal))
+      return
+    }
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      reject(abortError(signal))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/** Merge a caller cancel signal with a per-request timeout signal (either may be absent). */
+function combineSignals(caller?: AbortSignal, timeout?: AbortSignal): AbortSignal | undefined {
+  const parts = [caller, timeout].filter((s): s is AbortSignal => s !== undefined)
+  if (parts.length === 0) return undefined
+  if (parts.length === 1) return parts[0]
+  return AbortSignal.any(parts)
+}
+
+/**
+ * Runner-subprocess-unreachable signatures in an Ollama error BODY (§4). The
+ * daemon proxies embed/tokenize to a per-model subprocess on an ephemeral local
+ * port; when that runner is (re)loading or has just crashed, the daemon returns an
+ * HTTP 400 whose body is a dial/connection-refused to that port (observed live:
+ * `Post ".../tokenize": dial tcp 127.0.0.1:NNNNN: connectex: ... actively refused`).
+ * These clear on their own once the daemon respawns the runner — so they are
+ * retryable, whereas a plain "invalid input" / unknown-model 400 is NOT.
+ */
+const RUNNER_UNREACHABLE_RE =
+  /dial tcp|connectex|actively refused|connection refused|connection reset|econnrefused|tokenize|no connection could be made|broken pipe/i
+
+/**
+ * Is `err` a TRANSIENT Ollama fault worth retrying the SAME request for? True for
+ * a network-unreachable throw, any HTTP 5xx, and a 4xx whose body matches
+ * RUNNER_UNREACHABLE_RE (the model-runner crash/reload class). An AbortError is
+ * NEVER transient (the caller cancelled), and a plain 4xx (bad request / unknown
+ * model) is a permanent client error — retrying it only delays the real failure.
+ */
+export function isTransientOllamaFault(err: unknown): boolean {
+  if (isAbortError(err)) return false
+  if (!(err instanceof OllamaError)) return false
+  const msg = err.message.toLowerCase()
+  if (msg.includes('unreachable')) return true // the daemon socket refused/reset the connection
+  const httpMatch = /returned http (\d{3})/.exec(msg)
+  if (httpMatch !== null) {
+    const status = Number(httpMatch[1])
+    if (status >= 500) return true
+    if (status >= 400) return RUNNER_UNREACHABLE_RE.test(msg)
+  }
+  return false
 }
 
 interface OllamaClientOptions {
@@ -231,10 +328,15 @@ export class OllamaClient {
    * Rides the §8 local pool: bursts of background embeds queue here instead
    * of monopolizing the daemon.
    */
-  async embed(texts: string[]): Promise<number[][]> {
+  async embed(texts: string[], options: { signal?: AbortSignal } = {}): Promise<number[][]> {
     if (texts.length === 0) return []
     return localPool.run(async () => {
-      const response = await this.request('/api/embed', { model: EMBEDDING_MODEL, input: texts })
+      const response = await this.request(
+        '/api/embed',
+        { model: EMBEDDING_MODEL, input: texts },
+        options.signal,
+        OLLAMA_EMBED_TIMEOUT_MS
+      )
       const body = (await response.json()) as { embeddings?: number[][] }
       const embeddings = body.embeddings
       if (!embeddings || embeddings.length !== texts.length) {
@@ -281,7 +383,7 @@ export class OllamaClient {
       let totalDurationNs: number | undefined
       let ok = false
       try {
-        const response = await this.request('/api/generate', payload)
+        const response = await this.request('/api/generate', payload, options.signal, OLLAMA_GENERATE_TIMEOUT_MS)
         const body = (await response.json()) as {
           response?: string
           model?: string
@@ -359,15 +461,68 @@ export class OllamaClient {
     }
   }
 
-  private async request(path: string, payload: unknown): Promise<Response> {
+  /**
+   * POST to the daemon with bounded retry over a TRANSIENT runner fault
+   * (isTransientOllamaFault): a model-runner crash/reload answers embed/generate
+   * with a dial-refused 400 or a 5xx that clears once the daemon respawns the
+   * runner, so retrying the SAME request a few times (short backoff) keeps a whole
+   * extraction/ingest workflow step from dying on a hiccup. A permanent 4xx and an
+   * AbortError (caller cancel) are re-thrown immediately. The retry backoff holds
+   * this call's local-pool slot (embed/generate run inside localPool) — accepted:
+   * a genuine fault is rare and recovering it is the point. status()/ps() bypass
+   * this entirely (they call this.fetch directly) so the dashboard stays responsive.
+   */
+  private async request(path: string, payload: unknown, signal?: AbortSignal, timeoutMs?: number): Promise<Response> {
+    for (let attempt = 0; ; attempt++) {
+      if (isAborted(signal)) throw abortError(signal)
+      try {
+        return await this.requestOnce(path, payload, signal, timeoutMs)
+      } catch (err) {
+        if (isAbortError(err) || isAborted(signal)) throw err
+        const canRetry = attempt < OLLAMA_RETRY_ATTEMPTS && isTransientOllamaFault(err)
+        if (!canRetry) throw err
+        const backoff = OLLAMA_RETRY_BACKOFF_MS[attempt] ?? OLLAMA_RETRY_BACKOFF_MS[OLLAMA_RETRY_BACKOFF_MS.length - 1] ?? 1000
+        console.warn(
+          `[models] Ollama ${path} transient fault (try ${attempt + 1}/${OLLAMA_RETRY_ATTEMPTS + 1}) — retrying in ${backoff}ms: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        )
+        await sleep(backoff, signal)
+      }
+    }
+  }
+
+  /** One POST attempt: throws OllamaError on a network fault / timeout / non-2xx (retry lives in request()). */
+  private async requestOnce(path: string, payload: unknown, signal?: AbortSignal, timeoutMs?: number): Promise<Response> {
+    // A per-request wall-clock ceiling that a hung runner cannot outlast, merged
+    // with the caller's cancel signal so either one aborts the fetch.
+    const timeoutSignal = timeoutMs !== undefined ? AbortSignal.timeout(timeoutMs) : undefined
+    const effective = combineSignals(signal, timeoutSignal)
     let response: Response
     try {
       response = await this.fetch(`${this.baseUrl}${path}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        ...(effective !== undefined ? { signal: effective } : {})
       })
     } catch (err) {
+      // Disambiguate, in priority order:
+      //  1. Caller cancel (a real AbortError from the caller's controller) → propagate
+      //     as-is; never retried.
+      if (isAborted(signal)) throw abortError(signal)
+      //  2. Per-request TIMEOUT → a clean, NON-transient OllamaError so the step fails
+      //     and the queue retries the whole task once the daemon recovers. Keyed off
+      //     the timeout SIGNAL (ground truth) OR the 'TimeoutError' name — undici
+      //     rejects an AbortSignal.timeout fetch with 'TimeoutError', NOT 'AbortError',
+      //     so this must NOT sit behind isAbortError (that misclassified the hang as an
+      //     "unreachable" fault and retried it ~4× the ceiling).
+      if (isAborted(timeoutSignal) || isTimeoutError(err)) {
+        throw new OllamaError(`Ollama ${path} timed out after ${timeoutMs}ms — the daemon did not respond`)
+      }
+      //  3. Any other AbortError (a race where the caller aborted just now) → propagate.
+      if (isAbortError(err)) throw abortError(signal)
+      //  4. A genuine network-unreachable fault (transient — retried in request()).
       throw new OllamaError(`Ollama daemon unreachable at ${this.baseUrl} — is it running? (${OLLAMA_INSTALL_URL})`, err)
     }
     if (!response.ok) {

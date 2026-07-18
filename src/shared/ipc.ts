@@ -417,12 +417,57 @@ export interface LocalUsageSummaryDto {
 export interface TaskDto {
   readonly id: string
   readonly kind: string
-  readonly status: 'pending' | 'running' | 'done' | 'failed' | 'deferred'
+  readonly status: 'pending' | 'running' | 'done' | 'failed' | 'deferred' | 'cancelled'
   readonly attempts: number
   readonly notBeforeUnixMs: number | null
   readonly lastError: string | null
   readonly createdAt: string
   readonly updatedAt: string
+}
+
+/** One OS process's live resource use (tasks.processes). */
+export interface ProcResourceDto {
+  readonly pid: number | null
+  /** Percent of one core (may exceed 100 across cores); null when the OS omits it (Windows child CPU). */
+  readonly cpuPercent: number | null
+  /** Working-set / resident bytes; null when unavailable. */
+  readonly memoryBytes: number | null
+}
+
+/** The app's own main process — where in-process tasks (extraction, ingest, skills, maintenance) run. */
+export interface TaskHostProcessDto extends ProcResourceDto {
+  readonly name: string
+}
+
+/** A child process a task spawned (today: a runner `claude` child). */
+export interface TaskChildProcessDto extends ProcResourceDto {
+  /** e.g. 'runner:agent' / 'runner:completion'. */
+  readonly role: string
+  readonly startedAt: string
+  /** Still in flight (an unfinished runner_runs row); a finished child reports last-known stats. */
+  readonly live: boolean
+}
+
+/**
+ * tasks.processes / get_task_processes: what is running for a task and its RAM/CPU.
+ * `host` is the app's main process (Electron-measured — cross-platform CPU), where
+ * in-process background tasks actually run; `localRuntime` is the SHARED Ollama
+ * daemon's loaded models (the local-model work a task drives — memory per model);
+ * `children` are the task's own runner child processes. Best-effort telemetry.
+ */
+export interface TaskProcessesDto {
+  /** The task these belong to; null when asked for "the current task" and none is running. */
+  readonly taskId: string | null
+  /** Is this task the queue's in-flight task right now. */
+  readonly running: boolean
+  readonly host: TaskHostProcessDto | null
+  readonly localRuntime: {
+    readonly reachable: boolean
+    readonly loadedModels: readonly LocalLoadedModelDto[]
+  }
+  readonly children: readonly TaskChildProcessDto[]
+  /** ISO-8601 sample time. */
+  readonly sampledAt: string
 }
 
 export interface WatchedFolderDto {
@@ -963,6 +1008,15 @@ export interface IpcChannels {
   'usage.local.summary': { req: { sinceDays?: number }; res: LocalUsageSummaryDto }
 
   'tasks.list': { req: void; res: readonly TaskDto[] }
+  /** Force a task to run now (deferred/failed/cancelled/backoff-pending) — §8 "run now". */
+  'tasks.runNow': { req: { id: string }; res: { taskId: string; status: 'pending' } }
+  /** Cancel a task (running/pending/deferred) — §8 cooperative cancel; kills its child processes. */
+  'tasks.cancel': {
+    req: { id: string }
+    res: { taskId: string; status: 'cancelled'; wasRunning: boolean; killedChildren: number }
+  }
+  /** What is running for a task + its RAM/CPU (id omitted = the current in-flight task). */
+  'tasks.processes': { req: { id?: string }; res: TaskProcessesDto }
   'watch.list': { req: void; res: readonly WatchedFolderDto[] }
   'watch.add': {
     req: { name: string; path: string; tags: readonly string[]; extensions?: readonly string[] }

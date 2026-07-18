@@ -37,12 +37,19 @@ import type {
   SkillImprovementEntryDto,
   SkillSummaryDto,
   StagedWriteDto,
+  TaskHostProcessDto,
   UpdaterStatusDto,
   WatchedFolderDto
 } from '../shared/ipc'
 import { IPC_EVENT_INGEST_PROGRESS, IPC_EVENT_OLLAMA_PULL, IPC_INVOKE_PREFIX } from '../shared/ipc'
 import { quiesceForInstall, type UpdaterController } from './updater'
-import { BACKUP_INTERVAL_HOURS_CHOICES, CLOUD_PROVIDERS, WATCHED_FOLDERS_CONFIG_FILENAME, type CloudProvider } from './config'
+import {
+  BACKUP_INTERVAL_HOURS_CHOICES,
+  CLOUD_PROVIDERS,
+  PRODUCT_NAME,
+  WATCHED_FOLDERS_CONFIG_FILENAME,
+  type CloudProvider
+} from './config'
 import {
   exportData,
   listBackups,
@@ -115,6 +122,7 @@ import {
 import {
   HookInstallError,
   installSessionEndHook,
+  TaskRetryError,
   type DurableTaskQueue,
   type RuleLoadError,
   type TriggerSchedules,
@@ -128,6 +136,8 @@ import {
   getSettingsSummary,
   getSkillDetail,
   getSpendSummary,
+  getTaskProcesses,
+  sampleProcess,
   getTrace,
   getTriggersStatus,
   listInjectionFlags,
@@ -244,6 +254,7 @@ const errorCode = (err: unknown): IpcErrorCode => {
   if (err instanceof MemoryEditError) return err.code
   if (err instanceof SkillImprovementError) return err.code
   if (err instanceof OllamaError) return 'OLLAMA_ERROR'
+  if (err instanceof TaskRetryError) return err.code
   if (err instanceof HookInstallError) return 'INVALID_STATE'
   if (err instanceof RestoreRequestError) return err.code
   return 'INTERNAL'
@@ -281,6 +292,29 @@ const testConnectionMessage = (r: TestConnectionResult): string => {
   const detail = r.error ?? `runner ${r.state}`
   // The one actionable line for the common expired-login case (§3.7 banner copy).
   return r.state === 'auth-expired' ? `${detail} — run \`claude /login\` in any terminal, then Retry` : detail
+}
+
+/**
+ * The app's own main-process metrics (tasks.processes `host`) from Electron —
+ * where the in-process background tasks run. `percentCPUUsage` is a percentage;
+ * `workingSetSize` is KILOBYTES (Electron's unit) → bytes. Never throws.
+ */
+function appHostMetrics(): TaskHostProcessDto | null {
+  try {
+    const metrics = app.getAppMetrics()
+    const main = metrics.find((m) => m.type === 'Browser') ?? metrics[0]
+    if (main === undefined) return null
+    const cpu = main.cpu?.percentCPUUsage
+    const mem = main.memory?.workingSetSize
+    return {
+      pid: main.pid,
+      name: `${PRODUCT_NAME} (app)`,
+      cpuPercent: typeof cpu === 'number' && Number.isFinite(cpu) ? Math.round(cpu * 10) / 10 : null,
+      memoryBytes: typeof mem === 'number' && Number.isFinite(mem) ? mem * 1024 : null
+    }
+  } catch {
+    return null
+  }
 }
 
 // ── registration ──────────────────────────────────────────────────────────────
@@ -556,6 +590,34 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   // ── tasks & watched folders ────────────────────────────────────────────────
 
   register('tasks.list', () => listTasks(need.db()))
+
+  const needQueue = (): DurableTaskQueue =>
+    deps.triggers?.queue ?? raiseUnavailable('the task queue (triggers did not boot this launch)')
+
+  // "Run now": force a task to run regardless of its current state (deferred, failed,
+  // cancelled, or waiting out a retry backoff). TaskRetryError → NOT_FOUND/INVALID_STATE.
+  register('tasks.runNow', ({ id }) => needQueue().runNow(id))
+
+  // Cancel a task (§8 cooperative cancel): aborts the in-flight signal + kills the
+  // task's child processes, or drops a queued/deferred one. The human-gated approval
+  // spine is off-limits (a parked task returns INVALID_STATE — decide it in Approvals).
+  register('tasks.cancel', ({ id }) => needQueue().cancel(id))
+
+  // What is running for a task + its RAM/CPU: the app's own main process (Electron
+  // metrics — where in-process tasks run), the shared Ollama daemon's loaded models,
+  // and the task's runner child processes sampled by pid. Best-effort throughout.
+  register('tasks.processes', (req) =>
+    getTaskProcesses(
+      {
+        db: need.db(),
+        ollama: deps.ollama,
+        hostMetrics: appHostMetrics,
+        sampleProcess: (pid) => sampleProcess(pid),
+        runningTaskId: () => deps.triggers?.queue.runningTaskId ?? null
+      },
+      req?.id !== undefined ? { id: req.id } : {}
+    )
+  )
 
   const watchStore = new WatchedFolderStore({
     configPath: join(deps.userDataDir, WATCHED_FOLDERS_CONFIG_FILENAME)

@@ -503,7 +503,7 @@ describe('DurableTaskQueue (§8 mirror + §20 retry + §13 approvals)', () => {
     )
     insert.run('rd-done', 'done', null)
     expect(codeOf(() => queue.retryDeferred('rd-done'))).toBe('INVALID_STATE')
-    expect(() => queue.retryDeferred('rd-done')).toThrow(/not 'deferred'/)
+    expect(() => queue.retryDeferred('rd-done')).toThrow(/only deferred tasks can be retried/)
     // Deferred, but its kind has no handler this launch.
     insert.run('rd-alien', 'deferred', null)
     appData.db.prepare(`UPDATE tasks SET kind = 'alien' WHERE id = 'rd-alien'`).run()
@@ -544,5 +544,158 @@ describe('DurableTaskQueue (§8 mirror + §20 retry + §13 approvals)', () => {
     await tick()
     expect(attempts).toBe(5)
     expect(row('extract-p01').status).toBe('pending') // failing again → a new backoff round, still not lost
+  })
+})
+
+describe('DurableTaskQueue task control (runNow / cancel — §8 user actions)', () => {
+  const codeOf = (fn: () => unknown): string | null => {
+    try {
+      fn()
+    } catch (err) {
+      return err instanceof TaskRetryError ? err.code : `not-a-TaskRetryError: ${String(err)}`
+    }
+    return null
+  }
+  const insertTask = (id: string, status: string, approval: string | null = null): void => {
+    appData.db
+      .prepare(
+        `INSERT INTO tasks (id, kind, payload_json, status, attempts, priority, waiting_approval_id)
+         VALUES (?, 'probe', '{}', ?, 0, 0, ?)`
+      )
+      .run(id, status, approval)
+  }
+
+  it('runNow forces a deferred / failed / cancelled / backoff-pending task to run', async () => {
+    const queue = makeQueue()
+    queue.registerHandler('probe', () => Promise.resolve())
+    queue.start()
+    for (const status of ['deferred', 'failed', 'cancelled']) {
+      insertTask(`rn-${status}`, status)
+      expect(queue.runNow(`rn-${status}`)).toEqual({ taskId: `rn-${status}`, status: 'pending' })
+      expect(row(`rn-${status}`).status).toBe('pending')
+      await tick()
+      expect(row(`rn-${status}`).status).toBe('done')
+    }
+  })
+
+  it('runNow rejects a running / done task and an unknown id', async () => {
+    const queue = makeQueue()
+    queue.registerHandler('probe', () => Promise.resolve())
+    queue.start()
+    expect(codeOf(() => queue.runNow('ghost'))).toBe('NOT_FOUND')
+    insertTask('rn-done', 'done')
+    expect(codeOf(() => queue.runNow('rn-done'))).toBe('INVALID_STATE')
+    insertTask('rn-parked', 'deferred', 'apr-x')
+    expect(codeOf(() => queue.runNow('rn-parked'))).toBe('INVALID_STATE')
+    expect(() => queue.runNow('rn-parked')).toThrow(/decide the approval/)
+    await tick()
+  })
+
+  it('cancel drops a queued task and marks it cancelled (not run)', async () => {
+    const queue = makeQueue()
+    const ran: string[] = []
+    queue.registerHandler('probe', (payload) => {
+      ran.push(String(payload['tag']))
+      return Promise.resolve()
+    })
+    // Two tasks; a future notBefore keeps them queued so we can cancel one first.
+    queue.enqueue({ id: 'c1', kind: 'probe', payload: { tag: 'a' }, notBeforeUnixMs: Date.now() + 10_000 })
+    queue.start()
+    const result = queue.cancel('c1')
+    expect(result).toMatchObject({ taskId: 'c1', status: 'cancelled', wasRunning: false, killedChildren: 0 })
+    expect(row('c1').status).toBe('cancelled')
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(ran).toEqual([]) // never dispatched
+  })
+
+  it('cancel of the in-flight task marks it cancelled — recordFailure never overwrites it', async () => {
+    const killed: string[] = []
+    const queue = new DurableTaskQueue({ db: appData.db, killChildrenForTask: (id) => (killed.push(id), 3) })
+    queues.push(queue)
+    let sawSignal: AbortSignal | undefined
+    queue.registerHandler('slow', (_payload, ctx) => {
+      sawSignal = ctx.signal
+      return new Promise<void>((_resolve, reject) => {
+        ctx.signal.addEventListener('abort', () => reject(new Error('handler saw the cancel')), { once: true })
+      })
+    })
+    queue.start()
+    queue.enqueue({ id: 'run1', kind: 'slow' })
+    await tick()
+    expect(queue.runningTaskId).toBe('run1')
+
+    const result = queue.cancel('run1')
+    expect(result).toMatchObject({ taskId: 'run1', status: 'cancelled', wasRunning: true, killedChildren: 3 })
+    expect(killed).toEqual(['run1']) // the child-kill hook fired for the cancelled task
+    expect(sawSignal?.aborted).toBe(true) // the handler's ctx.signal fired
+
+    await tick()
+    // The settle path — NOT recordFailure — wrote the terminal status.
+    expect(row('run1').status).toBe('cancelled')
+    expect(row('run1').last_error).toBe('cancelled by user')
+  })
+
+  it('cancel of a live workflow (-wf) row redirects to its driver task', async () => {
+    const queue = makeQueue()
+    queue.registerHandler('slow', (_payload, ctx) => {
+      return new Promise<void>((_resolve, reject) => {
+        ctx.signal.addEventListener('abort', () => reject(new Error('driver cancelled')), { once: true })
+      })
+    })
+    queue.start()
+    queue.enqueue({ id: 'extract-x', kind: 'slow' })
+    await tick()
+    expect(queue.runningTaskId).toBe('extract-x')
+    // The runner's `<taskId>-wf` job row exists (kind='workflow', running).
+    appData.db.prepare(`INSERT INTO tasks (id, kind, status) VALUES ('extract-x-wf', 'workflow', 'running')`).run()
+
+    // Cancelling the internal -wf row redirects to the driver task.
+    const result = queue.cancel('extract-x-wf')
+    expect(result).toMatchObject({ taskId: 'extract-x', status: 'cancelled', wasRunning: true })
+    await tick()
+    expect(row('extract-x').status).toBe('cancelled')
+  })
+
+  it('a handler that completes despite a cancel still lands done (done wins)', async () => {
+    const queue = makeQueue()
+    let release: (() => void) | undefined
+    queue.registerHandler('stubborn', () => new Promise<void>((resolve) => (release = resolve)))
+    queue.start()
+    queue.enqueue({ id: 'sb1', kind: 'stubborn' })
+    await tick()
+    queue.cancel('sb1') // request cancel, but the handler ignores its signal…
+    release?.() // …and finishes anyway.
+    await tick()
+    expect(row('sb1').status).toBe('done')
+  })
+
+  it('cancel rejects a finished task, an unknown id, and an approval-parked task', async () => {
+    const queue = makeQueue()
+    queue.registerHandler('probe', () => Promise.resolve())
+    queue.start()
+    expect(codeOf(() => queue.cancel('ghost'))).toBe('NOT_FOUND')
+    insertTask('cx-done', 'done')
+    expect(codeOf(() => queue.cancel('cx-done'))).toBe('INVALID_STATE')
+    insertTask('cx-parked', 'deferred', 'apr-y')
+    expect(codeOf(() => queue.cancel('cx-parked'))).toBe('INVALID_STATE')
+    expect(() => queue.cancel('cx-parked')).toThrow(/decide it in Approvals/)
+    await tick()
+  })
+
+  it('runNow revives a cancelled task and it runs', async () => {
+    const queue = makeQueue()
+    const ran: string[] = []
+    queue.registerHandler('probe', (payload) => {
+      ran.push(String(payload['tag']))
+      return Promise.resolve()
+    })
+    queue.enqueue({ id: 'rev1', kind: 'probe', payload: { tag: 'z' }, notBeforeUnixMs: Date.now() + 10_000 })
+    queue.start()
+    queue.cancel('rev1')
+    expect(row('rev1').status).toBe('cancelled')
+    queue.runNow('rev1')
+    await tick()
+    expect(row('rev1').status).toBe('done')
+    expect(ran).toEqual(['z'])
   })
 })

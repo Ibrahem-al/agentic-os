@@ -80,6 +80,8 @@ export interface RunExtractionOptions {
   readonly cwd?: string
   /** Caller-supplied job id (schedulers / tests); defaults to a random UUID. */
   readonly jobId?: string
+  /** §8 cooperative cancel — threaded into the workflow run so a cancel marks it 'cancelled'. */
+  readonly signal?: AbortSignal
 }
 
 /** Input for the delegate variant — items already staged in `runner_submissions`. */
@@ -94,6 +96,8 @@ export interface RunDelegateExtractionInput {
 export interface RunDelegateExtractionOptions {
   /** Caller-supplied job id (the queue handler); defaults to a random UUID. */
   readonly jobId?: string
+  /** §8 cooperative cancel — threaded into the workflow run. */
+  readonly signal?: AbortSignal
 }
 
 /** Input for the agent-mode variant (phase-19) — spawn a runner child, then delegate. */
@@ -119,6 +123,8 @@ export interface RunAgentExtractionInput {
 export interface RunAgentExtractionOptions {
   /** Caller-supplied job id (the queue handler); defaults to a random UUID. */
   readonly jobId?: string
+  /** §8 cooperative cancel — threaded into the workflow run. */
+  readonly signal?: AbortSignal
 }
 
 export interface ExtractionAgent {
@@ -143,8 +149,8 @@ export interface ExtractionAgent {
     input: RunAgentExtractionInput,
     options?: RunAgentExtractionOptions
   ): Promise<ExtractionRunResult>
-  /** Continue a crashed/failed extraction job from its last checkpoint (any workflow). */
-  resumeExtraction(jobId: string): Promise<ExtractionRunResult>
+  /** Continue a crashed/failed/cancelled extraction job from its last checkpoint (any workflow). */
+  resumeExtraction(jobId: string, options?: { signal?: AbortSignal }): Promise<ExtractionRunResult>
 }
 
 interface ExtractionInput {
@@ -512,7 +518,8 @@ export function createExtractionAgent(deps: ExtractionAgentDeps): ExtractionAgen
       }
       await deps.runner.run(EXTRACTION_WORKFLOW, input as unknown as JsonObject, {
         jobId,
-        agentId: EXTRACTION_AGENT_ID
+        agentId: EXTRACTION_AGENT_ID,
+        ...(options.signal !== undefined ? { signal: options.signal } : {})
       })
       return resultOf(jobId)
     },
@@ -531,7 +538,8 @@ export function createExtractionAgent(deps: ExtractionAgentDeps): ExtractionAgen
       }
       await deps.runner.run(EXTRACTION_DELEGATE_WORKFLOW, wfInput as unknown as JsonObject, {
         jobId,
-        agentId: EXTRACTION_AGENT_ID
+        agentId: EXTRACTION_AGENT_ID,
+        ...(options.signal !== undefined ? { signal: options.signal } : {})
       })
       return resultOf(jobId)
     },
@@ -559,12 +567,13 @@ export function createExtractionAgent(deps: ExtractionAgentDeps): ExtractionAgen
       }
       await deps.runner.run(EXTRACTION_AGENT_WORKFLOW, wfInput as unknown as JsonObject, {
         jobId,
-        agentId: EXTRACTION_AGENT_ID
+        agentId: EXTRACTION_AGENT_ID,
+        ...(options.signal !== undefined ? { signal: options.signal } : {})
       })
       return resultOf(jobId)
     },
-    async resumeExtraction(jobId) {
-      await deps.runner.resume(jobId)
+    async resumeExtraction(jobId, options = {}) {
+      await deps.runner.resume(jobId, options.signal !== undefined ? { signal: options.signal } : {})
       return resultOf(jobId)
     }
   }

@@ -92,6 +92,7 @@ import {
   DurableTaskQueue,
   InactivityMonitor,
   loadRules,
+  reconcileWorkflowJobs,
   registerExtractionHandler,
   registerIngestHandlers,
   registerMaintenanceHandlers,
@@ -882,7 +883,10 @@ async function bootTriggers(): Promise<void> {
     // §8: live INTERACTIVE MCP work is prioritized; background dispatch yields
     // (capped). §14b gauge split: a runner's own MCP calls don't count, so its
     // background task never blocks itself.
-    shouldYield: () => (mcpServer?.inflightInteractiveCalls ?? 0) > 0
+    shouldYield: () => (mcpServer?.inflightInteractiveCalls ?? 0) > 0,
+    // §8 cancel hook: kill a cancelled task's runner child tree(s) from the live
+    // registry (pid-reuse-safe). No-op on a default install (no runner children).
+    killChildrenForTask: (taskId) => subscriptionRunner?.killTaskChildren(taskId) ?? 0
   })
 
   if (extractionAgent !== null) {
@@ -971,6 +975,21 @@ async function bootTriggers(): Promise<void> {
     }
   }
   const spool = drainSessionSpool(queue, SPOOL_DIR)
+
+  // Reconcile stuck/benign workflow rows BEFORE start() reloads + resumes drivers:
+  // orphaned 'running' workflow jobs with no live driver → 'failed' (they would
+  // otherwise linger 'running' forever), and benign "nothing to extract" jobs left
+  // 'failed' → 'done'. Fully guarded on the tasks table; never throws boot down.
+  try {
+    const wf = reconcileWorkflowJobs(appData.db)
+    if (wf.orphanedRunningFixed + wf.benignResolved > 0) {
+      console.log(
+        `[triggers] workflow reconcile — ${wf.orphanedRunningFixed} orphaned running job(s) marked failed, ${wf.benignResolved} benign no-op(s) resolved`
+      )
+    }
+  } catch (err) {
+    console.warn('[triggers] workflow reconcile failed (ignored)', err)
+  }
 
   const { reloaded } = queue.start()
   const schedules = new TriggerSchedules({ queue })

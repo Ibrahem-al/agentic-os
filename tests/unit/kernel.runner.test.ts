@@ -74,3 +74,70 @@ describe('resume()/getJob() edges', () => {
     await expect(stack.runner.getJob('other-task')).rejects.toThrow(/kind/)
   })
 })
+
+describe('cooperative cancel (§8) + resolveNoop', () => {
+  it('a run whose signal has fired marks the job cancelled, not failed', async () => {
+    const ac = new AbortController()
+    ac.abort() // pre-aborted → the very first step-boundary check stops the run
+    stack.runner.define('cw', [step('a')])
+    await expect(stack.runner.run('cw', {}, { jobId: 'cw-1', signal: ac.signal })).rejects.toThrow()
+    expect((await stack.runner.getJob('cw-1'))?.status).toBe('cancelled')
+  })
+
+  it('threads the cancel signal into each step context', async () => {
+    let seen: AbortSignal | undefined
+    stack.runner.define('sw', [
+      {
+        name: 'a',
+        run: (_state, ctx) => {
+          seen = ctx.signal
+          return {}
+        }
+      }
+    ])
+    const ac = new AbortController()
+    await stack.runner.run('sw', {}, { jobId: 'sw-1', signal: ac.signal })
+    expect(seen).toBe(ac.signal)
+  })
+
+  it('cancels at a mid-workflow boundary — earlier steps keep their checkpoint', async () => {
+    const ac = new AbortController()
+    const ran: string[] = []
+    stack.runner.define('mw', [
+      {
+        name: 'first',
+        run: () => {
+          ran.push('first')
+          ac.abort() // fire the cancel; the boundary before 'second' will catch it
+          return {}
+        }
+      },
+      {
+        name: 'second',
+        run: () => {
+          ran.push('second')
+          return {}
+        }
+      }
+    ])
+    await expect(stack.runner.run('mw', {}, { jobId: 'mw-1', signal: ac.signal })).rejects.toThrow()
+    expect(ran).toEqual(['first']) // 'second' never started
+    expect((await stack.runner.getJob('mw-1'))?.status).toBe('cancelled')
+  })
+
+  it('resolveNoop settles a failed job row to done and no-ops on a missing row', async () => {
+    stack.runner.define('nw', [
+      {
+        name: 'boom',
+        run: () => {
+          throw new Error('nope')
+        }
+      }
+    ])
+    await expect(stack.runner.run('nw', {}, { jobId: 'nw-1' })).rejects.toThrow()
+    expect((await stack.runner.getJob('nw-1'))?.status).toBe('failed')
+    stack.runner.resolveNoop('nw-1')
+    expect((await stack.runner.getJob('nw-1'))?.status).toBe('done')
+    expect(() => stack.runner.resolveNoop('ghost')).not.toThrow()
+  })
+})

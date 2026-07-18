@@ -14,6 +14,14 @@ export interface WorkflowStepContext {
   readonly stepName: string
   /** 0-based position of this step in the defined step list. */
   readonly stepIndex: number
+  /**
+   * Cancel signal for THIS run (§8 cooperative task cancel). The runner checks it
+   * at every step boundary (before a step's work) and aborts; a step may also pass
+   * it into a blocking call (e.g. Ollama embed/generate) so an in-flight model call
+   * stops promptly rather than at the next boundary. Absent when the run was started
+   * without one.
+   */
+  readonly signal?: AbortSignal
 }
 
 /**
@@ -35,13 +43,25 @@ export interface RunWorkflowOptions {
   jobId?: string
   /** Attributed agent for permission checks / spans. Default 'system'. */
   agentId?: string
+  /**
+   * §8 cooperative cancel: when this aborts, the run stops at the next step
+   * boundary and its job row is marked 'cancelled' (not 'failed'). Threaded into
+   * every step's WorkflowStepContext.signal so a step can also abort a blocking
+   * model call. Absent ⇒ the run cannot be cancelled mid-flight (today's behavior).
+   */
+  signal?: AbortSignal
+}
+
+/** Options for continuing a job — carries the same cooperative cancel signal. */
+export interface ResumeWorkflowOptions {
+  signal?: AbortSignal
 }
 
 /** Durable job record + live graph state, for the dashboard and scheduler. */
 export interface WorkflowJobStatus {
   readonly jobId: string
   readonly workflowName: string
-  readonly status: 'pending' | 'running' | 'done' | 'failed' | 'deferred'
+  readonly status: 'pending' | 'running' | 'done' | 'failed' | 'deferred' | 'cancelled'
   readonly attempts: number
   readonly lastError: string | null
   /** Latest checkpointed workflow state (empty object before any step ran). */
@@ -60,12 +80,21 @@ export interface WorkflowRunner {
   define(name: string, steps: readonly WorkflowStep[]): void
   run(name: string, input: JsonObject, options?: RunWorkflowOptions): Promise<string>
   /**
-   * Continue a job from its last checkpoint (crash, kill, or failure). The
-   * workflow must have been define()d in this process first — definitions are
-   * code, only state is durable.
+   * Continue a job from its last checkpoint (crash, kill, failure, or a prior
+   * cancel). The workflow must have been define()d in this process first —
+   * definitions are code, only state is durable. Only a 'done' job is a no-op;
+   * 'failed'/'cancelled'/'running' all re-run from the last checkpoint.
    */
-  resume(jobId: string): Promise<string>
+  resume(jobId: string, options?: ResumeWorkflowOptions): Promise<string>
   getJob(jobId: string): Promise<WorkflowJobStatus | undefined>
+  /**
+   * Settle a job's row to 'done' WITHOUT running it — for a workflow that
+   * legitimately had nothing to do (e.g. an extraction whose session has no
+   * mcp_calls and no transcript). Keeps a benign no-op from lingering as a scary
+   * 'failed' row. Idempotent; a no-op if the job row is absent. Optional so
+   * lightweight WorkflowRunner stubs need not implement it.
+   */
+  resolveNoop?(jobId: string): void
 }
 
 /** A workflow step failed; the job record is already marked 'failed'. */
@@ -77,6 +106,24 @@ export class WorkflowJobError extends Error {
     const detail = cause instanceof Error ? cause.message : String(cause)
     super(`workflow '${workflowName}' job ${jobId} failed: ${detail}`, cause === undefined ? undefined : { cause })
     this.name = 'WorkflowJobError'
+    this.jobId = jobId
+    this.workflowName = workflowName
+  }
+}
+
+/**
+ * A workflow run was cancelled via its §8 cooperative signal — thrown at a step
+ * boundary when the run's AbortSignal has fired. The runner marks the job row
+ * 'cancelled' (not 'failed') before propagating; distinct from a real failure so
+ * the queue/dashboard show a cancel, not an error.
+ */
+export class WorkflowCancelledError extends Error {
+  readonly jobId: string
+  readonly workflowName: string
+
+  constructor(jobId: string, workflowName: string) {
+    super(`workflow '${workflowName}' job ${jobId} was cancelled`)
+    this.name = 'WorkflowCancelledError'
     this.jobId = jobId
     this.workflowName = workflowName
   }

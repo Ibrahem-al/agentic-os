@@ -30,7 +30,7 @@ import {
 } from './completion'
 import { RunnerHealth } from './health'
 import { type RunnerLane } from './lanes'
-import { killAllRunnerChildren, killProcessTree, type SpawnImpl } from './spawn'
+import { killAllRunnerChildren, killProcessTree, killRunnerChildrenForTask, type SpawnImpl } from './spawn'
 import type { ResolvedBinary, RunnerHealthSnapshot } from './types'
 
 // ── barrel re-exports (consumers import from `../runner`) ─────────────────────
@@ -67,6 +67,7 @@ export {
   activeRunnerChildCount,
   killAllRunnerChildren,
   killProcessTree,
+  killRunnerChildrenForTask,
   parseRunnerEnvelope,
   spawnClaude,
   type SpawnClaudeContext,
@@ -260,6 +261,16 @@ export class Runner {
   /** Kill every in-flight runner child of THIS process (will-quit). */
   killChildren(): void {
     killAllRunnerChildren()
+  }
+
+  /**
+   * Kill the in-flight runner children of a cancelled task (§8 cancel) — its own id
+   * or its `<taskId>-wf` workflow job. Pid-reuse-safe (live registry handles, never
+   * a DB pid). Returns how many child trees were killed. The queue injects this as
+   * its `killChildrenForTask` cancel hook.
+   */
+  killTaskChildren(taskId: string): number {
+    return killRunnerChildrenForTask(taskId)
   }
 
   /**

@@ -47,7 +47,7 @@ const APPDATA_SCHEMA: readonly string[] = [
     kind TEXT NOT NULL,
     payload_json TEXT,
     status TEXT NOT NULL DEFAULT 'pending'
-      CHECK (status IN ('pending','running','done','failed','deferred')),
+      CHECK (status IN ('pending','running','done','failed','deferred','cancelled')),
     attempts INTEGER NOT NULL DEFAULT 0,
     not_before_unix_ms INTEGER,
     priority INTEGER NOT NULL DEFAULT 0,
@@ -297,7 +297,7 @@ const APPDATA_SCHEMA: readonly string[] = [
  * Current SQLite schema version. Exported so the boot-time data manifest can
  * record which schema the on-disk store carries (docs/DATA-MIGRATION.md).
  */
-export const APPDATA_USER_VERSION = 9
+export const APPDATA_USER_VERSION = 10
 
 /**
  * Column additions to tables that predate them (CREATE IF NOT EXISTS skips an
@@ -361,6 +361,49 @@ function migrateAuditLogOutcomeCheck(db: BetterSqlite3.Database): void {
     db.exec(`ALTER TABLE audit_log_v8 RENAME TO audit_log`)
     db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_log_agent ON audit_log(agent_id)`)
     db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_log_kind ON audit_log(kind)`)
+  })()
+}
+
+/**
+ * v10 (this build): tasks.status gains 'cancelled' as a legal value (the §8 queue
+ * can now cancel a running/queued task). Same guarded in-place rebuild as
+ * migrateAuditLogOutcomeCheck — SQLite cannot ALTER a column CHECK — copying every
+ * row (explicit 11-column list: the v5 ADD-COLUMNs mean column ORDER varies across
+ * old stores, so `SELECT *` is unsafe) into a table carrying the widened CHECK,
+ * swapping, and recreating idx_tasks_status, inside one transaction (the pre-upgrade
+ * VACUUM snapshot in openAppData is the outer net). Guarded + idempotent: it runs
+ * only when the on-disk CHECK still lacks 'cancelled'. `tasks` has no incoming
+ * foreign keys (workflow_checkpoints.thread_id is a naming convention, not an FK),
+ * so DROP+RENAME is safe with foreign_keys ON.
+ */
+function migrateTasksStatusCheck(db: BetterSqlite3.Database): void {
+  const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'`).get() as
+    | { sql: string }
+    | undefined
+  if (row === undefined) return // fresh install — the schema loop already created it with 'cancelled'
+  if (/'cancelled'/.test(row.sql)) return // already widened (fresh v10, or a prior upgrade)
+  db.transaction(() => {
+    db.exec(`CREATE TABLE tasks_v10 (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      payload_json TEXT,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','running','done','failed','deferred','cancelled')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      not_before_unix_ms INTEGER,
+      priority INTEGER NOT NULL DEFAULT 0,
+      waiting_approval_id TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    )`)
+    db.exec(`INSERT INTO tasks_v10
+      (id, kind, payload_json, status, attempts, not_before_unix_ms, priority, waiting_approval_id, last_error, created_at, updated_at)
+      SELECT id, kind, payload_json, status, attempts, not_before_unix_ms, priority, waiting_approval_id, last_error, created_at, updated_at
+      FROM tasks`)
+    db.exec(`DROP TABLE tasks`)
+    db.exec(`ALTER TABLE tasks_v10 RENAME TO tasks`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`)
   })()
 }
 
@@ -520,6 +563,9 @@ export function openAppData(dbPath: string, backupsDir?: string): AppData {
   // it (guarded + idempotent — a no-op on a fresh install). Non-additive, so it
   // cannot ride the CREATE-IF-NOT-EXISTS / guarded-ADD-COLUMN lists above.
   migrateAuditLogOutcomeCheck(db)
+  // v10: widen tasks.status's CHECK to allow 'cancelled' (same non-additive,
+  // guarded, idempotent in-place rebuild).
+  migrateTasksStatusCheck(db)
   if (existingVersion < APPDATA_USER_VERSION) {
     // Every schema change is additive (CREATE IF NOT EXISTS tables + guarded ADD
     // COLUMNs above) EXCEPT the v8 audit_log CHECK widening (migrateAuditLogOutcomeCheck,
@@ -531,7 +577,8 @@ export function openAppData(dbPath: string, backupsDir?: string): AppData {
     // skill_improvements, phase 12; v6 → v7: mcp_calls.session_kind +
     // runner_runs + runner_submissions, phase 14; v7 → v8: audit_log.outcome
     // 'pending' + lane_jobs — the crash-safety write-intent journal; v8 → v9:
-    // local_llm_usage — the additive local-LLM usage ledger).
+    // local_llm_usage — the additive local-LLM usage ledger; v9 → v10:
+    // tasks.status 'cancelled' — user task-cancel, migrateTasksStatusCheck).
     db.pragma(`user_version = ${APPDATA_USER_VERSION}`)
   }
   return {

@@ -117,12 +117,81 @@ export function runTaskRetentionSweep(db: BetterSqlite3.Database, now: Date = ne
   const taskRows = db
     .prepare(
       `DELETE FROM tasks
-       WHERE status IN ('done', 'failed') AND updated_at < ?
+       WHERE status IN ('done', 'failed', 'cancelled') AND updated_at < ?
          AND NOT (kind = ? AND id NOT LIKE 'extract-cont-%')
          AND NOT (kind = 'workflow' AND id LIKE 'extract-%' AND id NOT LIKE 'extract-cont-%')`
     )
     .run(cutoffIso, EXTRACTION_TASK_KIND).changes
   return { taskRows, checkpointRows, cutoffIso }
+}
+
+export interface WorkflowReconcileResult {
+  /** kind='workflow' rows stuck 'running' with no live driver → flipped to 'failed'. */
+  readonly orphanedRunningFixed: number
+  /** Benign "nothing to extract" workflow rows left 'failed' → settled to 'done'. */
+  readonly benignResolved: number
+}
+
+/**
+ * Boot reconciliation of the workflow (kind='workflow') rows — run ONCE before
+ * queue.start(), so nothing races the reload/resume it decides against:
+ *
+ *  (a) A `<taskId>-wf` row stuck 'running' is a crash orphan. It gets resumed only
+ *      when its DRIVER task (`<taskId>`) is reloaded by start() — i.e. the driver is
+ *      pending/deferred/running. When the driver is TERMINAL (done/failed/cancelled)
+ *      or absent, nothing will ever resume the row, so it lingers 'running' forever
+ *      (the "stuck workflow for days" the user saw). Flip those to 'failed'. Rows
+ *      whose driver WILL resume them are left untouched.
+ *  (b) A workflow row left 'failed' by a benign "nothing to extract" run (collect
+ *      threw NOT_FOUND; the driver extraction task is 'done') is not a real failure —
+ *      settle it to 'done' so it stops showing as a scary failed job. Keyed on the
+ *      exact last_error phrase AND a 'done' driver so a real failure is never touched.
+ *
+ * Only `<taskId>-wf`-shaped ids are considered, so a non-task workflow job is never
+ * disturbed. Idempotent: a second run finds nothing to fix.
+ */
+export function reconcileWorkflowJobs(db: BetterSqlite3.Database): WorkflowReconcileResult {
+  const nowExpr = `strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+  const driverStatus = db.prepare('SELECT status FROM tasks WHERE id = ?')
+  const terminal = new Set(['done', 'failed', 'cancelled'])
+
+  // (a) orphaned running workflow rows.
+  const running = db.prepare(`SELECT id FROM tasks WHERE kind = 'workflow' AND status = 'running'`).all() as {
+    id: string
+  }[]
+  const markOrphanFailed = db.prepare(
+    `UPDATE tasks SET status = 'failed', last_error = ?, updated_at = ${nowExpr} WHERE id = ? AND status = 'running'`
+  )
+  let orphanedRunningFixed = 0
+  for (const row of running) {
+    if (!row.id.endsWith('-wf')) continue // only task-driven workflow jobs
+    const driverId = row.id.slice(0, -'-wf'.length)
+    const driver = driverStatus.get(driverId) as { status: string } | undefined
+    const willResume = driver !== undefined && !terminal.has(driver.status)
+    if (willResume) continue // start() reloads the driver, which resumes this row
+    markOrphanFailed.run('interrupted by a shutdown with no pending driver task to resume it', row.id)
+    orphanedRunningFixed += 1
+  }
+
+  // (b) benign "nothing to extract" failed workflow rows with a completed driver.
+  const benignFailed = db
+    .prepare(
+      `SELECT id FROM tasks WHERE kind = 'workflow' AND status = 'failed' AND last_error LIKE '%nothing to extract%'`
+    )
+    .all() as { id: string }[]
+  const markBenignDone = db.prepare(
+    `UPDATE tasks SET status = 'done', last_error = NULL, updated_at = ${nowExpr} WHERE id = ? AND status = 'failed'`
+  )
+  let benignResolved = 0
+  for (const row of benignFailed) {
+    if (!row.id.endsWith('-wf')) continue
+    const driver = driverStatus.get(row.id.slice(0, -'-wf'.length)) as { status: string } | undefined
+    if (driver?.status !== 'done') continue // a real failure or an unfinished driver — leave it
+    markBenignDone.run(row.id)
+    benignResolved += 1
+  }
+
+  return { orphanedRunningFixed, benignResolved }
 }
 
 /** Register the prune/export schedule-slot handlers on the queue. */

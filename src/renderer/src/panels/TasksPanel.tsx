@@ -7,7 +7,7 @@
  * them. Re-skin only: every IPC call, the scan/add/remove flows, and the
  * `watch-scan-<name>` + "N ingested" contracts are unchanged.
  */
-import { useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { call, IpcError, useIpc } from '../lib/ipc'
 import { truncate } from '../lib/format'
 import {
@@ -26,8 +26,14 @@ import {
 import type { Column } from '../ui/kit'
 import { Icon } from '../ui/icons'
 import { CompositionBar } from '../ui/viz'
-import { plainStatus, plural } from '../lib/plain'
-import type { TaskDto, TriggersStatusDto, WatchScanResultDto, WatchedFolderDto } from '../../../shared/ipc'
+import { plainBytes, plainStatus, plural } from '../lib/plain'
+import type {
+  TaskDto,
+  TaskProcessesDto,
+  TriggersStatusDto,
+  WatchScanResultDto,
+  WatchedFolderDto
+} from '../../../shared/ipc'
 
 function errMessage(err: unknown): string {
   return err instanceof IpcError ? err.message : String(err)
@@ -38,9 +44,19 @@ function plainKind(kind: string): string {
   return kind.replace(/[_-]+/g, ' ').trim()
 }
 
+/** "Run now" applies to a job that is stopped or stuck (not running / not already done). */
+function canRunNow(status: TaskDto['status']): boolean {
+  return status === 'deferred' || status === 'failed' || status === 'cancelled' || status === 'pending'
+}
+
+/** "Cancel" applies to a job that is in progress or queued. */
+function canCancel(status: TaskDto['status']): boolean {
+  return status === 'running' || status === 'pending' || status === 'deferred'
+}
+
 // ── jobs table ────────────────────────────────────────────────────────────────
 
-const TASK_COLUMNS: readonly Column<TaskDto>[] = [
+const TASK_DISPLAY_COLUMNS: readonly Column<TaskDto>[] = [
   {
     key: 'kind',
     header: 'job',
@@ -79,17 +95,31 @@ const TASK_COLUMNS: readonly Column<TaskDto>[] = [
 ]
 
 /** Composition of task statuses + a one-line summary above the jobs table. */
-function JobsBody({ rows }: { rows: readonly TaskDto[] }): React.JSX.Element {
-  const counts: Record<TaskDto['status'], number> = { pending: 0, running: 0, done: 0, failed: 0, deferred: 0 }
+function JobsBody({
+  rows,
+  columns
+}: {
+  rows: readonly TaskDto[]
+  columns: readonly Column<TaskDto>[]
+}): React.JSX.Element {
+  const counts: Record<TaskDto['status'], number> = {
+    pending: 0,
+    running: 0,
+    done: 0,
+    failed: 0,
+    deferred: 0,
+    cancelled: 0
+  }
   for (const task of rows) counts[task.status] += 1
 
   // Semantic tints (brief §P5): running = accent, waiting = mute, finished = ok,
-  // postponed = warn, failed = err. Labels match lib/plain's status words.
+  // postponed = warn, failed = err, cancelled = mute. Labels match lib/plain.
   const segments = [
     { label: 'in progress', count: counts.running, tint: 'accent' as const },
     { label: 'waiting', count: counts.pending, tint: 'mute' as const },
     { label: 'finished', count: counts.done, tint: 'ok' as const },
     { label: 'postponed', count: counts.deferred, tint: 'warn' as const },
+    { label: 'cancelled', count: counts.cancelled, tint: 'mute' as const },
     { label: 'failed', count: counts.failed, tint: 'err' as const }
   ]
   const active = counts.running + counts.pending
@@ -113,13 +143,110 @@ function JobsBody({ rows }: { rows: readonly TaskDto[] }): React.JSX.Element {
         </div>
       )}
       <DataTable
-        columns={TASK_COLUMNS}
+        columns={columns}
         rows={rows}
         rowKey={(row) => row.id}
         empty="No background jobs right now — the assistant's small tasks show up here while they run."
         testId="tasks-table"
       />
     </>
+  )
+}
+
+// ── processes & resources ───────────────────────────────────────────────────────
+
+/** One CPU/RAM line — cpu% and memory, each shown only when the OS reported it. */
+function ResourceMeter({ cpuPercent, memoryBytes }: { cpuPercent: number | null; memoryBytes: number | null }): React.JSX.Element {
+  const parts: string[] = []
+  if (cpuPercent !== null) parts.push(`${cpuPercent.toFixed(1)}% CPU`)
+  if (memoryBytes !== null) parts.push(plainBytes(memoryBytes))
+  return <span className="font-mono text-[11px] text-ink">{parts.length > 0 ? parts.join(' · ') : '—'}</span>
+}
+
+/**
+ * "What's running & resources" — the OS processes doing a task's work and their
+ * RAM/CPU: the app's own process (where in-process jobs run), the shared Ollama
+ * models the local tier holds, and any child processes the task spawned.
+ */
+function ResourcesBody({
+  data,
+  onRefresh,
+  refreshing
+}: {
+  data: TaskProcessesDto
+  onRefresh: () => void
+  refreshing: boolean
+}): React.JSX.Element {
+  const models = data.localRuntime.loadedModels
+  return (
+    <div className="flex flex-col gap-3" data-testid="task-processes">
+      <div className="flex items-center justify-between">
+        <p className="text-[13px] text-ink-mute">
+          {data.taskId === null
+            ? 'Nothing is running right now — showing the app and local models.'
+            : data.running
+              ? <>Running now: <span className="font-mono text-[11px]">{data.taskId}</span></>
+              : <>Last known for <span className="font-mono text-[11px]">{data.taskId}</span> (not running now).</>}
+        </p>
+        <Button variant="ghost" onClick={onRefresh} disabled={refreshing} testId="task-processes-refresh">
+          {refreshing ? 'Refreshing…' : 'Refresh'}
+        </Button>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div className="rounded-md border border-line px-4 py-3">
+          <div className="mb-1 text-[12px] font-medium text-ink">This app</div>
+          <p className="mb-2 text-[12px] text-ink-mute">Where the assistant runs its own small jobs.</p>
+          {data.host === null ? (
+            <span className="text-[12px] text-ink-mute">Not available.</span>
+          ) : (
+            <div className="flex items-center justify-between">
+              <span className="text-[12px] text-ink-mute" title={`pid ${data.host.pid ?? '—'}`}>
+                {data.host.name}
+              </span>
+              <ResourceMeter cpuPercent={data.host.cpuPercent} memoryBytes={data.host.memoryBytes} />
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-md border border-line px-4 py-3">
+          <div className="mb-1 text-[12px] font-medium text-ink">Local AI models</div>
+          <p className="mb-2 text-[12px] text-ink-mute">Shared across jobs (the Ollama models held in memory).</p>
+          {!data.localRuntime.reachable ? (
+            <span className="text-[12px] text-ink-mute">The local model service isn&apos;t running.</span>
+          ) : models.length === 0 ? (
+            <span className="text-[12px] text-ink-mute">No models loaded right now.</span>
+          ) : (
+            <ul className="flex flex-col gap-1">
+              {models.map((m) => (
+                <li key={m.name} className="flex items-center justify-between">
+                  <span className="font-mono text-[11px] text-ink">{m.name}</span>
+                  <span className="font-mono text-[11px] text-ink" title={m.sizeVramBytes > 0 ? `${plainBytes(m.sizeVramBytes)} on GPU` : 'CPU only'}>
+                    {plainBytes(m.sizeBytes)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+
+      {data.children.length > 0 && (
+        <div className="rounded-md border border-line px-4 py-3">
+          <div className="mb-2 text-[12px] font-medium text-ink">Child processes for this job</div>
+          <ul className="flex flex-col gap-1">
+            {data.children.map((c, i) => (
+              <li key={`${c.pid ?? 'x'}-${i}`} className="flex items-center justify-between">
+                <span className="font-mono text-[11px] text-ink-mute">
+                  {c.role} {c.pid !== null ? `· pid ${c.pid}` : ''} {c.live ? '' : '(finished)'}
+                </span>
+                <ResourceMeter cpuPercent={c.cpuPercent} memoryBytes={c.memoryBytes} />
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -204,6 +331,59 @@ export default function TasksPanel(): React.JSX.Element {
   const [tags, setTags] = useState('')
   const [adding, setAdding] = useState(false)
 
+  // Job controls (run now / cancel) + the live process/resource view.
+  const [busyTaskId, setBusyTaskId] = useState<string | null>(null)
+  const [procData, setProcData] = useState<TaskProcessesDto | null>(null)
+  const [procLoading, setProcLoading] = useState(false)
+  /** null ⇒ show the current in-flight task; a taskId targets that job's processes. */
+  const [procTarget, setProcTarget] = useState<string | null>(null)
+
+  const loadProcesses = useCallback(async (target: string | null): Promise<void> => {
+    setProcLoading(true)
+    try {
+      const data = await call('tasks.processes', target !== null ? { id: target } : {})
+      setProcData(data)
+    } catch {
+      // A resource read is best-effort; leave the last snapshot rather than error out.
+    } finally {
+      setProcLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadProcesses(procTarget)
+  }, [loadProcesses, procTarget])
+
+  const runNowJob = async (id: string): Promise<void> => {
+    setBusyTaskId(id)
+    try {
+      await call('tasks.runNow', { id })
+      toast.notify('ok', 'Job queued to run now')
+      tasks.reload()
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setBusyTaskId(null)
+    }
+  }
+
+  const cancelJob = async (id: string): Promise<void> => {
+    setBusyTaskId(id)
+    try {
+      const result = await call('tasks.cancel', { id })
+      // A running job cancels cooperatively (it stops at its next step boundary),
+      // so report a REQUEST; a queued job is dropped outright, so report done.
+      const stopped = result.killedChildren > 0 ? ` (${plural(result.killedChildren, 'process', 'processes')} stopped)` : ''
+      toast.notify('ok', result.wasRunning ? `Cancelling…${stopped}` : `Job cancelled${stopped}`)
+      tasks.reload()
+      void loadProcesses(procTarget)
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setBusyTaskId(null)
+    }
+  }
+
   const scanNow = async (folderName: string): Promise<void> => {
     setScanningName(folderName)
     try {
@@ -267,6 +447,44 @@ export default function TasksPanel(): React.JSX.Element {
     }
   }
 
+  const taskColumns: readonly Column<TaskDto>[] = [
+    ...TASK_DISPLAY_COLUMNS,
+    {
+      key: 'actions',
+      header: '',
+      render: (row) => {
+        const busy = busyTaskId === row.id
+        return (
+          <span className="flex items-center justify-end gap-1.5">
+            {row.kind !== 'workflow' && canRunNow(row.status) && (
+              <Button
+                variant="ghost"
+                disabled={busy}
+                onClick={() => void runNowJob(row.id)}
+                testId={`task-run-${row.id}`}
+              >
+                {busy ? '…' : 'Run now'}
+              </Button>
+            )}
+            {row.kind !== 'workflow' && canCancel(row.status) && (
+              <Button
+                variant="danger-ghost"
+                disabled={busy}
+                onClick={() => void cancelJob(row.id)}
+                testId={`task-cancel-${row.id}`}
+              >
+                Cancel
+              </Button>
+            )}
+            <Button variant="ghost" onClick={() => setProcTarget(row.id)} testId={`task-resources-${row.id}`}>
+              Resources
+            </Button>
+          </span>
+        )
+      }
+    }
+  ]
+
   const watcherColumns: readonly Column<WatchedFolderDto>[] = [
     { key: 'name', header: 'name', render: (row) => row.name },
     {
@@ -326,13 +544,33 @@ export default function TasksPanel(): React.JSX.Element {
       />
       <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto px-5 py-4">
         <section>
-          <SectionHeader meta="Small tasks the assistant runs on its own">Jobs</SectionHeader>
+          <SectionHeader meta="Small tasks the assistant runs on its own — run one now, or cancel it">Jobs</SectionHeader>
           {tasks.error !== null ? (
             <ErrorState error={tasks.error} onRetry={tasks.reload} />
           ) : tasks.data === null ? (
             <LoadingRows rows={3} />
           ) : (
-            <JobsBody rows={tasks.data} />
+            <JobsBody rows={tasks.data} columns={taskColumns} />
+          )}
+        </section>
+
+        <section>
+          <SectionHeader meta="The processes doing the work, and how much CPU and memory they use">
+            What&apos;s running &amp; resources
+          </SectionHeader>
+          {procData === null ? (
+            <LoadingRows rows={2} />
+          ) : (
+            <>
+              {procTarget !== null && (
+                <div className="mb-2">
+                  <Button variant="ghost" onClick={() => setProcTarget(null)} testId="task-processes-clear">
+                    ← Back to what&apos;s running now
+                  </Button>
+                </div>
+              )}
+              <ResourcesBody data={procData} onRefresh={() => void loadProcesses(procTarget)} refreshing={procLoading} />
+            </>
           )}
         </section>
 

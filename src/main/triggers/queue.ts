@@ -75,9 +75,9 @@ export class TaskRetryAtError extends Error {
 }
 
 /**
- * Thrown by retryDeferred() when the request cannot be honored. `code` maps
- * onto the MCP tool-error vocabulary (§4.E `retry_task`: NOT_FOUND /
- * INVALID_STATE) without this module importing mcp.
+ * Thrown by the task-control operations (retryDeferred / runNow / cancel) when a
+ * request cannot be honored. `code` maps onto the MCP tool-error vocabulary
+ * (NOT_FOUND / INVALID_STATE) without this module importing mcp.
  */
 export class TaskRetryError extends Error {
   constructor(
@@ -111,6 +111,14 @@ export interface TaskRunContext {
   readonly kind: string
   /** Lifetime execution count including this run. */
   readonly attempts: number
+  /**
+   * §8 cooperative cancel: fires when `cancel(taskId)` targets the in-flight task.
+   * A handler should thread it into the work it drives (e.g. the workflow runner's
+   * run/resume, or an Ollama call) so a cancel takes effect promptly. The queue also
+   * marks the task 'cancelled' once the handler unwinds — a handler that ignores the
+   * signal still gets cancelled, just at its next natural stopping point.
+   */
+  readonly signal: AbortSignal
 }
 
 /** A handler may return a short note (logged); throwing drives retry/backoff. */
@@ -120,6 +128,14 @@ export interface DurableTaskQueueDeps {
   readonly db: BetterSqlite3.Database
   /** §8: background dispatch yields while this reports live MCP work in flight. */
   readonly shouldYield?: () => boolean
+  /**
+   * Cancel hook: kill any OS child process(es) a task spawned (e.g. a runner
+   * `claude` child), returning how many were killed. Called by cancel() for the
+   * targeted task. Absent ⇒ cancel still marks the task 'cancelled' and aborts the
+   * in-flight signal; it just cannot reach out-of-process children. Injected at boot
+   * over the runner's live-child registry (pid-reuse-safe — never kills by DB pid).
+   */
+  readonly killChildrenForTask?: (taskId: string) => number
 }
 
 interface MemTask {
@@ -147,9 +163,19 @@ interface TaskRow {
 
 const nowIso = (): string => new Date().toISOString()
 
+/** The in-flight task + its cancel machinery (§8 cooperative cancel). */
+interface CurrentTask {
+  readonly task: MemTask
+  done: Promise<void>
+  readonly abort: AbortController
+  /** Set by cancel(); read by runTask's settle path — the SINGLE writer of 'cancelled'. */
+  cancelRequested: boolean
+}
+
 export class DurableTaskQueue {
   private readonly db: BetterSqlite3.Database
   private readonly shouldYield: (() => boolean) | undefined
+  private readonly killChildrenForTask: ((taskId: string) => number) | undefined
   private readonly handlers = new Map<string, TaskHandler>()
   private readonly pending = new Map<string, MemTask>()
   /** approvalId → tasks parked behind that §13 pending approval. */
@@ -160,13 +186,14 @@ export class DurableTaskQueue {
   private started = false
   private stopped = false
   private timer: NodeJS.Timeout | null = null
-  private current: { task: MemTask; done: Promise<void> } | null = null
+  private current: CurrentTask | null = null
   private seqCounter = 0
   private yieldedMs = 0
 
   constructor(deps: DurableTaskQueueDeps) {
     this.db = deps.db
     this.shouldYield = deps.shouldYield
+    this.killChildrenForTask = deps.killChildrenForTask
     this.insertTask = deps.db.prepare(
       `INSERT INTO tasks (id, kind, payload_json, status, priority, not_before_unix_ms)
        VALUES (?, ?, ?, 'pending', ?, ?)
@@ -367,13 +394,37 @@ export class DurableTaskQueue {
   /**
    * Re-run a 'deferred' task NOW with a fresh §20 retry round (phase 14;
    * MCP-COVERAGE §4.E `retry_task`) — semantically what the next start()
-   * reload would do to the row, without the restart. Guard rails: only rows
-   * that are really deferred, of a kind registered this launch, not already
-   * queued/running, and not parked behind a §13 approval (approval decisions
-   * are the human's — onApprovalDecided is that row's only way back).
-   * Failures throw TaskRetryError with an MCP-mappable code.
+   * reload would do to the row, without the restart. Deferred-only; the broader
+   * "run it regardless of status" action is runNow(). Failures throw
+   * TaskRetryError with an MCP-mappable code.
    */
   retryDeferred(taskId: string): { taskId: string; status: 'pending' } {
+    return this.forceRun(taskId, new Set(['deferred']), 'retried (only deferred tasks can be retried)')
+  }
+
+  /**
+   * "Run now" — the user (or an MCP client) forces a task to run immediately,
+   * regardless of whether it is deferred, failed, cancelled, or a pending row
+   * sitting out a retry backoff. Resets the §20 retry round and clears any backoff.
+   * Rejects a task that is already running, already done, of an unregistered kind,
+   * or parked behind a §13 human approval (that decision is the human's — decide it
+   * in Approvals). Failures throw TaskRetryError with an MCP-mappable code.
+   */
+  runNow(taskId: string): { taskId: string; status: 'pending' } {
+    return this.forceRun(
+      taskId,
+      new Set(['deferred', 'failed', 'cancelled', 'pending']),
+      'run now (already done, or still running)'
+    )
+  }
+
+  /**
+   * Shared body of retryDeferred/runNow: validate the row against `allowed`
+   * statuses, then re-pend it with a fresh round + cleared backoff. A row already
+   * queued in memory (a pending backoff) is nudged in place rather than
+   * double-inserted; a corrupt payload is flagged failed and rejected.
+   */
+  private forceRun(taskId: string, allowed: Set<string>, verb: string): { taskId: string; status: 'pending' } {
     const row = this.db
       .prepare(
         `SELECT id, kind, payload_json, status, attempts, not_before_unix_ms, priority, waiting_approval_id
@@ -381,11 +432,11 @@ export class DurableTaskQueue {
       )
       .get(taskId) as TaskRow | undefined
     if (row === undefined) throw new TaskRetryError('NOT_FOUND', `no task with id '${taskId}'`)
-    if (row.status !== 'deferred') {
-      throw new TaskRetryError(
-        'INVALID_STATE',
-        `task '${taskId}' is '${row.status}', not 'deferred' — only deferred tasks can be retried`
-      )
+    if (this.current?.task.id === taskId) {
+      throw new TaskRetryError('INVALID_STATE', `task '${taskId}' is already running`)
+    }
+    if (!allowed.has(row.status)) {
+      throw new TaskRetryError('INVALID_STATE', `task '${taskId}' is '${row.status}' — cannot be ${verb}`)
     }
     if (row.waiting_approval_id !== null) {
       throw new TaskRetryError(
@@ -399,8 +450,15 @@ export class DurableTaskQueue {
         `task '${taskId}' has kind '${row.kind}', which has no handler registered this launch`
       )
     }
-    if (this.pending.has(taskId) || this.current?.task.id === taskId) {
-      throw new TaskRetryError('INVALID_STATE', `task '${taskId}' is already queued or running`)
+    // Already queued in memory (a 'pending' row awaiting its backoff): nudge it to
+    // run now — clear the backoff + reset the round — instead of a second insert.
+    const queued = this.pending.get(taskId)
+    if (queued !== undefined) {
+      queued.notBeforeUnixMs = null
+      queued.roundExecs = 0
+      this.updateStatus.run('pending', null, null, null, nowIso(), taskId)
+      this.poke()
+      return { taskId, status: 'pending' }
     }
     let payload: JsonObject = {}
     try {
@@ -408,7 +466,7 @@ export class DurableTaskQueue {
       if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) payload = parsed as JsonObject
     } catch {
       // Same posture as start(): a corrupt payload cannot run — flag it.
-      this.updateStatus.run('failed', null, null, 'unparseable payload_json on retry', nowIso(), row.id)
+      this.updateStatus.run('failed', null, null, 'unparseable payload_json on run', nowIso(), row.id)
       throw new TaskRetryError('INVALID_STATE', `task '${taskId}' has unparseable payload_json — marked failed`)
     }
     this.updateStatus.run('pending', null, null, null, nowIso(), taskId)
@@ -424,6 +482,73 @@ export class DurableTaskQueue {
     })
     this.poke()
     return { taskId, status: 'pending' }
+  }
+
+  /**
+   * Cancel a task (§8 user cancel). Semantics by state:
+   *  - the in-flight task → set the cancel flag + abort its signal (a handler that
+   *    threads ctx.signal stops promptly; one that ignores it stops at its next
+   *    natural boundary), and kill any OS child it spawned. runTask's settle path is
+   *    the SINGLE writer of the 'cancelled' row — no race with retry/defer/done.
+   *  - a pending / deferred / orphaned-running / bare workflow row → drop it from
+   *    memory and mark the row 'cancelled' now; kill any crash-orphaned child.
+   * Rejects an already-finished task (done/failed/cancelled) and one parked behind a
+   * §13 approval (decide it in Approvals — the human-gated spine stays untouched).
+   * Cancelling is not terminal-forever: runNow revives a cancelled task (the workflow
+   * job resumes from its last checkpoint, exactly like a failed one).
+   */
+  cancel(taskId: string): { taskId: string; status: 'cancelled'; wasRunning: boolean; killedChildren: number } {
+    const row = this.db.prepare('SELECT id, kind, status, waiting_approval_id FROM tasks WHERE id = ?').get(taskId) as
+      | { id: string; kind: string; status: string; waiting_approval_id: string | null }
+      | undefined
+    if (row === undefined) throw new TaskRetryError('NOT_FOUND', `no task with id '${taskId}'`)
+    // A workflow (`<taskId>-wf`) row is an internal job owned by the runner, not a
+    // queue task. If its DRIVER task is the in-flight one, redirect the cancel to the
+    // driver so the driver's signal is aborted and its settle path is the single
+    // writer of 'cancelled' (cancelling the raw -wf row would only kill the child and
+    // race the runner's own terminal write). The dashboard already hides Cancel on
+    // workflow rows; this guards any other caller. Driver kind is never 'workflow',
+    // so the recursion is one level. A non-live -wf row falls through (harmless).
+    if (row.kind === 'workflow' && row.id.endsWith('-wf')) {
+      const driverId = row.id.slice(0, -'-wf'.length)
+      if (this.current?.task.id === driverId) return this.cancel(driverId)
+    }
+    // A row that is 'running' in the DB but is THIS launch's current task is
+    // cancellable; a terminal row (done/failed/cancelled) is not.
+    const isCurrent = this.current?.task.id === taskId
+    if (!isCurrent && (row.status === 'done' || row.status === 'failed' || row.status === 'cancelled')) {
+      throw new TaskRetryError('INVALID_STATE', `task '${taskId}' is already '${row.status}' — nothing to cancel`)
+    }
+    if (row.waiting_approval_id !== null) {
+      throw new TaskRetryError(
+        'INVALID_STATE',
+        `task '${taskId}' is waiting on approval '${row.waiting_approval_id}' — decide it in Approvals`
+      )
+    }
+    if (isCurrent && this.current !== null) {
+      // In flight: flag + abort; the settle path writes 'cancelled'. Do NOT write the
+      // row here (that would race runTask's own settle write).
+      this.current.cancelRequested = true
+      this.current.abort.abort()
+      const killedChildren = this.killChildrenForTask?.(taskId) ?? 0
+      return { taskId, status: 'cancelled', wasRunning: true, killedChildren }
+    }
+    // Not in flight: drop from memory and settle the row now (single writer — no
+    // dispatch is touching it).
+    this.pending.delete(taskId)
+    this.removeFromWaiting(taskId)
+    this.updateStatus.run('cancelled', null, null, 'cancelled by user', nowIso(), taskId)
+    const killedChildren = this.killChildrenForTask?.(taskId) ?? 0
+    return { taskId, status: 'cancelled', wasRunning: false, killedChildren }
+  }
+
+  /** Remove a task from every §13 approval-parked list it might sit in (cancel cleanup). */
+  private removeFromWaiting(taskId: string): void {
+    for (const [approvalId, parked] of this.waiting) {
+      const next = parked.filter((t) => t.id !== taskId)
+      if (next.length === 0) this.waiting.delete(approvalId)
+      else if (next.length !== parked.length) this.waiting.set(approvalId, next)
+    }
   }
 
   /** Status counts over the queue's rows (workflow jobs excluded). */
@@ -488,15 +613,16 @@ export class DurableTaskQueue {
     this.yieldedMs = 0
     const task = best
     this.pending.delete(task.id)
-    const done = this.runTask(task)
-    this.current = { task, done }
-    void done.finally(() => {
+    const entry: CurrentTask = { task, done: Promise.resolve(), abort: new AbortController(), cancelRequested: false }
+    this.current = entry
+    entry.done = this.runTask(task, entry)
+    void entry.done.finally(() => {
       this.current = null
       this.poke()
     })
   }
 
-  private async runTask(task: MemTask): Promise<void> {
+  private async runTask(task: MemTask, entry: CurrentTask): Promise<void> {
     task.roundExecs += 1
     let attempts = task.roundExecs
     try {
@@ -519,12 +645,31 @@ export class DurableTaskQueue {
         )
         return
       }
-      const outcome = await handler(task.payload, { taskId: task.id, kind: task.kind, attempts })
+      const outcome = await handler(task.payload, {
+        taskId: task.id,
+        kind: task.kind,
+        attempts,
+        signal: entry.abort.signal
+      })
+      // A handler that RETURNED wins over a racing cancel — the work finished, so
+      // honor it as 'done' (matches "done beats cancel when it completes first").
       this.updateStatus.run('done', null, null, null, nowIso(), task.id)
       if (outcome?.note !== undefined) {
         console.log(`[triggers] task ${task.id} (${task.kind}) done — ${outcome.note}`)
       }
     } catch (err) {
+      // §8 user cancel is the SINGLE writer of 'cancelled': cancel() only set the
+      // flag + aborted the signal; here (the handler unwound via that abort) we
+      // settle the row, so recordFailure never overwrites a cancel with retry/defer.
+      if (entry.cancelRequested) {
+        try {
+          this.updateStatus.run('cancelled', null, null, 'cancelled by user', nowIso(), task.id)
+          console.warn(`[triggers] task ${task.id} (${task.kind}) cancelled by user`)
+        } catch (updateErr) {
+          console.warn(`[triggers] could not record cancel of task ${task.id}: ${String(updateErr)}`)
+        }
+        return
+      }
       this.recordFailure(task, err)
     }
   }

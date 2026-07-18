@@ -201,6 +201,34 @@ export const OLLAMA_BASE_URL = process.env['AGENTIC_OS_OLLAMA_BASE_URL'] ?? 'htt
 export const OLLAMA_INSTALL_URL = 'https://ollama.com/download'
 /** The models the one-click pull installs (§4 setup): embeddings + small LLM. */
 export const OLLAMA_REQUIRED_MODELS: readonly string[] = [EMBEDDING_MODEL, SMALL_LLM_MODEL]
+/**
+ * In-process resilience for embed()/generate() against a TRANSIENT Ollama fault
+ * (rule-12 pick, recorded in the task-control report). The daemon runs each model
+ * in a subprocess "runner"; when that runner is mid-(re)load or has just crashed,
+ * Ollama answers /api/embed with an HTTP 400 whose body is a dial/connection-refused
+ * to the runner's internal port (observed live: `Post ".../tokenize": dial tcp
+ * 127.0.0.1:NNNNN: connectex: ... actively refused`), or a 5xx, or the socket
+ * simply refuses. These recover on their own within a second or two once the daemon
+ * respawns the runner — so we retry the SAME request a few times with short backoff
+ * instead of failing a whole extraction/ingest workflow step. A permanent 4xx (bad
+ * request / unknown model) is NOT retried (isTransientOllamaFault gates this).
+ * OLLAMA_RETRY_ATTEMPTS is the number of ADDITIONAL tries after the first.
+ */
+export const OLLAMA_RETRY_ATTEMPTS = 3
+export const OLLAMA_RETRY_BACKOFF_MS: readonly number[] = [300, 1_000, 2_500]
+/**
+ * Per-request wall-clock ceilings (rule-12 picks, recorded in the task-control
+ * report). A runner that ACCEPTS the socket then never answers is the sibling of
+ * the crash above — it would otherwise pin a task AND a local-pool slot forever
+ * (the "stuck for days" symptom, untouched by retry). Generous so legitimate work
+ * is never cut off (a normal embed batch is sub-second; a qwen3:4b extraction pass
+ * is tens of seconds), but bounded so a hang fails cleanly and the queue retries
+ * the whole task with backoff — by which point the daemon has usually recovered. A
+ * timeout is NOT treated as a transient in-request retry (retrying a hang just hangs
+ * again); it surfaces as a clean OllamaError and the step fails.
+ */
+export const OLLAMA_EMBED_TIMEOUT_MS = 120_000
+export const OLLAMA_GENERATE_TIMEOUT_MS = 300_000
 
 // ── Local-LLM usage tracking (§4 "see & control what runs on this computer") ──
 /**

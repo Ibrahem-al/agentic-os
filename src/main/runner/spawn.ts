@@ -152,6 +152,8 @@ export function killProcessTree(
 
 interface LiveChild {
   readonly pid: number | null
+  /** The spawn's task id — a queue task id (agent mode) or a `<jobId>`/`live:<sid>` key. */
+  readonly taskId: string
   readonly kill: () => void
 }
 
@@ -167,6 +169,30 @@ export function killAllRunnerChildren(): void {
     }
   }
   liveChildren.clear()
+}
+
+/**
+ * Kill the in-flight runner children belonging to a cancelled task (§8 cancel):
+ * the exact task id OR any child keyed by a `<taskId>-…` id — in practice the
+ * `<taskId>-wf` workflow job whose completion calls ride that id (task ids are
+ * UUID-suffixed, so a prefix match never collides across sessions). Kills LIVE
+ * registry handles — the pid-reuse-safe authority — never a recycled DB pid.
+ * Returns how many were killed.
+ */
+export function killRunnerChildrenForTask(taskId: string): number {
+  let killed = 0
+  for (const child of liveChildren) {
+    if (child.taskId === taskId || child.taskId.startsWith(`${taskId}-`)) {
+      try {
+        child.kill()
+      } catch {
+        /* already gone */
+      }
+      liveChildren.delete(child)
+      killed += 1
+    }
+  }
+  return killed
 }
 
 /** How many runner children are in flight right now (observability/tests). */
@@ -394,7 +420,11 @@ export async function spawnClaude(ctx: SpawnClaudeContext, opts: SpawnClaudeOpti
         exitCode: null
       }
       stmts.insertStart.run(startRow(startRecord))
-      const handle: LiveChild = { pid, kill: () => killProcessTree(pid, platform, () => child.kill('SIGKILL')) }
+      const handle: LiveChild = {
+        pid,
+        taskId: ctx.taskId,
+        kill: () => killProcessTree(pid, platform, () => child.kill('SIGKILL'))
+      }
       liveChildren.add(handle)
 
       // 3. Collect + finalize.

@@ -31,9 +31,11 @@ import {
 import type { Telemetry } from '../telemetry'
 import { SqliteCheckpointSaver } from './checkpointer'
 import {
+  WorkflowCancelledError,
   WorkflowJobError,
   type ActionExecutor,
   type JsonObject,
+  type ResumeWorkflowOptions,
   type RunWorkflowOptions,
   type WorkflowJobStatus,
   type WorkflowRunner,
@@ -88,6 +90,12 @@ export interface LangGraphRunnerDeps {
 export class LangGraphRunner implements WorkflowRunner {
   private readonly definitions = new Map<string, readonly WorkflowStep[]>()
   private readonly compiled = new Map<string, CompiledWorkflow>()
+  /**
+   * jobId → the live run's cancel signal. Set before invoke, deleted after, and
+   * read by the node closure (the compiled graph is shared across runs, so the
+   * per-run signal cannot ride the closure). Not persisted — a resume re-supplies it.
+   */
+  private readonly activeSignals = new Map<string, AbortSignal>()
   private readonly checkpointer: SqliteCheckpointSaver
   private readonly telemetry: Telemetry
   private readonly executor: ActionExecutor
@@ -158,6 +166,13 @@ export class LangGraphRunner implements WorkflowRunner {
       const node = async (state: WorkflowGraphState, config: LangGraphRunnableConfig): Promise<Partial<WorkflowGraphState>> => {
         const jobId = (config.configurable?.['thread_id'] as string | undefined) ?? 'unknown'
         const agentId = (config.configurable?.['agent_id'] as string | undefined) ?? 'system'
+        const signal = this.activeSignals.get(jobId)
+        // §8 cooperative CANCEL at step boundaries: if the run's signal fired, stop
+        // HERE (before this step's work) with a WorkflowCancelledError. The previous
+        // step's checkpoint is already durable, so a cancelled run resumes cleanly
+        // from it. A step may also thread `signal` into a blocking model call so an
+        // in-flight embed/generate aborts immediately rather than at this boundary.
+        if (signal?.aborted === true) throw new WorkflowCancelledError(jobId, name)
         // §8 cooperative yield at step boundaries only: this runs after the
         // previous step's checkpoint is durable (durability 'sync') and
         // before this step does any work, so it cannot corrupt or reorder
@@ -176,7 +191,14 @@ export class LangGraphRunner implements WorkflowRunner {
               'workflow.step_index': index
             }
           },
-          () => step.run(state.data, { jobId, workflowName: name, stepName: step.name, stepIndex: index })
+          () =>
+            step.run(state.data, {
+              jobId,
+              workflowName: name,
+              stepName: step.name,
+              stepIndex: index,
+              ...(signal !== undefined ? { signal } : {})
+            })
         )
         return { data: patch ?? {} }
       }
@@ -219,6 +241,7 @@ export class LangGraphRunner implements WorkflowRunner {
       throw err
     }
 
+    if (options.signal !== undefined) this.activeSignals.set(jobId, options.signal)
     try {
       await this.telemetry.withSpan(
         'workflow.run',
@@ -236,20 +259,23 @@ export class LangGraphRunner implements WorkflowRunner {
         }
       )
     } catch (err) {
-      this.markStatus.run('failed', err instanceof Error ? err.message : String(err), jobId)
+      this.settleFailure(jobId, err, options.signal)
       throw new WorkflowJobError(jobId, name, err)
+    } finally {
+      this.activeSignals.delete(jobId)
     }
     this.markStatus.run('done', null, jobId)
     return jobId
   }
 
-  async resume(jobId: string): Promise<string> {
+  async resume(jobId: string, options: ResumeWorkflowOptions = {}): Promise<string> {
     const job = this.readJob(jobId)
     if (job === undefined) throw new Error(`no job '${jobId}' in the tasks table`)
     const { row, payload } = job
     if (row.status === 'done') return jobId // completed jobs resume as a no-op
     const graph = this.compiledFor(payload.workflow)
     this.bumpAttempts.run(jobId)
+    if (options.signal !== undefined) this.activeSignals.set(jobId, options.signal)
 
     const parent = payload.trace !== undefined
       ? { parent: this.telemetry.remoteParentContext(payload.trace.traceId, payload.trace.spanId) }
@@ -268,11 +294,40 @@ export class LangGraphRunner implements WorkflowRunner {
         parent
       )
     } catch (err) {
-      this.markStatus.run('failed', err instanceof Error ? err.message : String(err), jobId)
+      this.settleFailure(jobId, err, options.signal)
       throw new WorkflowJobError(jobId, payload.workflow, err)
+    } finally {
+      this.activeSignals.delete(jobId)
     }
     this.markStatus.run('done', null, jobId)
     return jobId
+  }
+
+  /**
+   * Mark the job's row terminal after a run/resume threw: 'cancelled' when the
+   * failure was the §8 cooperative cancel (a WorkflowCancelledError from the
+   * boundary check, OR a lower-level abort that fired because the run's signal
+   * aborted — e.g. an aborted Ollama fetch), else 'failed'. This is the ONLY
+   * writer of the terminal status on the failure path.
+   */
+  private settleFailure(jobId: string, err: unknown, signal?: AbortSignal): void {
+    const cancelled = err instanceof WorkflowCancelledError || signal?.aborted === true
+    this.markStatus.run(cancelled ? 'cancelled' : 'failed', err instanceof Error ? err.message : String(err), jobId)
+  }
+
+  /**
+   * Settle a job's row to 'done' without running it — a workflow that legitimately
+   * had nothing to do (e.g. an extraction whose session has no calls and no
+   * transcript, whose collect step threw NOT_FOUND). Keeps a benign no-op from
+   * lingering as a 'failed' row. Idempotent; a no-op if the row is absent.
+   */
+  resolveNoop(jobId: string): void {
+    const job = this.readJob(jobId)
+    if (job === undefined) return
+    // Defensive: only settle a job that has already stopped (its caller is a
+    // post-failure path); never flip a live 'running' job or re-touch a 'done' one.
+    if (job.row.status === 'running' || job.row.status === 'done') return
+    this.markStatus.run('done', null, jobId)
   }
 
   async getJob(jobId: string): Promise<WorkflowJobStatus | undefined> {

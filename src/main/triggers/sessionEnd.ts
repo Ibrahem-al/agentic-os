@@ -356,11 +356,11 @@ export function registerExtractionHandler(queue: DurableTaskQueue, deps: Extract
       let result
       if (existing !== undefined) {
         // Resume the SAME workflow job (main / delegate / agent) — no re-buying.
-        result = await deps.agent.resumeExtraction(workflowJobId)
+        result = await deps.agent.resumeExtraction(workflowJobId, { signal: ctx.signal })
       } else if (isContinuation) {
         result = await deps.agent.runDelegateExtraction(
           { taskId: ctx.taskId, sessionId, ...(transcriptPath !== undefined ? { transcriptPath } : {}) },
-          { jobId: workflowJobId }
+          { jobId: workflowJobId, signal: ctx.signal }
         )
       } else {
         // Phase-19: a primary extraction routes to AGENT MODE when the runner is
@@ -380,11 +380,12 @@ export function registerExtractionHandler(queue: DurableTaskQueue, deps: Extract
               ...(cwd !== undefined ? { cwd } : {}),
               stageAll: route.stageAll
             },
-            { jobId: workflowJobId }
+            { jobId: workflowJobId, signal: ctx.signal }
           )
         } else {
           result = await deps.agent.runExtraction(sessionId, {
             jobId: workflowJobId,
+            signal: ctx.signal,
             ...(transcriptPath !== undefined ? { transcriptPath } : {}),
             ...(cwd !== undefined ? { cwd } : {})
           })
@@ -399,8 +400,11 @@ export function registerExtractionHandler(queue: DurableTaskQueue, deps: Extract
       }
     } catch (err) {
       if (isNothingToExtract(err)) {
-        // Not a failure: a session with no calls and no transcript has nothing
-        // to learn from; retrying cannot change that.
+        // Not a failure: a session with no calls and no transcript has nothing to
+        // learn from; retrying cannot change that. The workflow's collect step threw
+        // NOT_FOUND, so run() left the `-wf` row 'failed' — settle it to 'done' so a
+        // benign no-op never lingers as a scary "workflow failed" row in the dashboard.
+        deps.runner.resolveNoop?.(workflowJobId)
         return { note: `session ${sessionId}: nothing to extract (no mcp_calls, no readable transcript)` }
       }
       throw err
