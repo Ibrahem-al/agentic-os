@@ -24,6 +24,7 @@ import SkillsPanel from './panels/SkillsPanel'
 import IngestPanel from './panels/IngestPanel'
 import SettingsPanel from './panels/SettingsPanel'
 import DocsPanel from './panels/DocsPanel'
+import AutomationsPanel from './panels/AutomationsPanel'
 
 /**
  * Panel identity is a fixed union (not derived) so it can be referenced from
@@ -43,6 +44,7 @@ type PanelKey =
   | 'ingest'
   | 'settings'
   | 'docs'
+  | 'automations'
 
 /** A cross-panel deep-link target for the Memory inspector (addendum R3). */
 export interface InspectTarget {
@@ -84,7 +86,8 @@ const PANELS: Record<PanelKey, PanelDef> = {
   skills: { label: 'Skills', icon: 'skills', component: SkillsPanel },
   ingest: { label: 'Add knowledge', icon: 'ingest', component: IngestPanel },
   settings: { label: 'Settings', icon: 'settings', component: SettingsPanel },
-  docs: { label: 'Docs', icon: 'doc', component: DocsPanel }
+  docs: { label: 'Docs', icon: 'doc', component: DocsPanel },
+  automations: { label: 'Automations', icon: 'automations', component: AutomationsPanel }
 }
 
 /** Grouped nav (brief IA): Home stands alone; the rest fall under plain group headings. */
@@ -92,7 +95,7 @@ const NAV_GROUPS: readonly { readonly label: string | null; readonly keys: reado
   { label: null, keys: ['home'] },
   { label: 'Decisions', keys: ['review', 'audit'] },
   { label: 'Knowledge', keys: ['memory', 'graph', 'ingest', 'skills'] },
-  { label: 'Activity', keys: ['tasks', 'traces', 'spend'] },
+  { label: 'Activity', keys: ['tasks', 'automations', 'traces', 'spend'] },
   { label: 'Help', keys: ['docs'] }
 ]
 

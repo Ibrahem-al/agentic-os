@@ -29,6 +29,7 @@ export type IconName =
   | 'alert'
   | 'lock'
   | 'graph'
+  | 'automations'
 
 // Each entry is the inner geometry for a 16×16 viewBox; the wrapper supplies
 // the shared stroke grammar. Zero-length "h.01" segments render as round dots.
@@ -80,6 +81,7 @@ const PATHS: Record<IconName, React.JSX.Element> = {
       <path d="M5 8h4.5" />
     </>
   ),
+  automations: <path d="M9 1.8 4 9h3.4l-.6 5.2L12 6.6H8.4L9 1.8Z" />,
   skills: (
     <path d="M8 2.5c.4 2.6 1.5 3.7 4 4-2.5.3-3.6 1.4-4 4-.4-2.6-1.5-3.7-4-4 2.5-.3 3.6-1.4 4-4Z" />
   ),

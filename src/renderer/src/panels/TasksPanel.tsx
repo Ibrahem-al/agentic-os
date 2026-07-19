@@ -28,7 +28,6 @@ import type { Column } from '../ui/kit'
 import { Icon } from '../ui/icons'
 import { CompositionBar } from '../ui/viz'
 import { plainBytes, plainDuration, plainStatus, plainUsd, plural } from '../lib/plain'
-import { AutomationsSection } from './automations/AutomationsSection'
 import type {
   TaskDto,
   TaskProcessesDto,
@@ -847,8 +846,6 @@ export default function TasksPanel(): React.JSX.Element {
             <AutomationBody data={triggers.data} />
           )}
         </section>
-
-        <AutomationsSection onMutated={() => triggers.reload()} />
       </div>
 
       {resourcesTask !== null && (
