@@ -57,6 +57,9 @@ export {
 } from './hookInstaller'
 export {
   RULE_FILE_SUFFIX,
+  RULE_PRESETS,
+  analyzeRule,
+  derivePresetCapabilities,
   evaluateRuleCondition,
   loadRules,
   parseRuleCondition,
@@ -64,9 +67,15 @@ export {
   registerRuleAgents,
   ruleAgentId,
   type LoadedRule,
+  type RuleAction,
+  type RuleAnalysis,
+  type RuleAnalysisCtx,
   type RuleCondition,
+  type RuleFileJson,
+  type RuleIssue,
   type RuleLoadError,
   type RuleLoadResult,
+  type RulePresetName,
   type RuleTrigger
 } from './rules'
 export {
@@ -74,6 +83,8 @@ export {
   RULE_ACTION_TASK_KIND,
   TriggerWatchers,
   WATCH_SCAN_TASK_KIND,
+  describeRuleTrigger,
+  enqueueRuleFire,
   registerIngestHandlers,
   registerRuleActionHandler,
   type IngestHandlerDeps,
@@ -81,3 +92,17 @@ export {
   type TriggerWatchersDeps,
   type WatcherStatus
 } from './watchers'
+export {
+  RuleRuntime,
+  ruleFingerprint,
+  type RuleReloadResult,
+  type RuleRuntimeDeps
+} from './reload'
+export {
+  RuleStore,
+  RuleStoreError,
+  type RuleMutationOutcome,
+  type RuleStoreAudit,
+  type RuleStoreDeps,
+  type RuleStoreEntry
+} from './ruleStore'

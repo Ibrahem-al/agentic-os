@@ -151,6 +151,16 @@ export class PermissionEngine implements PermissionChecker {
   }
 
   /**
+   * Remove an exact-match agent registration (phase-31 rule reload — a deleted
+   * or disabled rule's `rule:<id>` agent is unregistered). Returns whether an
+   * entry was removed; §13 default-deny (unregistered ⇒ hard-block) applies
+   * afterwards. Prefix registrations are not affected.
+   */
+  unregisterAgent(agentId: string): boolean {
+    return this.exact.delete(agentId)
+  }
+
+  /**
    * Register a family of agent ids by prefix (e.g. 'mcp:' — one profile per
    * transport session family). Longest matching prefix wins.
    */

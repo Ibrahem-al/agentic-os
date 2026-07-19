@@ -28,6 +28,7 @@ import type { Column } from '../ui/kit'
 import { Icon } from '../ui/icons'
 import { CompositionBar } from '../ui/viz'
 import { plainBytes, plainDuration, plainStatus, plainUsd, plural } from '../lib/plain'
+import { AutomationsSection } from './automations/AutomationsSection'
 import type {
   TaskDto,
   TaskProcessesDto,
@@ -426,7 +427,7 @@ function AutomationBody({ data }: { data: TriggersStatusDto }): React.JSX.Elemen
 
       {data.schedules.length > 0 && (
         <div className="flex flex-col gap-1">
-          <div className="text-[12px] font-medium text-ink">Schedules</div>
+          <div className="text-[12px] font-medium text-ink">Built-in schedules</div>
           {data.schedules.map((schedule) => (
             <div key={schedule.name} className="text-[12px] text-ink-mute">
               {schedule.name} runs on <span className="font-mono text-[11px]">{schedule.cron}</span> — next{' '}
@@ -435,24 +436,6 @@ function AutomationBody({ data }: { data: TriggersStatusDto }): React.JSX.Elemen
           ))}
         </div>
       )}
-
-      {data.rules.length > 0 && (
-        <Disclosure summary={plural(data.rules.length, 'loaded rule')}>
-          <ul className="flex flex-col gap-1 font-mono text-[11px] text-ink-mute">
-            {data.rules.map((rule) => (
-              <li key={rule.id}>
-                {rule.id}: {rule.trigger}
-              </li>
-            ))}
-          </ul>
-        </Disclosure>
-      )}
-
-      {data.ruleErrors.map((failure) => (
-        <div key={failure.file} className="text-[12px] text-err" title={failure.file}>
-          A rule file couldn&apos;t be loaded ({truncate(failure.file, 60)}): {failure.error}
-        </div>
-      ))}
     </div>
   )
 }
@@ -864,6 +847,8 @@ export default function TasksPanel(): React.JSX.Element {
             <AutomationBody data={triggers.data} />
           )}
         </section>
+
+        <AutomationsSection onMutated={() => triggers.reload()} />
       </div>
 
       {resourcesTask !== null && (

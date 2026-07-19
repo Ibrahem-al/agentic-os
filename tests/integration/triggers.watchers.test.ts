@@ -182,14 +182,14 @@ console.log(JSON.stringify({ wrote, outsideDenied, outsideDetail }))
     kernel: stack.kernel,
     rules: () => new Map(rules.rules.map((rule) => [rule.id, rule])),
     denoLane: new DenoLane({ binDir: denoBinDir }),
-    dockerLane: null
+    dockerLane: () => null
   })
   queue.start()
 
   watchers = new TriggerWatchers({
     queue,
     kernel: stack.kernel,
-    rules: rules.rules,
+    initialRules: rules.rules,
     folderStore,
     stateFile: join(baseDir, 'trigger-state.json'),
     debounceMs: 200,

@@ -68,7 +68,6 @@ import {
   createInjectionScanner,
   DenoLane,
   detectDocker,
-  DockerLane,
   PermissionEngine,
   registerInternalAgents,
   untrusted,
@@ -98,9 +97,10 @@ import {
   registerMaintenanceHandlers,
   registerRuleActionHandler,
   registerRuleAgents,
+  RuleRuntime,
+  RuleStore,
   TriggerSchedules,
-  TriggerWatchers,
-  type RuleLoadResult
+  TriggerWatchers
 } from './triggers'
 import { registerIpcHandlers, unregisterIpcHandlers } from './ipc'
 import { bootUpdater, type UpdaterController } from './updater'
@@ -197,7 +197,8 @@ let triggerInstances: {
   schedules: TriggerSchedules
   watchers: TriggerWatchers
   inactivity: InactivityMonitor
-  rules: RuleLoadResult
+  ruleRuntime: RuleRuntime
+  ruleStore: RuleStore
 } | null = null
 
 /**
@@ -946,17 +947,40 @@ async function bootTriggers(): Promise<void> {
   }
 
   // User rules (§17 shape, ~/.agentic-os/rules/*.rule.json) → §13 agents.
-  const rules = loadRules(RULES_DIR)
-  registerRuleAgents(securityInstances.permissions, rules.rules)
-  for (const failure of rules.errors) {
+  // Phase-31: the RuleRuntime owns the LIVE rule set + the Docker lane and
+  // applies dashboard edits without a restart; the rule-action handler and the
+  // authoring store both read it live (never a boot snapshot).
+  const initialRules = loadRules(RULES_DIR)
+  registerRuleAgents(securityInstances.permissions, initialRules.rules)
+  for (const failure of initialRules.errors) {
     console.warn(`[triggers] invalid rule ${failure.file}: ${failure.error}`)
   }
   const docker = await detectDocker()
+  const watchers = new TriggerWatchers({
+    queue,
+    kernel: kernelInstances.kernel,
+    initialRules: initialRules.rules,
+    folderStore,
+    stateFile: join(userDataDir, TRIGGER_STATE_FILENAME)
+  })
+  const ruleRuntime = new RuleRuntime(
+    { rulesDir: RULES_DIR, permissions: securityInstances.permissions, watchers },
+    initialRules,
+    docker.available
+  )
   registerRuleActionHandler(queue, {
     kernel: kernelInstances.kernel,
-    rules: () => new Map(rules.rules.map((rule) => [rule.id, rule])),
+    rules: () => ruleRuntime.rules(),
     denoLane: new DenoLane({ binDir: join(userDataDir, 'bin') }),
-    dockerLane: docker.available ? new DockerLane() : null
+    dockerLane: () => ruleRuntime.dockerLane()
+  })
+  const ruleStore = new RuleStore({
+    rulesDir: RULES_DIR,
+    audit: securityInstances.audit,
+    actor: 'user:dashboard',
+    watchedFolderNames: () => folderStore.list().map((f) => f.name),
+    dockerAvailable: () => ruleRuntime.dockerLane() !== null,
+    onMutation: () => ruleRuntime.reload()
   })
 
   // §6 tier 1: the hook endpoint (same HTTP server, dedicated token). While
@@ -997,22 +1021,15 @@ async function bootTriggers(): Promise<void> {
   // §6 tier 2: the 30-min mcp_calls inactivity fallback (any client).
   const inactivity = new InactivityMonitor({ db: appData.db, queue })
   inactivity.start()
-  const watchers = new TriggerWatchers({
-    queue,
-    kernel: kernelInstances.kernel,
-    rules: rules.rules,
-    folderStore,
-    stateFile: join(userDataDir, TRIGGER_STATE_FILENAME)
-  })
   await watchers.start()
-  triggerInstances = { queue, schedules, watchers, inactivity, rules }
+  triggerInstances = { queue, schedules, watchers, inactivity, ruleRuntime, ruleStore }
 
   const status = watchers.status()
   console.log(
     `[triggers] durable queue ready — ${reloaded} task(s) reloaded, spool drained (${spool.enqueued} new, ${spool.deduped} dup, ${spool.malformed} bad); schedules armed (skill 02:00, prune 03:00, export Sun 03:30)`
   )
   console.log(
-    `[triggers] session-end: hook endpoint ${mcpServer !== null ? `armed at ${HOOK_SESSION_END_URL}` : 'NOT armed (MCP server down — spool only)'}; inactivity fallback 30 min; watchers: ${status.folders.length} folder(s), ${rules.rules.length} rule(s)${rules.errors.length > 0 ? ` (${rules.errors.length} invalid — see warnings)` : ''}`
+    `[triggers] session-end: hook endpoint ${mcpServer !== null ? `armed at ${HOOK_SESSION_END_URL}` : 'NOT armed (MCP server down — spool only)'}; inactivity fallback 30 min; watchers: ${status.folders.length} folder(s), ${initialRules.rules.length} rule(s)${initialRules.errors.length > 0 ? ` (${initialRules.errors.length} invalid — see warnings)` : ''}`
   )
 }
 
@@ -1028,13 +1045,18 @@ function bootIpc(): void {
     // the ONE shared reranker instance.
     reranker = new Reranker({ modelsDir: appDataPaths(userDataDir).modelsDir, ...rerankerFilesOverride() })
   }
+  const ti = triggerInstances
   const triggers =
-    triggerInstances !== null
+    ti !== null
       ? {
-          queue: triggerInstances.queue,
-          schedules: triggerInstances.schedules,
-          watchers: triggerInstances.watchers,
-          ruleErrors: triggerInstances.rules.errors
+          queue: ti.queue,
+          schedules: ti.schedules,
+          watchers: ti.watchers,
+          ruleRuntime: ti.ruleRuntime,
+          ruleStore: ti.ruleStore,
+          // Phase-31: a THUNK, not a captured array — a live reload updates the
+          // error list, and triggers.status must reflect it without a restart.
+          ruleErrors: () => ti.ruleRuntime.ruleErrors()
         }
       : null
   const subsystems = currentSubsystems()

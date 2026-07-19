@@ -1008,6 +1008,120 @@ export interface InstallHookResultDto {
   readonly diff: string
 }
 
+// ── rule authoring (phase 31 — DASHBOARD-ONLY, never MCP, §21.6) ──────────────
+
+/** Renderer-safe preset catalogue (const, not a channel). Mirrors RULE_PRESETS. */
+export const IPC_RULE_PRESETS = [
+  {
+    id: 'memory-export',
+    label: 'Export your memory',
+    needsFolder: false,
+    description: 'Writes a portable export of your whole knowledge base.'
+  },
+  {
+    id: 'graph-prune',
+    label: 'Prune stale memories',
+    needsFolder: false,
+    description: 'Runs the maintenance prune pass now.'
+  },
+  {
+    id: 'skill-improvement',
+    label: 'Improve skills',
+    needsFolder: false,
+    description: 'Runs the skill-improvement pass over new corrections and failure examples.'
+  },
+  {
+    id: 'folder-scan',
+    label: 'Scan a watched folder',
+    needsFolder: true,
+    description: 'Ingests new or changed files from one of your watched folders.'
+  }
+] as const
+
+export interface RuleCapabilitiesDto {
+  readonly fsRead: readonly string[]
+  readonly fsWrite: readonly string[]
+  readonly netDomains: readonly string[]
+  readonly tools: readonly string[]
+  readonly maxSpendUSD: number
+}
+
+export type RuleTriggerDto =
+  | { readonly type: 'schedule'; readonly cron: string }
+  | { readonly type: 'watch'; readonly path: string }
+  | { readonly type: 'watch'; readonly url: string; readonly intervalMin: number }
+
+export type RuleActionDto =
+  | { readonly kind: 'code'; readonly lang: string; readonly entry: string; readonly lane: 'deno' | 'docker' }
+  | { readonly kind: 'preset'; readonly preset: string; readonly taskKind: string; readonly folder: string | null }
+
+export interface RuleDetailDto {
+  readonly id: string
+  readonly file: string
+  readonly enabled: boolean
+  /** enabled AND currently armed in the trigger runtime. */
+  readonly armed: boolean
+  readonly trigger: RuleTriggerDto
+  readonly condition: string | null
+  readonly action: RuleActionDto
+  readonly modelTier: 'local' | 'cloud'
+  /** Hand-written (code) or auto-derived from the trigger (preset). */
+  readonly capabilities: RuleCapabilitiesDto
+  readonly agentId: string
+  /** Next fire time (schedules only). */
+  readonly nextRunAt: string | null
+  /** The verbatim on-disk JSON — seeds the edit form (raw preservation). */
+  readonly raw: unknown
+}
+
+export interface RuleFileErrorDto {
+  readonly file: string
+  readonly error: string
+}
+
+export interface RuleListDto {
+  readonly rules: readonly RuleDetailDto[]
+  readonly errors: readonly RuleFileErrorDto[]
+  readonly dockerAvailable: boolean
+}
+
+export interface RuleValidationIssueDto {
+  readonly field: string
+  readonly severity: 'error' | 'warning'
+  readonly message: string
+}
+
+export interface RuleValidationNormalizedDto {
+  readonly entryAbsolute?: string
+  readonly willScaffoldEntry?: boolean
+  readonly lane?: 'deno' | 'docker'
+  readonly watchPathAbsolute?: string
+  readonly urlHost?: string
+  readonly taskKind?: string
+  readonly nextRunAt?: string | null
+}
+
+export interface RuleValidationDto {
+  /** No error-severity issues (warnings still allow a save). */
+  readonly ok: boolean
+  readonly issues: readonly RuleValidationIssueDto[]
+  readonly normalized: RuleValidationNormalizedDto | null
+}
+
+export interface RuleReloadResultDto {
+  readonly added: readonly string[]
+  readonly removed: readonly string[]
+  readonly changed: readonly string[]
+  readonly unchanged: number
+  readonly errors: readonly RuleFileErrorDto[]
+}
+
+export interface RuleMutationDto {
+  readonly rule: RuleDetailDto
+  readonly auditActionId: string
+  readonly reload: RuleReloadResultDto
+}
+
 // ── data & backups (Settings "Data & backups") ───────────────────────────────
 
 /** How a directory under `backups/` was created. */
@@ -1208,6 +1322,23 @@ export interface IpcChannels {
 
   'triggers.status': { req: void; res: TriggersStatusDto }
   'triggers.installHook': { req: void; res: InstallHookResultDto }
+
+  // Rule authoring (phase 31) — DASHBOARD-ONLY; deliberately NOT MCP tools (§21.6).
+  'rules.list': { req: void; res: RuleListDto }
+  'rules.validate': { req: { draft: unknown; currentId?: string }; res: RuleValidationDto }
+  'rules.create': { req: { draft: unknown }; res: RuleMutationDto }
+  'rules.update': { req: { id: string; draft: unknown }; res: RuleMutationDto }
+  'rules.setEnabled': { req: { id: string; enabled: boolean }; res: RuleMutationDto }
+  'rules.delete': {
+    req: { id: string }
+    res: { deleted: true; entryFile: string | null; auditActionId: string; reload: RuleReloadResultDto }
+  }
+  'rules.deleteInvalid': {
+    req: { file: string }
+    res: { deleted: true; auditActionId: string; reload: RuleReloadResultDto }
+  }
+  'rules.runNow': { req: { id: string }; res: { taskId: string; kind: string } }
+  'rules.reload': { req: void; res: RuleReloadResultDto }
 
   'settings.get': { req: void; res: SettingsDto }
   'settings.save': { req: ModelSettingsPatchDto; res: SettingsDto }

@@ -31,6 +31,11 @@ import type {
   JsonValue,
   OllamaPullProgressDto,
   ReasoningSettingsDto,
+  RuleDetailDto,
+  RuleMutationDto,
+  RuleReloadResultDto,
+  RuleValidationDto,
+  RuleValidationNormalizedDto,
   RunnerSettingsDto,
   SettingsDto,
   SkillImprovementDto,
@@ -42,11 +47,13 @@ import type {
   WatchedFolderDto
 } from '../shared/ipc'
 import { IPC_EVENT_INGEST_PROGRESS, IPC_EVENT_OLLAMA_PULL, IPC_INVOKE_PREFIX } from '../shared/ipc'
+import { Cron } from 'croner'
 import { quiesceForInstall, type UpdaterController } from './updater'
 import {
   BACKUP_INTERVAL_HOURS_CHOICES,
   CLOUD_PROVIDERS,
   PRODUCT_NAME,
+  RULES_DIR,
   WATCHED_FOLDERS_CONFIG_FILENAME,
   type CloudProvider
 } from './config'
@@ -83,6 +90,7 @@ import {
   UndoError,
   approveStagedWrite,
   getStagedWrite,
+  isPathWithin,
   listStagedWrites,
   rejectStagedWriteWithEffects,
   renderStagedWriteDiff,
@@ -120,11 +128,21 @@ import {
   type MemoryEditDeps
 } from './memory'
 import {
+  enqueueRuleFire,
   HookInstallError,
   installSessionEndHook,
+  RULE_ACTION_TASK_KIND,
+  ruleAgentId,
+  RuleStoreError,
   TaskRetryError,
   type DurableTaskQueue,
+  type RuleAnalysis,
   type RuleLoadError,
+  type RuleMutationOutcome,
+  type RuleReloadResult,
+  type RuleRuntime,
+  type RuleStore,
+  type RuleStoreEntry,
   type TriggerSchedules,
   type TriggerWatchers
 } from './triggers'
@@ -150,12 +168,17 @@ import {
 } from './reads'
 import type { Runner, TestConnectionResult } from './runner'
 
-/** The phase-11 trigger runtime the status/installer channels read. */
+/** The phase-11/31 trigger runtime the status/installer/authoring channels read. */
 export interface IpcTriggerDeps {
   readonly queue: DurableTaskQueue
   readonly schedules: TriggerSchedules
   readonly watchers: TriggerWatchers
-  readonly ruleErrors: readonly RuleLoadError[]
+  /** phase-31: the live rule runtime (reload + docker lane + error list). */
+  readonly ruleRuntime: RuleRuntime
+  /** phase-31: the dashboard-only rule authoring store. */
+  readonly ruleStore: RuleStore
+  /** A thunk so a live reload's updated error list is reflected without restart. */
+  readonly ruleErrors: () => readonly RuleLoadError[]
 }
 
 /** Everything the dashboard reads/writes. Null = subsystem didn't boot. */
@@ -259,6 +282,7 @@ const errorCode = (err: unknown): IpcErrorCode => {
   if (err instanceof TaskRetryError) return err.code
   if (err instanceof HookInstallError) return 'INVALID_STATE'
   if (err instanceof RestoreRequestError) return err.code
+  if (err instanceof RuleStoreError) return err.code
   return 'INTERNAL'
 }
 
@@ -578,9 +602,22 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   register('audit.undo', async ({ id }) => {
     const audit = need.audit()
+    const row = audit.getAction(id)
     await audit.undo(id, DASHBOARD_USER)
     // undo() records the undo as its own audited action and links it back.
     const undone = audit.getAction(id)
+    // Phase-31: undoing a rule-file write/delete (from History) must re-arm — or
+    // re-break, correctly surfaced — the automation live, without a restart.
+    if (row !== undefined && (row.kind === 'file-write' || row.kind === 'file-delete') && deps.triggers !== null) {
+      const path = (row.details as { path?: unknown } | null)?.path
+      if (typeof path === 'string' && isPathWithin(path, RULES_DIR)) {
+        try {
+          await deps.triggers.ruleRuntime.reload()
+        } catch {
+          // best-effort — the file state is already restored either way.
+        }
+      }
+    }
     return { undoActionId: undone?.undoActionId ?? '' }
   })
 
@@ -729,6 +766,139 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       diff: redact(result.diff)
     }
   })
+
+  // ── rule authoring (phase 31) — DASHBOARD-ONLY, never MCP (§21 rule 6) ───────
+  // A rule is user-authored executable intent + a capability self-declaration,
+  // so it may never come from Claude; these channels have no MCP counterpart.
+
+  const needTriggers = (): IpcTriggerDeps =>
+    deps.triggers ?? raiseUnavailable('the automation runtime (triggers did not boot this launch)')
+
+  const ruleNextRunAt = (trigger: RuleDetailDto['trigger']): string | null => {
+    if (trigger.type !== 'schedule') return null
+    try {
+      const probe = new Cron(trigger.cron, { paused: true }, () => undefined)
+      const next = probe.nextRun()
+      probe.stop()
+      return next?.toISOString() ?? null
+    } catch {
+      return null
+    }
+  }
+
+  const ruleDetailDto = (entry: RuleStoreEntry, armed: ReadonlySet<string>): RuleDetailDto => {
+    const rule = entry.rule
+    return {
+      id: rule.id,
+      file: rule.file,
+      enabled: rule.enabled,
+      armed: rule.enabled && armed.has(rule.id),
+      trigger: rule.trigger,
+      condition: rule.condition?.source ?? null,
+      action: rule.action,
+      modelTier: rule.modelTier,
+      capabilities: rule.capabilities,
+      agentId: ruleAgentId(rule.id),
+      nextRunAt: ruleNextRunAt(rule.trigger),
+      raw: entry.raw
+    }
+  }
+
+  const armedRuleIds = (t: IpcTriggerDeps): Set<string> => new Set(t.watchers.status().rules.map((r) => r.id))
+
+  const ruleReloadDto = (r: RuleReloadResult): RuleReloadResultDto => ({
+    added: r.added,
+    removed: r.removed,
+    changed: r.changed,
+    unchanged: r.unchanged,
+    errors: r.errors.map((e) => ({ file: e.file, error: e.error }))
+  })
+
+  const ruleValidationDto = (analysis: RuleAnalysis): RuleValidationDto => {
+    const rule = analysis.rule
+    let normalized: RuleValidationNormalizedDto | null = null
+    if (rule !== null) {
+      normalized = {
+        ...(rule.action.kind === 'code'
+          ? { entryAbsolute: rule.action.entry, lane: rule.action.lane, willScaffoldEntry: analysis.willScaffoldEntry }
+          : { taskKind: rule.action.taskKind }),
+        ...(rule.trigger.type === 'schedule'
+          ? { nextRunAt: ruleNextRunAt(rule.trigger) }
+          : 'path' in rule.trigger
+            ? { watchPathAbsolute: rule.trigger.path }
+            : { urlHost: new URL(rule.trigger.url).host })
+      }
+    }
+    return {
+      ok: !analysis.issues.some((i) => i.severity === 'error'),
+      issues: analysis.issues.map((i) => ({ field: i.field, severity: i.severity, message: i.message })),
+      normalized
+    }
+  }
+
+  const ruleMutationDto = (t: IpcTriggerDeps, outcome: RuleMutationOutcome): RuleMutationDto => {
+    const armed = armedRuleIds(t)
+    // The store re-read from disk finds the freshly-written entry (with its raw);
+    // fall back to the returned LoadedRule if a concurrent delete raced.
+    const entry: RuleStoreEntry = t.ruleStore.get(outcome.rule.id) ?? { rule: outcome.rule, raw: {} }
+    return { rule: ruleDetailDto(entry, armed), auditActionId: outcome.auditActionId, reload: ruleReloadDto(outcome.reload) }
+  }
+
+  register('rules.list', () => {
+    const t = needTriggers()
+    const { entries, errors } = t.ruleStore.list()
+    const armed = armedRuleIds(t)
+    return {
+      rules: entries.map((e) => ruleDetailDto(e, armed)),
+      errors: errors.map((e) => ({ file: e.file, error: e.error })),
+      dockerAvailable: t.ruleRuntime.dockerLane() !== null
+    }
+  })
+
+  register('rules.validate', ({ draft, currentId }) =>
+    ruleValidationDto(needTriggers().ruleStore.validateDraft(draft, currentId !== undefined ? { excludeId: currentId } : {}))
+  )
+
+  register('rules.create', async ({ draft }) => {
+    const t = needTriggers()
+    return ruleMutationDto(t, await t.ruleStore.create(draft))
+  })
+
+  register('rules.update', async ({ id, draft }) => {
+    const t = needTriggers()
+    return ruleMutationDto(t, await t.ruleStore.update(id, draft))
+  })
+
+  register('rules.setEnabled', async ({ id, enabled }) => {
+    const t = needTriggers()
+    return ruleMutationDto(t, await t.ruleStore.setEnabled(id, enabled))
+  })
+
+  register('rules.delete', async ({ id }) => {
+    const t = needTriggers()
+    const r = await t.ruleStore.delete(id)
+    return { deleted: true as const, entryFile: r.entryFile, auditActionId: r.auditActionId, reload: ruleReloadDto(r.reload) }
+  })
+
+  register('rules.deleteInvalid', async ({ file }) => {
+    const t = needTriggers()
+    const r = await t.ruleStore.deleteInvalidFile(file)
+    return { deleted: true as const, auditActionId: r.auditActionId, reload: ruleReloadDto(r.reload) }
+  })
+
+  register('rules.runNow', ({ id }) => {
+    const t = needTriggers()
+    const entry = t.ruleStore.get(id)
+    if (entry === null) throw new RuleStoreError('NOT_FOUND', `no automation with id '${id}'`)
+    if (!entry.rule.enabled) throw new RuleStoreError('INVALID_STATE', `automation '${id}' is off — turn it on first`)
+    // Bypass the condition (there is no real event) — run-now tests the ACTION;
+    // a code rule still hits the same sandbox + §13 approval spine as a real fire.
+    const result = enqueueRuleFire(t.queue, entry.rule, { kind: 'manual', manual: true, firedAt: new Date().toISOString() })
+    const kind = entry.rule.action.kind === 'preset' ? entry.rule.action.taskKind : RULE_ACTION_TASK_KIND
+    return { taskId: result.taskId, kind }
+  })
+
+  register('rules.reload', async () => ruleReloadDto(await needTriggers().ruleRuntime.reload()))
 
   // ── traces ─────────────────────────────────────────────────────────────────
 

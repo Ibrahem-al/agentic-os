@@ -131,7 +131,8 @@ export interface TriggerStatusDeps {
   readonly queue: DurableTaskQueue
   readonly schedules: TriggerSchedules
   readonly watchers: TriggerWatchers
-  readonly ruleErrors: readonly RuleLoadError[]
+  /** A thunk so a phase-31 live reload's updated error list is reflected. */
+  readonly ruleErrors: () => readonly RuleLoadError[]
 }
 
 export interface TriggersStatusArgs {
@@ -174,7 +175,7 @@ export function getTriggersStatus(args: TriggersStatusArgs): TriggersStatusDto {
     schedules: triggers.schedules.status(),
     watchedFolders: watcherStatus.folders,
     rules: watcherStatus.rules,
-    ruleErrors: triggers.ruleErrors.map((e) => ({ file: e.file, error: e.error })),
+    ruleErrors: triggers.ruleErrors().map((e) => ({ file: e.file, error: e.error })),
     hook
   }
 }

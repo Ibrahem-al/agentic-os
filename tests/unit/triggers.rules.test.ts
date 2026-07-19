@@ -44,6 +44,12 @@ afterEach(() => {
 
 const baseAction = { kind: 'code', lang: 'ts', entry: 'action.ts' }
 
+/** Narrow a loaded rule's action to its code variant (the shape these tests build). */
+const codeAction = (rule: LoadedRule): { lang: string; entry: string; lane: 'deno' | 'docker' } => {
+  if (rule.action.kind !== 'code') throw new Error(`expected a code action, got '${rule.action.kind}'`)
+  return rule.action
+}
+
 const writeRule = (base: string, rule: unknown): string => {
   const file = join(rulesDir, `${base}${RULE_FILE_SUFFIX}`)
   writeFileSync(file, typeof rule === 'string' ? rule : JSON.stringify(rule, null, 2))
@@ -86,10 +92,10 @@ describe('user rules (§17 shape + §13 scope coherence)', () => {
       path: ['item', 'title'],
       needle: 'AI'
     })
-    expect(rule.action.lane).toBe('deno')
-    expect(isAbsolute(rule.action.entry)).toBe(true)
-    expect(rule.action.entry).toBe(join(rulesDir, 'summarize.ts'))
-    expect(existsSync(rule.action.entry)).toBe(true)
+    expect(codeAction(rule).lane).toBe('deno')
+    expect(isAbsolute(codeAction(rule).entry)).toBe(true)
+    expect(codeAction(rule).entry).toBe(join(rulesDir, 'summarize.ts'))
+    expect(existsSync(codeAction(rule).entry)).toBe(true)
     expect(rule.modelTier).toBe('local')
     // parseCapabilities semantics: ~ expanded to an absolute path, defaults
     // filled deny-empty, netDomains lowercased host form.
@@ -249,10 +255,10 @@ describe('user rules (§17 shape + §13 scope coherence)', () => {
         }),
         rulesDir
       )
-    expect(make('py').action.lane).toBe('docker')
-    expect(make('js').action.lane).toBe('deno')
-    expect(make('typescript').action.lane).toBe('deno')
-    expect(make('TS').action.lane).toBe('deno') // lang is case-folded
+    expect(codeAction(make('py')).lane).toBe('docker')
+    expect(codeAction(make('js')).lane).toBe('deno')
+    expect(codeAction(make('typescript')).lane).toBe('deno')
+    expect(codeAction(make('TS')).lane).toBe('deno') // lang is case-folded
   })
 
   it('keeps the first file for a duplicate rule id and rejects the later one', () => {
