@@ -213,4 +213,6 @@ export interface SettingsSummaryDto {
   /** phase-16 sections; included only once loadModelSettings returns them. */
   readonly reasoning?: JsonObject
   readonly runner?: JsonObject
+  /** network section (phone/LAN access); included only once it's on disk. */
+  readonly network?: JsonObject
 }

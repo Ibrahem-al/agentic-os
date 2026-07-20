@@ -74,6 +74,7 @@ import {
   OllamaError,
   Reranker,
   apiKeySecretName,
+  defaultNetworkSettings,
   defaultReasoningSettings,
   defaultRunnerSettings,
   loadModelSettings,
@@ -192,6 +193,15 @@ export interface IpcDeps {
   readonly reranker: Reranker | null
   readonly keychain: Keychain | null
   readonly mcpUrl: string | null
+  /** The session-end hook URL for the ACTUAL bound MCP port (null when MCP is
+   *  down); threaded to triggers.installHook + triggers.status so a port
+   *  fallback doesn't leave the hook pointing at a stale 4517. */
+  readonly hookEndpointUrl?: string | null
+  /** The LAN-reachable MCP connect URL when the server is bound to the network
+   *  (phone access), else null. Surfaced in the Settings connection card. The
+   *  toggle STATE (mcp.lanAccess) comes from persisted settings, not from here,
+   *  so a fresh toggle sticks in the UI without waiting for the restart. */
+  readonly mcpLanUrl?: string | null
   readonly triggers: IpcTriggerDeps | null
   readonly userDataDir: string
   readonly subsystems: AppStatusDto['subsystems']
@@ -748,7 +758,12 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   // ── triggers & automation (phase 11) ───────────────────────────────────────
 
-  register('triggers.status', () => getTriggersStatus({ triggers: deps.triggers }))
+  register('triggers.status', () =>
+    getTriggersStatus({
+      triggers: deps.triggers,
+      ...(deps.hookEndpointUrl != null ? { hookEndpointUrl: deps.hookEndpointUrl } : {})
+    })
+  )
 
   register('triggers.installHook', () => {
     const keychain = need.keychain()
@@ -759,7 +774,10 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       // shell must execute them, so they cannot live inside asar (phase 13).
       scriptsDir: app.isPackaged
         ? join(process.resourcesPath, 'hooks')
-        : join(app.getAppPath(), 'scripts', 'hooks')
+        : join(app.getAppPath(), 'scripts', 'hooks'),
+      // Point the installed hook at the ACTUAL bound port (a fallback changes it);
+      // absent ⇒ the hookInstaller defaults to the 4517 constant.
+      ...(deps.hookEndpointUrl != null ? { endpointUrl: deps.hookEndpointUrl } : {})
     })
     // §21 rule 7 discipline: the token lives in settings.json (the recorded
     // phase-11 placement) but never renders in the dashboard.
@@ -1125,8 +1143,16 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       },
       mcp: {
         url: deps.mcpUrl,
-        connectCommand: claudeMcpAddCommand(),
-        sampleConfigPath: join(deps.userDataDir, '.mcp.json')
+        // Live URL so the copyable command matches the ACTUAL bound port after a
+        // port fallback (deps.mcpUrl is the server's real url; undefined ⇒ the
+        // 4517 default when MCP is down).
+        connectCommand: claudeMcpAddCommand(undefined, deps.mcpUrl ?? undefined),
+        sampleConfigPath: join(deps.userDataDir, '.mcp.json'),
+        // The toggle STATE reflects the persisted intent immediately (so flipping
+        // it sticks in the UI after applyDto), while lanUrl below reflects the
+        // ACTUAL boot-time binding (null until the app is restarted to apply).
+        lanAccess: (summary.network as { lanAccess?: boolean } | undefined)?.lanAccess ?? false,
+        lanUrl: deps.mcpLanUrl ?? null
       },
       // Phase-16b: surface the reasoning/runner sections getSettingsSummary
       // (phase-15) already returns — validated JsonObjects derived from
@@ -1162,6 +1188,11 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       next.runner = { ...defaultRunnerSettings(), ...current.runner, ...patch.runner }
     } else if (current.runner !== undefined) {
       next.runner = current.runner
+    }
+    if (patch.network !== undefined) {
+      next.network = { ...defaultNetworkSettings(), ...current.network, ...patch.network }
+    } else if (current.network !== undefined) {
+      next.network = current.network
     }
     saveModelSettings(settingsFile(), next)
     deps.onSettingsChanged?.()

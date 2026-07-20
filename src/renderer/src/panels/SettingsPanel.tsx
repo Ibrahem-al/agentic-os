@@ -256,6 +256,12 @@ export default function SettingsPanel(): React.JSX.Element {
   const [sensitiveAck, setSensitiveAck] = useState(false)
   const [sensitiveBusy, setSensitiveBusy] = useState(false)
 
+  // Phone / other-device access over the local network — opt-in, consent-gated
+  // exactly like the sensitive-egress flag above.
+  const [lanConsentOpen, setLanConsentOpen] = useState(false)
+  const [lanAck, setLanAck] = useState(false)
+  const [lanBusy, setLanBusy] = useState(false)
+
   // ── data & backups ───────────────────────────────────────────────────────────
   const backupsQuery = useIpc('backups.list', undefined)
   // A create/restore/reset stages a marker and relaunches the app; this flag
@@ -588,6 +594,43 @@ export default function SettingsPanel(): React.JSX.Element {
   const confirmSensitiveConsent = (): void => {
     setSensitiveConsentOpen(false)
     void saveSensitive(true)
+  }
+
+  /**
+   * Persist the LAN-access flag. Turning it on/off only takes full effect after
+   * a restart (the MCP server binds its host at boot), so the toast says so.
+   */
+  const saveLan = async (enable: boolean): Promise<void> => {
+    setLanBusy(true)
+    try {
+      const fresh = await call('settings.save', { network: { lanAccess: enable } })
+      applyDto(fresh)
+      toast.notify(
+        'ok',
+        enable
+          ? 'network access on — restart the app to start listening'
+          : 'network access off — restart the app to stop listening'
+      )
+    } catch (err) {
+      toast.notify('err', errMessage(err))
+    } finally {
+      setLanBusy(false)
+    }
+  }
+
+  /** Turning ON gates behind the consent modal; turning OFF revokes immediately. */
+  const handleLanToggle = (next: boolean): void => {
+    if (next) {
+      setLanAck(false)
+      setLanConsentOpen(true)
+      return
+    }
+    void saveLan(false)
+  }
+
+  const confirmLanConsent = (): void => {
+    setLanConsentOpen(false)
+    void saveLan(true)
   }
 
   // Re-fetch the live role map after any settings change (the router re-resolves
@@ -1115,6 +1158,49 @@ export default function SettingsPanel(): React.JSX.Element {
                 </p>
               </div>
             </Disclosure>
+
+            {/* ── Phone / other-device access over the local network ─────────── */}
+            <div className="mt-1 flex flex-col gap-3 border-t border-line pt-4">
+              <div className="flex items-center gap-3">
+                <Toggle
+                  label="Let a phone or other device on my network connect"
+                  testId="settings-lan-toggle"
+                  checked={dto.mcp.lanAccess}
+                  disabled={lanBusy}
+                  onChange={handleLanToggle}
+                />
+                <span className="text-[13px]">{dto.mcp.lanAccess ? 'on' : 'off'}</span>
+              </div>
+              <p className="text-[12px] text-ink-mute">
+                Off by default, the app only answers from this computer. Turn this on to continue your work from
+                your phone or another device on the same Wi-Fi.
+              </p>
+              {dto.mcp.lanAccess &&
+                (dto.mcp.lanUrl !== null ? (
+                  <div className="flex flex-col gap-2">
+                    <div className="text-[12px] text-ink-mute">
+                      On the other device, point its MCP client at this address (use the same token as above):
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <div
+                        className="min-w-0 flex-1 rounded-md bg-raised p-3 font-mono text-[12px] break-all"
+                        data-testid="settings-lan-url"
+                      >
+                        {dto.mcp.lanUrl}
+                      </div>
+                      <Button onClick={() => copy(dto.mcp.lanUrl ?? '')}>Copy</Button>
+                    </div>
+                    <p className="text-[12px] text-warn">
+                      Anyone on this network who has the token can reach your memory and tools. Keep the token
+                      private and turn this off when you are done.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="text-[12px] text-warn" data-testid="settings-lan-restart">
+                    Restart the app to start listening on your network.
+                  </div>
+                ))}
+            </div>
           </div>
         </SettingsSection>
 
@@ -1676,6 +1762,52 @@ export default function SettingsPanel(): React.JSX.Element {
                 style={{ accentColor: 'var(--color-accent)' }}
               />
               <span>I understand what leaves this computer.</span>
+            </label>
+          </div>
+        </Modal>
+      )}
+
+      {lanConsentOpen && (
+        <Modal
+          title="let a phone or other device connect"
+          onClose={() => setLanConsentOpen(false)}
+          footer={
+            <>
+              <Button onClick={() => setLanConsentOpen(false)}>Cancel</Button>
+              <Button
+                variant="primary"
+                testId="settings-lan-consent-confirm"
+                disabled={!lanAck}
+                onClick={confirmLanConsent}
+              >
+                Allow
+              </Button>
+            </>
+          }
+        >
+          <div className="flex flex-col gap-3 text-[13px] leading-6" data-testid="settings-lan-consent">
+            <p>
+              By default this app only answers requests from this computer. Turn this on and it will also listen on
+              your local network, so a phone or another device on the same Wi-Fi can connect and continue your work.
+            </p>
+            <p className="text-warn">
+              Anyone on this network who has your connection token could reach your memory and tools. Only do this on
+              a network you trust, keep the token private, and turn it back off when you are done.
+            </p>
+            <p className="text-ink-mute">
+              This takes effect after you restart the app. You can turn it back off at any time.
+            </p>
+            <label className="mt-1 flex items-center gap-2 text-[12px]">
+              <input
+                type="checkbox"
+                aria-label="I understand this exposes the app to my local network"
+                data-testid="settings-lan-consent-ack"
+                checked={lanAck}
+                onChange={(e) => setLanAck(e.target.checked)}
+                className="size-3.5"
+                style={{ accentColor: 'var(--color-accent)' }}
+              />
+              <span>I understand this opens access to my local network.</span>
             </label>
           </div>
         </Modal>

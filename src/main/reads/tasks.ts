@@ -139,6 +139,8 @@ export interface TriggersStatusArgs {
   readonly triggers: TriggerStatusDeps | null
   /** Test seam; defaults to ~/.claude/settings.json (the hook-install probe). */
   readonly claudeSettingsPath?: string
+  /** The hook URL for the ACTUAL bound MCP port; defaults to the 4517 constant. */
+  readonly hookEndpointUrl?: string
 }
 
 /** ipc triggers.status: queue counts + schedules + watchers + hook probe. */
@@ -151,7 +153,7 @@ export function getTriggersStatus(args: TriggersStatusArgs): TriggersStatusDto {
     installed = (err as NodeJS.ErrnoException).code === 'ENOENT' ? false : null
   }
   const hook = {
-    endpoint: HOOK_SESSION_END_URL,
+    endpoint: args.hookEndpointUrl ?? HOOK_SESSION_END_URL,
     spoolDir: SPOOL_DIR,
     settingsPath: claudeSettingsPath,
     installed

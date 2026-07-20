@@ -232,6 +232,43 @@ describe('ipc settings mutators (phase-16b)', () => {
     expect(dto.runner).toBeUndefined()
   })
 
+  // ── Phone/LAN access (network.lanAccess) ─────────────────────────────────────
+
+  it('settings.save persists network.lanAccess and the DTO toggle STATE reflects it immediately (no restart)', async () => {
+    // Default install: localhost-only, toggle reads off, no LAN url this launch.
+    const before: SettingsDto = dataOf(await invoke('settings.get'))
+    expect(before.mcp.lanAccess).toBe(false)
+    expect(before.mcp.lanUrl).toBeNull()
+    expect(loadModelSettings(settingsPath(dir)).network).toBeUndefined()
+
+    // Enabling: persisted to disk AND surfaced in the DTO toggle state right away,
+    // so applyDto(fresh) keeps the checkbox on without waiting for the restart.
+    const enabled = dataOf(await invoke('settings.save', { network: { lanAccess: true } }))
+    expect(enabled.mcp.lanAccess).toBe(true)
+    expect(loadModelSettings(settingsPath(dir)).network?.lanAccess).toBe(true)
+    // lanUrl stays null in this rig (no LAN-bound server wired) — it only appears
+    // after a real restart binds 0.0.0.0.
+    expect(enabled.mcp.lanUrl).toBeNull()
+
+    // Disabling is an explicit false and flips the state straight back.
+    const disabled = dataOf(await invoke('settings.save', { network: { lanAccess: false } }))
+    expect(disabled.mcp.lanAccess).toBe(false)
+    expect(loadModelSettings(settingsPath(dir)).network?.lanAccess).toBe(false)
+  })
+
+  it('settings.save preserves network across a patch that omits it, and never materializes it on a default install', async () => {
+    await invoke('settings.save', { network: { lanAccess: true } })
+    // A later provider-only patch must NOT drop the network section.
+    await invoke('settings.save', { cloudProvider: 'openai' })
+    expect(loadModelSettings(settingsPath(dir)).network?.lanAccess).toBe(true)
+
+    // And a save that never touches network on a fresh install leaves it absent.
+    rmSync(settingsPath(dir), { force: true })
+    await invoke('settings.save', { cloudProvider: 'openai' })
+    expect(loadModelSettings(settingsPath(dir)).network).toBeUndefined()
+    expect(readFileSync(settingsPath(dir), 'utf8')).not.toMatch(/network/)
+  })
+
   it('reasoning.roles enumerates all 14 roles with plain groups + the sensitive flag; effectiveBackend is null with no router wired (DEFAULT == TODAY)', async () => {
     const roles = dataOf(await invoke('reasoning.roles'))
     // Every §2.2 role, canonical order, no dupes.

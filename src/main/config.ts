@@ -20,6 +20,29 @@ export const MCP_TRANSPORT = 'streamable-http' as const
 /** Session-end hook endpoint (same server). */
 export const HOOK_SESSION_END_PATH = '/hooks/session-end'
 export const HOOK_SESSION_END_URL = `http://${MCP_HOST}:${MCP_PORT}${HOOK_SESSION_END_PATH}`
+/** The session-end hook URL for the ACTUAL bound port (differs when a port
+ *  fallback engaged). Every hook producer should use this over the constant. */
+export const hookSessionEndUrl = (port: number = MCP_PORT): string => `http://${MCP_HOST}:${port}${HOOK_SESSION_END_PATH}`
+/**
+ * Ports bootMcp tries in order if 4517 is busy — the §20 default first, then a
+ * small sequential band (stable across launches so installed hooks/registrations
+ * don't churn), then an OS-assigned free port as a last resort. Falling back off
+ * the fixed §20 port is a recorded §21-rule-12 deviation: 4517 stays the default,
+ * a fallback happens ONLY on a genuine conflict, and the real port is surfaced.
+ */
+export const MCP_PORT_FALLBACKS: readonly number[] = [
+  MCP_PORT,
+  MCP_PORT + 1,
+  MCP_PORT + 2,
+  MCP_PORT + 3,
+  MCP_PORT + 4,
+  MCP_PORT + 5,
+  MCP_PORT + 6,
+  MCP_PORT + 7,
+  MCP_PORT + 8,
+  MCP_PORT + 9,
+  0
+]
 /** Max bytes of a session-end hook POST body (payloads are tiny JSON; rule 12). */
 export const HOOK_MAX_BODY_BYTES = 256 * 1024
 /** 30 min of MCP silence per session id → session considered ended. */

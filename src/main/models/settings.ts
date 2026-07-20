@@ -52,6 +52,18 @@ export interface RunnerSettings {
   binaryPath?: string
 }
 
+/**
+ * Network exposure. Absent on a default install (DEFAULT == TODAY = the MCP
+ * server binds 127.0.0.1, localhost-only, per spec §21.7). `lanAccess` is an
+ * explicit, consented departure: when true, boot binds the server to 0.0.0.0
+ * so another device on the same network (e.g. the user's phone) can connect,
+ * with the bearer token as the sole auth over the LAN. Recorded §21-rule-12
+ * deviation from "never a networked service".
+ */
+export interface NetworkSettings {
+  lanAccess: boolean
+}
+
 export interface ModelSettings {
   /** Which cloud brain background agents use. */
   cloudProvider: CloudProvider
@@ -63,6 +75,8 @@ export interface ModelSettings {
   reasoning?: ReasoningSettings
   /** Phase-16 runner / subscription reasoner; absent = disabled (today). */
   runner?: RunnerSettings
+  /** Network exposure; absent = localhost-only (today). */
+  network?: NetworkSettings
 }
 
 /** The three reasoning backends, as a runtime set for validation. Mirrors
@@ -99,6 +113,11 @@ export function defaultReasoningSettings(): ReasoningSettings {
 /** The default runner section — disabled, phase-doc field defaults. */
 export function defaultRunnerSettings(): RunnerSettings {
   return { enabled: false, model: RUNNER_MODEL_DEFAULT, stageAll: true, mode: 'completion', injectionPolicy: 'downgrade' }
+}
+
+/** The default network section — localhost-only (the secure default). */
+export function defaultNetworkSettings(): NetworkSettings {
+  return { lanAccess: false }
 }
 
 /** The model the active provider should use (override or provider default). */
@@ -146,7 +165,20 @@ export function loadModelSettings(filePath: string): ModelSettings {
   // section is present on disk. Absent → stays absent → the router reads today.
   if (candidate.reasoning !== undefined) settings.reasoning = parseReasoning(candidate.reasoning, filePath)
   if (candidate.runner !== undefined) settings.runner = parseRunner(candidate.runner, filePath)
+  if (candidate.network !== undefined) settings.network = parseNetwork(candidate.network, filePath)
   return settings
+}
+
+/** Validate + normalize a `network` section (defaults filled). */
+function parseNetwork(value: unknown, filePath: string): NetworkSettings {
+  if (!isPlainObject(value)) throw new Error(`${filePath}: network must be an object`)
+  const result = defaultNetworkSettings()
+  const lanAccess = value['lanAccess']
+  if (lanAccess !== undefined) {
+    if (typeof lanAccess !== 'boolean') throw new Error(`${filePath}: network.lanAccess must be a boolean`)
+    result.lanAccess = lanAccess
+  }
+  return result
 }
 
 /** Atomic write (tmp + rename), matching the keychain's crash discipline. */

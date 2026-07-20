@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, safeStorage, shell } from 'electron'
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { networkInterfaces } from 'node:os'
 import {
   IPC_EVENT_CLOSE_REQUEST,
   IPC_EVENT_UPDATER_STATUS,
@@ -19,9 +20,11 @@ import {
   appDataPaths,
   CLOUD_BASE_URL_OVERRIDE,
   DENO_VERSION,
-  HOOK_SESSION_END_URL,
+  hookSessionEndUrl,
+  MCP_ENDPOINT_PATH,
   MCP_HOST,
   MCP_PORT,
+  MCP_PORT_FALLBACKS,
   MCP_SERVERS_CONFIG_FILENAME,
   PRODUCT_NAME,
   RULES_DIR,
@@ -183,6 +186,27 @@ let reranker: Reranker | null = null
 let mcpServer: AgenticOsMcpServer | null = null
 let mcpClientManager: McpClientManager | null = null
 void mcpClientManager
+/** True when the MCP server was bound to the LAN (0.0.0.0) this launch — set at
+ *  boot from the network.lanAccess setting; drives the phone/LAN connect URL. */
+let mcpLanBound = false
+
+/** The machine's first non-internal IPv4 address (for the LAN connect URL), or
+ *  null when there is no such interface (offline / loopback-only). */
+function lanIpv4(): string | null {
+  for (const addrs of Object.values(networkInterfaces())) {
+    for (const addr of addrs ?? []) {
+      if (addr.family === 'IPv4' && !addr.internal) return addr.address
+    }
+  }
+  return null
+}
+
+/** The LAN connect URL when the server is actually LAN-bound, else null. */
+function mcpLanUrl(): string | null {
+  if (!mcpLanBound || mcpServer === null) return null
+  const ip = lanIpv4()
+  return ip !== null ? `http://${ip}:${mcpServer.port}${MCP_ENDPOINT_PATH}` : null
+}
 /** Extraction agent (phase 08) — the phase-11 session-end triggers call it. */
 let extractionAgent: ExtractionAgent | null = null
 /** Skill-improvement agent (phase 12) — the 02:00 slot + "improve now" drive it. */
@@ -723,8 +747,13 @@ async function bootMcp(): Promise<void> {
   // read-path consumer (taskId 'live:<sessionId>', RUNNER_LIVE_SESSION_MAX_CALLS)
   // is wired when getContext is refactored at FP-1; here we only supply the dep.
   const callBudget = new CallBudget({ db: appData.db })
-  const server = new AgenticOsMcpServer({
+  // Phone/LAN access (opt-in, §21.12 deviation): bind the LAN interface (0.0.0.0)
+  // when the user enabled it, else the localhost-only §21.7 default. Read at boot;
+  // a toggle takes effect on the next launch (the Settings card says so).
+  const lanAccess = loadModelSettings(settingsPath(userDataDir)).network?.lanAccess === true
+  const serverDeps = {
     bearerToken: keychain.ensureMcpBearerToken(),
+    ...(lanAccess ? { host: '0.0.0.0' } : {}),
     runnerToken,
     engine,
     retriever,
@@ -741,21 +770,40 @@ async function bootMcp(): Promise<void> {
     ...(securityInstances !== null
       ? { scanner: securityInstances.scanner, audit: securityInstances.audit }
       : {})
-  })
-  try {
-    await server.start()
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code
-    if (code === 'EADDRINUSE') {
-      bootErrors.set('mcp', `port ${MCP_PORT} already in use (another ${PRODUCT_NAME} instance?) — MCP server disabled`)
-      console.error(
-        `[mcp] port ${MCP_PORT} is already in use (another ${PRODUCT_NAME} instance?) — MCP server disabled this launch`
-      )
-      return
+  }
+  // Port fallback (§21.12 deviation, recorded): if 4517 is taken (a different
+  // profile's instance, or any unrelated process), try the next free port
+  // instead of disabling MCP. The server already reads its real bound port from
+  // http.address(), and every connect surface below uses server.url — so the
+  // dashboard, connect command, sample config, and hook all follow the real port.
+  let server: AgenticOsMcpServer | null = null
+  let startErr: unknown = null
+  for (const port of MCP_PORT_FALLBACKS) {
+    const candidate = new AgenticOsMcpServer({ ...serverDeps, port })
+    try {
+      await candidate.start()
+      server = candidate
+      break
+    } catch (err) {
+      startErr = err
+      if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err
+      // Port busy — try the next candidate.
     }
-    throw err
+  }
+  if (server === null) {
+    bootErrors.set('mcp', `port ${MCP_PORT} and its fallbacks are all in use — MCP server disabled this launch`)
+    console.error(`[mcp] no free port found from ${MCP_PORT} — MCP server disabled this launch`, startErr)
+    return
+  }
+  if (server.port !== MCP_PORT) {
+    console.warn(`[mcp] port ${MCP_PORT} was in use — automatically using port ${server.port} instead (connect command in Settings shows it)`)
   }
   mcpServer = server
+  mcpLanBound = lanAccess
+  if (lanAccess) {
+    const lan = lanIpv4()
+    console.log(`[mcp] LAN access ON — reachable on your network at ${lan !== null ? `http://${lan}:${server.port}${MCP_ENDPOINT_PATH}` : '(no network interface found)'} (bearer auth only)`)
+  }
   mcpClientManager = new McpClientManager({
     configPath: join(userDataDir, MCP_SERVERS_CONFIG_FILENAME),
     secrets: (name) => keychain?.getSecret(name)
@@ -766,12 +814,12 @@ async function bootMcp(): Promise<void> {
   // and is surfaced by the dashboard (phase 10). Dev escape hatch: set
   // AGENTIC_OS_PRINT_MCP_TOKEN=1 to print the runnable command.
   const samplePath = join(userDataDir, '.mcp.json')
-  writeSampleMcpJson(samplePath)
+  writeSampleMcpJson(samplePath, { url: server.url })
   console.log(`[mcp] server listening at ${server.url} (bearer auth, 7 tools, call log → mcp_calls)`)
-  console.log(`[mcp] connect Claude Code with:\n[mcp]   ${claudeMcpAddCommand()}`)
+  console.log(`[mcp] connect Claude Code with:\n[mcp]   ${claudeMcpAddCommand(undefined, server.url)}`)
   console.log(`[mcp] sample .mcp.json written to ${samplePath} (replace <token> with the keychain token)`)
   if (process.env['AGENTIC_OS_PRINT_MCP_TOKEN'] === '1') {
-    console.log(`[mcp] dev: ${claudeMcpAddCommand(keychain.ensureMcpBearerToken())}`)
+    console.log(`[mcp] dev: ${claudeMcpAddCommand(keychain.ensureMcpBearerToken(), server.url)}`)
   }
 }
 
@@ -1032,7 +1080,7 @@ async function bootTriggers(): Promise<void> {
     `[triggers] durable queue ready — ${reloaded} task(s) reloaded, spool drained (${spool.enqueued} new, ${spool.deduped} dup, ${spool.malformed} bad); schedules armed (skill 02:00, prune 03:00, export Sun 03:30)`
   )
   console.log(
-    `[triggers] session-end: hook endpoint ${mcpServer !== null ? `armed at ${HOOK_SESSION_END_URL}` : 'NOT armed (MCP server down — spool only)'}; inactivity fallback 30 min; watchers: ${status.folders.length} folder(s), ${initialRules.rules.length} rule(s)${initialRules.errors.length > 0 ? ` (${initialRules.errors.length} invalid — see warnings)` : ''}`
+    `[triggers] session-end: hook endpoint ${mcpServer !== null ? `armed at ${hookSessionEndUrl(mcpServer.port)}` : 'NOT armed (MCP server down — spool only)'}; inactivity fallback 30 min; watchers: ${status.folders.length} folder(s), ${initialRules.rules.length} rule(s)${initialRules.errors.length > 0 ? ` (${initialRules.errors.length} invalid — see warnings)` : ''}`
   )
 }
 
@@ -1074,6 +1122,11 @@ function bootIpc(): void {
     reranker,
     keychain,
     mcpUrl: mcpServer?.url ?? null,
+    hookEndpointUrl: mcpServer !== null ? hookSessionEndUrl(mcpServer.port) : null,
+    // Phone/LAN access (Settings connection card): the network-reachable connect
+    // URL, present only when the server is actually LAN-bound this launch. The
+    // toggle STATE is read from persisted settings inside settingsDto().
+    mcpLanUrl: mcpLanUrl(),
     triggers,
     // Phase-17: the subscription runner backs runner.status / runner.testConnection.
     runner: subscriptionRunner,

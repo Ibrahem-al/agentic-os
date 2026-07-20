@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   activeCloudModel,
   defaultModelSettings,
+  defaultNetworkSettings,
   defaultReasoningSettings,
   defaultRunnerSettings,
   loadModelSettings,
@@ -153,5 +154,29 @@ describe('phase-16 reasoning + runner settings', () => {
   it('rejects a non-boolean reasoning.allowSensitiveNonLocal loudly', () => {
     writeFileSync(filePath, JSON.stringify({ reasoning: { allowSensitiveNonLocal: 'yes' } }))
     expect(() => loadModelSettings(filePath)).toThrow(/reasoning\.allowSensitiveNonLocal must be a boolean/)
+  })
+
+  // ── Phone/LAN access (network.lanAccess) ────────────────────────────────────
+
+  it('a default install materializes NO network section (DEFAULT == TODAY, localhost-only)', () => {
+    expect(loadModelSettings(filePath).network).toBeUndefined()
+    expect(defaultNetworkSettings()).toEqual({ lanAccess: false })
+  })
+
+  it('round-trips network.lanAccess and normalizes a partial section to the secure default', () => {
+    const settings = defaultModelSettings()
+    settings.network = { lanAccess: true }
+    saveModelSettings(filePath, settings)
+    expect(loadModelSettings(filePath)).toEqual(settings)
+    expect(loadModelSettings(filePath).network?.lanAccess).toBe(true)
+
+    // Empty section on disk → lanAccess fills to the secure default (false).
+    writeFileSync(filePath, JSON.stringify({ network: {} }))
+    expect(loadModelSettings(filePath).network).toEqual({ lanAccess: false })
+  })
+
+  it('rejects a non-boolean network.lanAccess loudly', () => {
+    writeFileSync(filePath, JSON.stringify({ network: { lanAccess: 'yes' } }))
+    expect(() => loadModelSettings(filePath)).toThrow(/network\.lanAccess must be a boolean/)
   })
 })

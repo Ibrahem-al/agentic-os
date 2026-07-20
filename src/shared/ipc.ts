@@ -839,6 +839,12 @@ export interface SettingsDto {
     /** The `claude mcp add` command with the <token> placeholder. */
     readonly connectCommand: string
     readonly sampleConfigPath: string
+    /** Whether LAN access is enabled in settings (the toggle state). */
+    readonly lanAccess: boolean
+    /** The LAN connect URL (http://<lan-ip>:<port>/mcp) when the server is
+     *  actually bound to the network; null when localhost-only (or LAN access
+     *  was enabled but the app has not been restarted to apply it yet). */
+    readonly lanUrl: string | null
   }
   /**
    * Phase-16 sections — present only once the user opts in (absent on a default
@@ -861,6 +867,9 @@ export interface ModelSettingsPatchDto {
    */
   readonly reasoning?: ReasoningSettingsDto
   readonly runner?: RunnerSettingsDto
+  /** Network exposure (phone/LAN access). Absent = unchanged; lanAccess toggles
+   *  the localhost-only default (takes effect on the next launch). */
+  readonly network?: { readonly lanAccess?: boolean }
 }
 
 /** Pushed over IPC_EVENT_OLLAMA_PULL while settings.ollamaPull runs. */

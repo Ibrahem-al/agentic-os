@@ -59,7 +59,7 @@ export function getSettingsSummary(deps: SettingsSummaryDeps): SettingsSummaryDt
   ) as Record<IpcCloudProvider, boolean>
   // phase-16 will add reasoning/runner to ModelSettings; surface them if present
   // (loadModelSettings drops unknown keys until then, so this is inert today).
-  const extra = settings as unknown as { reasoning?: unknown; runner?: unknown }
+  const extra = settings as unknown as { reasoning?: unknown; runner?: unknown; network?: unknown }
   return {
     cloudProvider: settings.cloudProvider,
     cloudModels: settings.cloudModels,
@@ -68,6 +68,7 @@ export function getSettingsSummary(deps: SettingsSummaryDeps): SettingsSummaryDt
     defaultModels: CLOUD_DEFAULT_MODELS,
     apiKeysPresent,
     ...(extra.reasoning !== undefined ? { reasoning: jsonObject(extra.reasoning) } : {}),
-    ...(extra.runner !== undefined ? { runner: jsonObject(extra.runner) } : {})
+    ...(extra.runner !== undefined ? { runner: jsonObject(extra.runner) } : {}),
+    ...(extra.network !== undefined ? { network: jsonObject(extra.network) } : {})
   }
 }

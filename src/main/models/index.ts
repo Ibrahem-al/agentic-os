@@ -66,12 +66,14 @@ export {
   SETTINGS_FILENAME,
   activeCloudModel,
   defaultModelSettings,
+  defaultNetworkSettings,
   defaultReasoningSettings,
   defaultRunnerSettings,
   loadModelSettings,
   saveModelSettings,
   settingsPath,
   type ModelSettings,
+  type NetworkSettings,
   type ReasoningSettings,
   type RunnerSettings
 } from './settings'
