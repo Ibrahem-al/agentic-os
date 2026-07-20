@@ -387,6 +387,7 @@ export default function SettingsPanel(): React.JSX.Element {
   const [updater, setUpdater] = useState<UpdaterStatusDto | null>(null)
   const [checkingUpdate, setCheckingUpdate] = useState(false)
   const [confirmRestart, setConfirmRestart] = useState(false)
+  const [pausingRestart, setPausingRestart] = useState(false)
 
   const installHook = async (): Promise<void> => {
     setInstallingHook(true)
@@ -702,22 +703,29 @@ export default function SettingsPanel(): React.JSX.Element {
   /**
    * Confirmed restart-to-install. On the normal path the app quits + relaunches
    * to apply the update, so this panel never re-renders. But the install can be
-   * DEFERRED (§21.9 quiesce: a write was still in flight) — then it returns
-   * installDeferred and the app keeps running, so fold that snapshot back in and
-   * tell the user (the update still applies on the next quit).
+   * DEFERRED: either a write was still in flight after the quiesce bound, or a
+   * background JOB is running (then `blockedByTaskId` is set and the UI offers to
+   * pause it). `force: true` = the "pause the job and restart now" action.
    */
-  const installUpdate = async (): Promise<void> => {
+  const installUpdate = async (force = false): Promise<void> => {
+    if (force) setPausingRestart(true)
     try {
-      const status = await call('updater.install', undefined)
+      const status = await call('updater.install', { force })
       if (status.installDeferred === true) {
         setUpdater(status)
         setConfirmRestart(false)
-        toast.notify('ok', status.detail ?? 'The update will install when you next close the app.')
+        // A job blocking the restart shows the inline block (with the pause
+        // button); only the plain write-drain defer needs a toast.
+        if (status.blockedByTaskId === undefined) {
+          toast.notify('ok', status.detail ?? 'The update will install when you next close the app.')
+        }
       }
       // Otherwise the app is quitting to install — no state change needed here.
     } catch (err) {
       setConfirmRestart(false)
       toast.notify('err', errMessage(err))
+    } finally {
+      setPausingRestart(false)
     }
   }
 
@@ -1378,17 +1386,48 @@ export default function SettingsPanel(): React.JSX.Element {
               </p>
             )}
 
+            {/* Restart held because a BACKGROUND JOB is running — say so plainly
+                and offer to pause it and restart now (the update otherwise applies
+                when the job finishes and the app next closes). */}
+            {updState === 'downloaded' &&
+              updater?.installDeferred === true &&
+              updater.blockedByTaskId !== undefined && (
+                <div
+                  className="flex flex-col gap-2 rounded-md border border-warn/40 bg-warn/10 px-3 py-2"
+                  data-testid="updater-blocked-job"
+                >
+                  <p className="text-[12px] leading-5">
+                    The app didn&apos;t restart because a background job is running{' '}
+                    (<span className="font-mono text-[11px]">{updater.blockedByTaskId}</span>). It&apos;ll update on its
+                    own once the job finishes and you close the app — or pause the job and restart now (you can resume
+                    the job from Jobs afterwards).
+                  </p>
+                  <div>
+                    <Button
+                      variant="primary"
+                      testId="updater-pause-restart"
+                      disabled={pausingRestart}
+                      onClick={() => void installUpdate(true)}
+                    >
+                      {pausingRestart ? 'Pausing…' : 'Pause the job & restart'}
+                    </Button>
+                  </div>
+                </div>
+              )}
+
             {/* Install deferred (§21.9 quiesce): a write was in flight, so we did
                 not interrupt it — the update applies on the next quit. */}
-            {updState === 'downloaded' && updater?.installDeferred === true && (
-              <p
-                className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-5"
-                role="status"
-                data-testid="updater-deferred"
-              >
-                {updater.detail ?? 'The app is finishing a write — the update will install when you next close it.'}
-              </p>
-            )}
+            {updState === 'downloaded' &&
+              updater?.installDeferred === true &&
+              updater.blockedByTaskId === undefined && (
+                <p
+                  className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-5"
+                  role="status"
+                  data-testid="updater-deferred"
+                >
+                  {updater.detail ?? 'The app is finishing a write — the update will install when you next close it.'}
+                </p>
+              )}
 
             {/* What's new — the release notes for the update being downloaded /
                 ready to install, so the user can read them before restarting.

@@ -1039,6 +1039,14 @@ export interface UpdaterStatusDto {
    * (autoInstallOnAppQuit). Absent on every other path.
    */
   readonly installDeferred?: boolean
+  /**
+   * Set (with installDeferred) when the restart was held specifically because a
+   * BACKGROUND JOB is running — the id of that task. The UI surfaces which job is
+   * blocking and offers "pause it and restart now" (`updater.install` with
+   * `force: true`, which pauses this task before installing). Absent when the
+   * defer was a plain write-lane drain with no queued job.
+   */
+  readonly blockedByTaskId?: string
 }
 
 // ── triggers & automation (phase 11) ─────────────────────────────────────────
@@ -1446,7 +1454,9 @@ export interface IpcChannels {
   /** Trigger a manual update check (no-op while already checking/downloading). */
   'updater.check': { req: void; res: UpdaterStatusDto }
   /** Restart-to-install a downloaded update (user-confirmed in the UI first). */
-  'updater.install': { req: void; res: UpdaterStatusDto }
+  /** `force: true` pauses a running background job first, then installs (the
+   *  "pause the job and restart now" action); omit/false defers when a job runs. */
+  'updater.install': { req: { readonly force?: boolean }; res: UpdaterStatusDto }
 
   // ── data & backups (Settings "Data & backups") ──────────────────────────────
   /** The backup list (newest first) + current auto-backup settings. */

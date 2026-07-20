@@ -1297,7 +1297,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   register('updater.check', () => deps.updater?.check() ?? disabledUpdaterStatus)
 
-  register('updater.install', async () => {
+  register('updater.install', async (req) => {
     const updater = deps.updater
     if (updater === null || updater === undefined) return disabledUpdaterStatus
     // Only a genuinely downloaded update installs; anything else, quitAndInstall
@@ -1306,6 +1306,34 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       updater.quitAndInstall()
       return updater.status()
     }
+    const queue = deps.triggers?.queue ?? null
+    const runningTaskId = queue?.runningTaskId ?? null
+
+    // A background job is running and the user hasn't opted to pause it: DON'T
+    // silently block on the 30s quiesce (the old behaviour gave zero feedback and
+    // then a vague "finishing a write" message). Return right away naming the job
+    // that's holding the restart — the UI offers "pause it and restart now".
+    if (runningTaskId !== null && req?.force !== true) {
+      return {
+        ...updater.status(),
+        installDeferred: true,
+        blockedByTaskId: runningTaskId,
+        detail: `A background job is running (${runningTaskId}), so the app didn't restart to update. It will update when the job finishes and you close the app — or pause the job and restart now.`
+      }
+    }
+    // "Pause the job and restart now": pause the running task first. It settles to
+    // 'paused' (cooperative abort — nothing is lost; resume it after the update),
+    // which lets the quiesce below drain promptly instead of timing out.
+    if (runningTaskId !== null && req?.force === true) {
+      try {
+        queue?.pause(runningTaskId)
+      } catch (err) {
+        // Already settled (finished/paused) between the click and here — harmless;
+        // the quiesce still confirms the lane is idle before we install.
+        console.warn(`[updater] pause-before-install skipped: ${String(err)}`)
+      }
+    }
+
     // §21.9 (G5+G6): quitAndInstall bypasses will-quit's bounded drain and
     // relaunches into the new binary (which migrates storage at first boot). So
     // drain HERE first — wait (bounded) for the durable queue's running task to
@@ -1313,7 +1341,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     // never boots off a stale graph. The user already confirmed the restart.
     const { idle } = await quiesceForInstall({
       engine: deps.engine,
-      queue: deps.triggers?.queue ?? null,
+      queue,
       log: (line) => console.log(line)
     })
     if (!idle) {
