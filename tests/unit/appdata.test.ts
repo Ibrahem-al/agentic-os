@@ -20,7 +20,8 @@ const TABLES = [
   'runner_runs',
   'runner_submissions',
   'lane_jobs',
-  'local_llm_usage'
+  'local_llm_usage',
+  'dedupe_scans'
 ] as const
 
 describe('appdata.db (SQLite side of §20 app data)', () => {
@@ -29,13 +30,13 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('creates the db in WAL mode with all tables and user_version 11', () => {
+  it('creates the db in WAL mode with all tables and user_version 12', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const appData = openAppData(join(dir, 'nested', 'appdata.db'))
     try {
       expect(existsSync(appData.path)).toBe(true)
       expect(appData.db.pragma('journal_mode', { simple: true })).toBe('wal')
-      expect(appData.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(appData.db.pragma('user_version', { simple: true })).toBe(12)
       expect(appData.db.pragma('foreign_keys', { simple: true })).toBe(1)
       const names = appData.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -134,7 +135,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const second = openAppData(dbPath)
     try {
-      expect(second.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(second.db.pragma('user_version', { simple: true })).toBe(12)
       expect((second.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(1)
     } finally {
       second.close()
@@ -185,7 +186,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(12)
       const names = upgraded.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .all()
@@ -245,7 +246,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(12)
       // A real upgrade takes the §21-rule-9 pre-upgrade snapshot.
       expect(upgraded.backupCreated).not.toBeNull()
       // Data survived the in-place rebuild (including the non-default priority).
@@ -268,7 +269,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     }
   })
 
-  it('upgrades a v10 db to v11: tasks.status gains paused + a started_at column (CHECK rebuilt in place)', () => {
+  it('upgrades a v10 db to current (v12): tasks.status gains paused + a started_at column (CHECK rebuilt in place)', () => {
     dir = mkdtempSync(join(tmpdir(), 'appdata-'))
     const dbPath = join(dir, 'appdata.db')
     const first = openAppData(dbPath)
@@ -298,7 +299,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(12)
       // A real upgrade takes the §21-rule-9 pre-upgrade snapshot.
       expect(upgraded.backupCreated).not.toBeNull()
       // Data survived the in-place rebuild (including the non-default priority).
@@ -355,7 +356,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(12)
       // The v6 row survives; the new nullable column reads NULL on it.
       const old = upgraded.db
         .prepare('SELECT tool, args_hash, session_kind FROM mcp_calls WHERE session_id = ?')
@@ -385,7 +386,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
       const snapshot = upgraded.backupCreated
       expect(snapshot).not.toBeNull()
       expect(existsSync(snapshot as string)).toBe(true)
-      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v11$/)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v12$/)
       const header = readFileSync(snapshot as string)
       expect(header.subarray(0, 16).toString('latin1')).toBe(`SQLite format 3${String.fromCharCode(0)}`)
       expect(header.readUInt32BE(60)).toBe(6)
@@ -434,7 +435,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(12)
       // lane_jobs now exists; the pre-existing audit row survived the rebuild.
       const names = upgraded.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -462,7 +463,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
       const snapshot = upgraded.backupCreated
       expect(snapshot).not.toBeNull()
       expect(existsSync(snapshot as string)).toBe(true)
-      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v11$/)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v12$/)
       expect(readFileSync(snapshot as string).readUInt32BE(60)).toBe(7)
     } finally {
       upgraded.close()
@@ -472,7 +473,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     // and 'pending' still round-trips.
     const reopened = openAppData(dbPath)
     try {
-      expect(reopened.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(reopened.db.pragma('user_version', { simple: true })).toBe(12)
       expect(reopened.backupCreated).toBeNull()
       reopened.db
         .prepare(`INSERT INTO audit_log (id, agent_id, kind, description, outcome) VALUES (?, ?, ?, ?, ?)`)
@@ -499,7 +500,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
 
     const upgraded = openAppData(dbPath)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(12)
       // The full table set (incl. the new ledger) exists and the marker survived.
       const names = upgraded.db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -529,8 +530,57 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
       const snapshot = upgraded.backupCreated
       expect(snapshot).not.toBeNull()
       expect(existsSync(snapshot as string)).toBe(true)
-      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v11$/)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v12$/)
       expect(readFileSync(snapshot as string).readUInt32BE(60)).toBe(8)
+    } finally {
+      upgraded.close()
+    }
+  })
+
+  it('upgrades a v11 db to v12: additive dedupe_scans table, snapshot frozen at v11', () => {
+    dir = mkdtempSync(join(tmpdir(), 'appdata-'))
+    const dbPath = join(dir, 'appdata.db')
+    // Simulate a real v11 (v0.1.15) install: everything present EXCEPT the v12
+    // dedupe_scans background-scan cache.
+    const first = openAppData(dbPath)
+    first.db.exec('DROP TABLE dedupe_scans')
+    first.db.prepare('INSERT INTO tasks (id, kind) VALUES (?, ?)').run('v11-marker', 'probe')
+    first.db.pragma('user_version = 11')
+    first.close()
+
+    const upgraded = openAppData(dbPath)
+    try {
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(12)
+      const names = upgraded.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .all()
+        .map((r) => (r as { name: string }).name)
+      expect(names).toEqual([...TABLES].sort())
+      expect((upgraded.db.prepare('SELECT kind FROM tasks WHERE id = ?').get('v11-marker') as { kind: string }).kind).toBe(
+        'probe'
+      )
+      // The singleton cache really takes its one row.
+      upgraded.db
+        .prepare(
+          `INSERT INTO dedupe_scans (id, completed_at, scope, options_json, result_json, scanned_nodes, watermark_at)
+           VALUES (1, ?, ?, ?, ?, ?, ?)`
+        )
+        .run('2026-07-20T00:00:00.000Z', 'all', '{}', '{"groups":[],"truncated":false}', 0, null)
+      expect((upgraded.db.prepare('SELECT scope FROM dedupe_scans WHERE id = 1').get() as { scope: string }).scope).toBe('all')
+      // The id=1 CHECK keeps it a singleton.
+      expect(() =>
+        upgraded.db
+          .prepare(
+            `INSERT INTO dedupe_scans (id, completed_at, scope, options_json, result_json) VALUES (2, ?, ?, ?, ?)`
+          )
+          .run('x', 'all', '{}', '{}')
+      ).toThrow(/CHECK/)
+      // §21 rule 9: the pre-upgrade snapshot exists and is frozen at v11.
+      const snapshot = upgraded.backupCreated
+      expect(snapshot).not.toBeNull()
+      expect(existsSync(snapshot as string)).toBe(true)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v12$/)
+      expect(readFileSync(snapshot as string).readUInt32BE(60)).toBe(11)
     } finally {
       upgraded.close()
     }
@@ -559,15 +609,15 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     const upgraded = openAppData(dbPath)
     try {
       // Main db really upgraded in place.
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(12)
       expect(
         upgraded.db.prepare("SELECT count(*) AS c FROM sqlite_master WHERE name = 'skill_settings'").get()
       ).toEqual({ c: 1 })
-      // Snapshot at the derived default location: <db parent>/backups/<stamp>-pre-appdata-v11/appdata.db.
+      // Snapshot at the derived default location: <db parent>/backups/<stamp>-pre-appdata-v12/appdata.db.
       const snapshot = upgraded.backupCreated
       expect(snapshot).not.toBeNull()
       expect(existsSync(snapshot as string)).toBe(true)
-      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v11$/)
+      expect(dirname(snapshot as string)).toMatch(/-pre-appdata-v12$/)
       expect(dirname(dirname(snapshot as string))).toBe(join(dir, 'backups'))
       // The snapshot is a valid sqlite db frozen at the OLD version: header
       // magic + user_version (byte 60, big-endian) read straight off disk —
@@ -604,7 +654,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     const elsewhere = join(dir, 'elsewhere')
     const upgraded = openAppData(dbPath, elsewhere)
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(12)
       expect(upgraded.backupCreated).not.toBeNull()
       expect(dirname(dirname(upgraded.backupCreated as string))).toBe(elsewhere)
       expect(existsSync(upgraded.backupCreated as string)).toBe(true)
@@ -627,7 +677,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     snapshotAppDataDb(dbPath, snap)
 
     // The read-only snapshot did not disturb the live source (still v7, 2 rows).
-    expect(live.db.pragma('user_version', { simple: true })).toBe(11)
+    expect(live.db.pragma('user_version', { simple: true })).toBe(12)
     expect((live.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(2)
     live.close()
 
@@ -637,7 +687,7 @@ describe('appdata.db (SQLite side of §20 app data)', () => {
     const reopened = openAppData(snap)
     try {
       expect((reopened.db.prepare('SELECT count(*) AS c FROM tasks').get() as { c: number }).c).toBe(2)
-      expect(reopened.db.pragma('user_version', { simple: true })).toBe(11)
+      expect(reopened.db.pragma('user_version', { simple: true })).toBe(12)
     } finally {
       reopened.close()
     }

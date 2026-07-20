@@ -312,8 +312,11 @@ const APPDATA_SCHEMA: readonly string[] = [
 /**
  * Current SQLite schema version. Exported so the boot-time data manifest can
  * record which schema the on-disk store carries (docs/DATA-MIGRATION.md).
+ * v12: the additive `dedupe_scans` background-scan cache (a new table, so the
+ * version ticks — same discipline as v9's `local_llm_usage`; the CREATE IF NOT
+ * EXISTS in APPDATA_SCHEMA creates it for fresh + upgrading stores alike).
  */
-export const APPDATA_USER_VERSION = 11
+export const APPDATA_USER_VERSION = 12
 
 /**
  * Column additions to tables that predate them (CREATE IF NOT EXISTS skips an
@@ -639,7 +642,8 @@ export function openAppData(dbPath: string, backupsDir?: string): AppData {
     // local_llm_usage — the additive local-LLM usage ledger; v9 → v10:
     // tasks.status 'cancelled' — user task-cancel, migrateTasksStatusCheck;
     // v10 → v11: tasks.status 'paused' + tasks.started_at — user pause/resume
-    // + the Resources "time it took" readout, migrateTasksV11).
+    // + the Resources "time it took" readout, migrateTasksV11; v11 → v12:
+    // dedupe_scans — the background duplicate-scan result cache, additive).
     db.pragma(`user_version = ${APPDATA_USER_VERSION}`)
   }
   return {
