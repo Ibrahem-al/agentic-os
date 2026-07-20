@@ -32,6 +32,10 @@ function bundleIds(bundle: ContextBundle): string[] {
   return [...bundle.items, ...bundle.globalPreferences].map((i) => i.id)
 }
 
+// Opening a real store + seeding the whole fixture graph is heavy; under the
+// Electron-ABI runtime on a loaded CI runner it occasionally brushes past the
+// default 30s hook timeout (a flake — the tests themselves are fast, offline
+// fakes). Give the setup generous headroom so a slow seed never fails the suite.
 beforeAll(async () => {
   store = await openTestStore()
   await seedFixtureGraph(store.engine)
@@ -42,9 +46,11 @@ beforeAll(async () => {
     reranker: new FakeReranker(),
     llm: passingCritic
   })
-})
+}, 120_000)
 afterAll(async () => {
-  await store.cleanup()
+  // Guard: if the seed above ever fails, `store` is undefined — don't mask it
+  // with a cleanup NPE (the real failure is the hook, not the teardown).
+  if (store !== undefined) await store.cleanup()
 })
 
 interface GoldenCase {

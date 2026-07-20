@@ -120,7 +120,10 @@ async function pollPanel(
 
 async function openSkillDetail(page: Page): Promise<void> {
   await page.locator(`[data-rowkey="${GOLDEN_SKILL_ID}"]`).click()
-  await expect(page.getByTestId('skill-improvement')).toBeVisible({ timeout: 15_000 })
+  // 30s (was 15s): the skill-improvement detail renders after a background job
+  // settles; on a loaded CI runner that occasionally took >15s (an intermittent
+  // flake — the element does appear, just slowly). The extra headroom is free.
+  await expect(page.getByTestId('skill-improvement')).toBeVisible({ timeout: 30_000 })
 }
 
 // eslint-disable-next-line no-empty-pattern -- Playwright mandates the object pattern here
