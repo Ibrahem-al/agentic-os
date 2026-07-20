@@ -30,8 +30,9 @@ const FRICTION = 0.82 // velocity retained per tick
 const MAX_SPEED = 32 // clamp so a hot start can't explode
 const ALPHA_DECAY = 0.985 // cooling per tick
 const ALPHA_MIN = 0.02 // below this the sim is considered settled
-const ALPHA_REHEAT_DRAG = 0.35
-const ALPHA_REHEAT_DATA = 0.9
+const ALPHA_REHEAT_DRAG = 0.2 // dragging a node nudges its neighbors, not the whole graph
+const ALPHA_REHEAT_DATA = 0.9 // COLD start only — the very first layout forms from the spiral seed
+const ALPHA_REHEAT_WARM = 0.12 // re-filter / local mode / search over an EXISTING layout: a gentle settle, never a re-explosion
 
 // ── camera / view constants ──────────────────────────────────────────────────
 const MIN_SCALE = 0.04
@@ -178,11 +179,13 @@ export function ForceGraph({
     const nextNodes: SimNode[] = []
     const indexByKey = new Map<string, number>()
     let spiralCounter = prevPositions.size
+    let newCount = 0
 
     for (const node of nodes) {
       const prior = prevPositions.get(node.key)
       let pos = prior
       if (pos === undefined) {
+        newCount++
         // Place a new node near its already-placed neighbors, else on the spiral.
         const neighbors = adjacencyRef.current.get(node.key)
         let sumX = 0
@@ -235,7 +238,13 @@ export function ForceGraph({
     for (const n of nextNodes) nextPositions.set(n.key, { x: n.x, y: n.y })
     positionsRef.current = nextPositions
 
-    alphaRef.current = ALPHA_REHEAT_DATA
+    // Reheat gently: a COLD start (no prior layout) needs full energy to form;
+    // a WARM rebuild (re-filter / local mode / search over an existing layout,
+    // positions preserved by key) needs only a nudge so nodes ease into place
+    // instead of re-exploding across the canvas on every interaction.
+    const cold = prevPositions.size === 0
+    const newFraction = nextNodes.length > 0 ? newCount / nextNodes.length : 0
+    alphaRef.current = cold ? ALPHA_REHEAT_DATA : Math.min(0.3, ALPHA_REHEAT_WARM + newFraction * 0.4)
     dirtyRef.current = true
     if (!hasFitRef.current && nextNodes.length > 0) needsFitRef.current = true
   }, [nodes, edges])
@@ -528,10 +537,11 @@ export function ForceGraph({
     return () => canvas.removeEventListener('wheel', onWheel)
   }, [screenToWorld])
 
-  // ── external fit request (toolbar / mode change): relax, then frame ─────────
+  // ── external fit request (toolbar "Fit" / mode change): re-frame only ───────
+  // Do NOT reheat — "Fit" should re-center the current layout, not re-jiggle it;
+  // a mode change already set its own gentle alpha in the rebuild effect.
   useEffect(() => {
     needsFitRef.current = true
-    alphaRef.current = Math.max(alphaRef.current, 0.4)
     dirtyRef.current = true
   }, [fitSignal])
 
