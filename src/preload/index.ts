@@ -1,14 +1,17 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import {
+  IPC_EVENT_CLOSE_REQUEST,
   IPC_EVENT_INGEST_PROGRESS,
   IPC_EVENT_OLLAMA_PULL,
   IPC_EVENT_UPDATER_STATUS,
   IPC_EVENT_WINDOW_MAXIMIZE,
   IPC_INVOKE_PREFIX,
   IPC_WINDOW_CLOSE,
+  IPC_WINDOW_CLOSE_CONFIRM,
   IPC_WINDOW_IS_MAXIMIZED,
   IPC_WINDOW_MINIMIZE,
   IPC_WINDOW_TOGGLE_MAXIMIZE,
+  type CloseActivityDto,
   type IngestProgressEventDto,
   type IpcChannel,
   type IpcRequest,
@@ -59,7 +62,11 @@ const api = {
     /** Current maximize state (seed for the restore icon). */
     isMaximized: (): Promise<boolean> => ipcRenderer.invoke(IPC_WINDOW_IS_MAXIMIZED) as Promise<boolean>,
     /** Subscribe to maximize-state pushes; returns unsubscribe. */
-    onMaximizeChange: subscribe<boolean>(IPC_EVENT_WINDOW_MAXIMIZE)
+    onMaximizeChange: subscribe<boolean>(IPC_EVENT_WINDOW_MAXIMIZE),
+    /** Close-guard: main asks (with running/connected detail) to warn before closing. */
+    onCloseRequest: subscribe<CloseActivityDto>(IPC_EVENT_CLOSE_REQUEST),
+    /** Close-guard: the user confirmed — close for real. */
+    confirmClose: (): void => ipcRenderer.send(IPC_WINDOW_CLOSE_CONFIRM)
   }
 } as const
 

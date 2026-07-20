@@ -1419,6 +1419,31 @@ export const IPC_WINDOW_CLOSE = 'window.close'
 export const IPC_WINDOW_IS_MAXIMIZED = 'window.is-maximized'
 /** Maximize-state push (main → renderer, boolean payload); mirrors event.ingest.progress. */
 export const IPC_EVENT_WINDOW_MAXIMIZE = 'event.window.maximize'
+/**
+ * Close-guard (§21.11). When the user tries to close while work is running or a
+ * client is connected, main preventDefaults the window close and pushes a
+ * CloseActivityDto on this event; the renderer shows a warning modal. If the
+ * user confirms, the renderer sends IPC_WINDOW_CLOSE_CONFIRM and main closes.
+ */
+export const IPC_EVENT_CLOSE_REQUEST = 'event.window.close-request'
+/** Force-close (renderer → main) after the user confirms the close warning. */
+export const IPC_WINDOW_CLOSE_CONFIRM = 'window.close-confirm'
+
+/** What is running/connected when the user tries to close (drives the warning). */
+export interface CloseActivityDto {
+  /** A background job is executing right now. */
+  readonly running: boolean
+  /** The id of that job (for display), if any. */
+  readonly runningTaskId: string | null
+  /** Claude (or another client) has an open MCP connection. */
+  readonly connected: boolean
+  /** How many interactive MCP sessions are open. */
+  readonly connectionCount: number
+  /** Jobs waiting to run — durable, they resume next launch (informational). */
+  readonly queued: number
+  /** running || connected — whether a warning is warranted at all. */
+  readonly busy: boolean
+}
 
 /** Stable error codes the renderer may branch on (message is for display). */
 export type IpcErrorCode =

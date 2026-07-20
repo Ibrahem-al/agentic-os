@@ -225,6 +225,21 @@ export class AgenticOsMcpServer {
   }
 
   /**
+   * Live MCP session counts by kind. `interactive` = an external client (Claude
+   * Code) is CONNECTED; `runner` = the app's own agent-mode children connecting
+   * back. Powers the close-guard "Claude is connected" check (interactive > 0).
+   */
+  activeSessions(): { interactive: number; runner: number } {
+    let interactive = 0
+    let runner = 0
+    for (const session of this.sessions.values()) {
+      if (session.kind === 'runner') runner += 1
+      else interactive += 1
+    }
+    return { interactive, runner }
+  }
+
+  /**
    * Supply the §4 read tools' late-bound dependencies. Called once from bootIpc
    * — the last boot step, where every subsystem singleton exists and the
    * subsystem snapshot is accurate. Mirrors setSessionEndHook: purely additive.

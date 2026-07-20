@@ -3,14 +3,17 @@ import { join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import {
+  IPC_EVENT_CLOSE_REQUEST,
   IPC_EVENT_UPDATER_STATUS,
   IPC_EVENT_WINDOW_MAXIMIZE,
   IPC_WINDOW_CLOSE,
+  IPC_WINDOW_CLOSE_CONFIRM,
   IPC_WINDOW_IS_MAXIMIZED,
   IPC_WINDOW_MINIMIZE,
   IPC_WINDOW_TOGGLE_MAXIMIZE,
   type AppStatusDto,
-  type BootDiagnosticDto
+  type BootDiagnosticDto,
+  type CloseActivityDto
 } from '../shared/ipc'
 import {
   appDataPaths,
@@ -1087,6 +1090,11 @@ function bootIpc(): void {
     // snapshot — provider/model/key changes take effect on the NEXT reasoning
     // call with no app restart.
     onSettingsChanged: () => providerRouter?.invalidate(),
+    // Close-guard: updater.install calls this before quitAndInstall so the
+    // update quit bypasses the running/connected close warning.
+    allowNextClose: () => {
+      forceClose = true
+    },
     // Full-stack reconnect (fix/stack-reconnect): the app.reconnect channel awaits
     // this. rebootStack is single-flight and never throws; the fresh AppStatusDto
     // it returns carries any re-boot failure in its diagnostics.
@@ -1184,6 +1192,33 @@ async function runRebootStack(): Promise<void> {
 }
 
 /**
+ * Close-guard (§21.11). When the user closes while a background job is running
+ * or a client is connected, we warn first (the window `close` interceptor in
+ * createWindow). `forceClose` is the escape hatch — set once the user confirms
+ * the warning, or once the updater is installing — so the next `close`
+ * proceeds. A null subsystem degrades to "not busy" (a normal, silent close).
+ */
+let forceClose = false
+/**
+ * True once app is quitting programmatically (updater install, OS shutdown,
+ * tests, or window-all-closed after a confirmed close). before-quit fires
+ * BEFORE the window `close` events, so the guard never blocks a quit that isn't
+ * the user's own direct window-close.
+ */
+let appQuitting = false
+
+function computeCloseActivity(): CloseActivityDto {
+  const queue = triggerInstances?.queue ?? null
+  const runningTaskId = queue?.runningTaskId ?? null
+  const counts = queue?.counts() ?? {}
+  const queued = (counts['pending'] ?? 0) + (counts['deferred'] ?? 0)
+  const connectionCount = mcpServer?.activeSessions().interactive ?? 0
+  const running = runningTaskId !== null
+  const connected = connectionCount > 0
+  return { running, runningTaskId, connected, connectionCount, queued, busy: running || connected }
+}
+
+/**
  * GLOBAL window-chrome handlers for the frameless title bar. Registered exactly
  * once (in whenReady, before createWindow) so macOS 'activate' re-creating the
  * window never double-registers the ipcMain.handle channel. Each resolves the
@@ -1202,6 +1237,11 @@ function registerWindowControlIpc(): void {
     else win.maximize()
   })
   ipcMain.on(IPC_WINDOW_CLOSE, (event) => {
+    BrowserWindow.fromWebContents(event.sender)?.close()
+  })
+  // The user confirmed the close-guard warning → close for real this time.
+  ipcMain.on(IPC_WINDOW_CLOSE_CONFIRM, (event) => {
+    forceClose = true
     BrowserWindow.fromWebContents(event.sender)?.close()
   })
   ipcMain.handle(IPC_WINDOW_IS_MAXIMIZED, (event) => BrowserWindow.fromWebContents(event.sender)?.isMaximized() ?? false)
@@ -1244,6 +1284,18 @@ function createWindow(): void {
   }
   win.on('maximize', () => sendMaximizeState(true))
   win.on('unmaximize', () => sendMaximizeState(false))
+
+  // Close-guard (§21.11): warn before closing while a job is running or a client
+  // is connected. Covers the custom title-bar button AND an OS close (Alt+F4 /
+  // taskbar) — both fire this one event. preventDefault + ask the renderer to
+  // show the warning; a confirmed close returns via IPC_WINDOW_CLOSE_CONFIRM.
+  win.on('close', (event) => {
+    if (forceClose || appQuitting) return
+    const activity = computeCloseActivity()
+    if (!activity.busy) return
+    event.preventDefault()
+    if (!win.isDestroyed()) win.webContents.send(IPC_EVENT_CLOSE_REQUEST, activity)
+  })
 
   win.webContents.setWindowOpenHandler((details) => {
     void shell.openExternal(details.url)
@@ -1371,6 +1423,13 @@ void app.whenReady().then(async () => {
 //    update installs on the NEXT ordinary quit; electron-updater's own quit hook
 //    launches the installer during this same teardown. The pre-migration backup +
 //    first-boot migration are proven end-to-end by scripts/smoke/packaged-smoke.mjs.
+// A programmatic quit (updater install, OS shutdown, tests, window-all-closed
+// after a confirmed close) fires before-quit BEFORE the window close events, so
+// the close-guard bypasses it — only a user's direct window-close is warned.
+app.on('before-quit', () => {
+  appQuitting = true
+})
+
 let quitting = false
 app.on('will-quit', (event) => {
   if (quitting) return

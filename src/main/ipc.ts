@@ -211,6 +211,12 @@ export interface IpcDeps {
    */
   readonly onSettingsChanged?: () => void
   /**
+   * Close-guard bypass: called by `updater.install` right before quitAndInstall
+   * so the update quit skips the running/connected close warning. Boot wires it
+   * to set the window `forceClose` flag; unset in test rigs (a no-op).
+   */
+  readonly allowNextClose?: () => void
+  /**
    * Phase-17 subscription runner — backs `runner.status` (health snapshot +
    * latest runner_runs row) and `runner.testConnection` (the manual 1-turn
    * canary, §3.7). Optional: null/absent when the runner did not boot (storage
@@ -1284,6 +1290,9 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       console.log('[updater] install deferred — deferring to autoInstallOnAppQuit on the next quit')
       return { ...updater.status(), installDeferred: true, detail: UPDATER_INSTALL_DEFERRED_DETAIL }
     }
+    // Close-guard: this quit is an update install, not a user close — bypass the
+    // running/connected warning so quitAndInstall's window close proceeds cleanly.
+    deps.allowNextClose?.()
     updater.quitAndInstall()
     return updater.status()
   })

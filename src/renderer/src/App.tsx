@@ -5,10 +5,10 @@
  * are plain-English per the redesign brief; testids are unchanged.
  */
 import { useCallback, useEffect, useState } from 'react'
-import type { IpcNodeLabel, RunnerStatusDto } from '../../shared/ipc'
+import type { CloseActivityDto, IpcNodeLabel, RunnerStatusDto } from '../../shared/ipc'
 import { call, useIpc } from './lib/ipc'
 import { plainStatus } from './lib/plain'
-import { Badge, Button, ToastProvider } from './ui/kit'
+import { Badge, Button, Modal, ToastProvider } from './ui/kit'
 import { Icon } from './ui/icons'
 import type { IconName } from './ui/icons'
 import TitleBar from './ui/TitleBar'
@@ -438,6 +438,64 @@ function NavItem({
   )
 }
 
+/**
+ * Close-guard warning (§21.11): main preventDefaults the window close while a
+ * job is running or a client is connected, and pushes what's active. Dismiss
+ * (Escape / backdrop / "Keep it open") leaves the window open; "Close anyway"
+ * confirms and main closes for real. Background jobs are durable — they resume
+ * next launch — so the copy reassures rather than alarms.
+ */
+function CloseGuardModal({ activity, onDismiss }: { activity: CloseActivityDto; onDismiss: () => void }): React.JSX.Element {
+  const confirmClose = (): void => {
+    onDismiss()
+    window.agenticOS.window.confirmClose()
+  }
+  return (
+    <Modal
+      title="Close Agentic OS?"
+      onClose={onDismiss}
+      footer={
+        <>
+          <Button onClick={onDismiss} testId="close-guard-keep">
+            Keep it open
+          </Button>
+          <Button variant="danger" onClick={confirmClose} testId="close-guard-confirm">
+            Close anyway
+          </Button>
+        </>
+      }
+    >
+      <p className="text-[13px] text-ink">Something is still active:</p>
+      <ul className="mt-2 flex flex-col gap-2 text-[13px] text-ink-mute">
+        {activity.connected && (
+          <li>
+            <span className="text-ink">Claude is connected</span>
+            {activity.connectionCount > 1 ? ` (${activity.connectionCount} sessions)` : ''} — closing ends its connection to your
+            memory and tools.
+          </li>
+        )}
+        {activity.running && (
+          <li>
+            <span className="text-ink">A background job is running</span>
+            {activity.runningTaskId !== null && (
+              <>
+                {' '}
+                (<span className="font-mono text-[11px]">{activity.runningTaskId}</span>)
+              </>
+            )}{' '}
+            — it will pick up where it left off next time you open the app.
+          </li>
+        )}
+      </ul>
+      {activity.queued > 0 && (
+        <p className="mt-2 text-[12px] text-ink-mute">
+          {activity.queued} more {activity.queued === 1 ? 'job is' : 'jobs are'} queued — they&apos;ll resume next launch.
+        </p>
+      )}
+    </Modal>
+  )
+}
+
 export default function App(): React.JSX.Element {
   const [active, setActive] = useState<PanelKey>('home')
   // R3 one-shot deep-link target: set by onInspect, consumed + cleared by MemoryPanel.
@@ -446,6 +504,11 @@ export default function App(): React.JSX.Element {
   const drift = usePolledCount(fetchDriftCount)
   const { status: runnerStatus, refresh: refreshRunner } = useRunnerStatus()
   const ActivePanel = PANELS[active].component
+
+  // Close-guard (§21.11): main pushes CloseActivityDto when it blocks a close
+  // (a job is running or a client is connected); we warn before closing.
+  const [closeRequest, setCloseRequest] = useState<CloseActivityDto | null>(null)
+  useEffect(() => window.agenticOS.window.onCloseRequest(setCloseRequest), [])
 
   // Route to Memory and open a node's inspector (Approvals source chips, etc.).
   const onInspect = useCallback((target: InspectTarget) => {
@@ -525,6 +588,7 @@ export default function App(): React.JSX.Element {
           </main>
         </div>
       </div>
+      {closeRequest !== null && <CloseGuardModal activity={closeRequest} onDismiss={() => setCloseRequest(null)} />}
     </ToastProvider>
   )
 }
