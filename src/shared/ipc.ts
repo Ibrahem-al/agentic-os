@@ -1020,6 +1020,18 @@ export interface UpdaterStatusDto {
   /** Why the updater is 'disabled' (dev build / unavailable). */
   readonly detail?: string
   /**
+   * Patch notes for the available/downloaded version — the GitHub release body,
+   * normalized to a single UNTRUSTED plain/markdown string (an Array of
+   * per-version notes is joined newest-first). Absent when the release carries no
+   * notes. Rendered as escaped text (never injected as HTML). Carried across the
+   * available → downloading → downloaded transitions so it is present at install.
+   */
+  readonly releaseNotes?: string
+  /** The release's human title (e.g. "0.1.16 — Patch notes in updates"), when set. */
+  readonly releaseName?: string
+  /** The release's ISO date, when set. */
+  readonly releaseDate?: string
+  /**
    * Set by `updater.install` when the install was DEFERRED because a write was
    * still in flight after the quiesce bound (§21.9 crash-safety). The state stays
    * 'downloaded' (additive — the renderer switch is unchanged); the downloaded

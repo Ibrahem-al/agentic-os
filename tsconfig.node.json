@@ -32,6 +32,7 @@
     "src/renderer/src/lib/nodeSummary.ts",
     "src/renderer/src/lib/format.ts",
     "src/renderer/src/lib/cron.ts",
+    "src/renderer/src/lib/releaseNotesParser.ts",
     "src/renderer/src/ui/graph/model.ts",
     "src/renderer/src/ui/graph/colors.ts"
   ],

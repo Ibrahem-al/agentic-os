@@ -233,6 +233,85 @@ describe('bootUpdater — controller lifecycle (Settings "Updates")', () => {
   })
 })
 
+describe('bootUpdater — release notes (patch notes)', () => {
+  const boot = (): ReturnType<typeof fakeUpdater> => fakeUpdater()
+
+  it('surfaces string release notes on update-available and update-downloaded', () => {
+    const updater = boot()
+    const controller = bootUpdater({ isPackaged: true, updater })
+    updater.emit('update-available', { version: '2.0.0', releaseNotes: '- fixed a crash', releaseName: 'Big fixes' })
+    expect(controller.status()).toMatchObject({ state: 'downloading', releaseNotes: '- fixed a crash', releaseName: 'Big fixes' })
+    updater.emit('update-downloaded', { version: '2.0.0', releaseNotes: '- fixed a crash' })
+    expect(controller.status().releaseNotes).toBe('- fixed a crash')
+  })
+
+  it('joins an Array of per-version notes newest-first and skips null-note entries', () => {
+    const updater = boot()
+    const controller = bootUpdater({ isPackaged: true, updater })
+    updater.emit('update-available', {
+      version: '2.0.0',
+      releaseNotes: [
+        { version: '2.0.0', note: 'two point oh' },
+        { version: '1.9.0', note: null },
+        { version: '1.8.0', note: 'one point eight' }
+      ]
+    })
+    const notes = controller.status().releaseNotes ?? ''
+    expect(notes).toContain('## 2.0.0')
+    expect(notes).toContain('two point oh')
+    expect(notes).toContain('## 1.8.0')
+    expect(notes).toContain('one point eight')
+    expect(notes).not.toContain('1.9.0') // the null-note version is dropped
+  })
+
+  it('strips HTML from a body (untrusted) — no angle brackets survive', () => {
+    const updater = boot()
+    const controller = bootUpdater({ isPackaged: true, updater })
+    updater.emit('update-available', { version: '2.0.0', releaseNotes: '<p>Hello</p><script>bad()</script>' })
+    const notes = controller.status().releaseNotes ?? ''
+    expect(notes).toContain('Hello')
+    expect(notes).not.toContain('<')
+    expect(notes).not.toContain('>')
+  })
+
+  it('truncates an over-cap body with a trailing ellipsis', () => {
+    const updater = boot()
+    const controller = bootUpdater({ isPackaged: true, updater })
+    updater.emit('update-available', { version: '2.0.0', releaseNotes: 'x'.repeat(10_001) })
+    const notes = controller.status().releaseNotes ?? ''
+    expect(notes.endsWith('…')).toBe(true)
+    expect(notes.length).toBeLessThanOrEqual(10_010)
+  })
+
+  it('carries the notes across update-available → download-progress → update-downloaded', () => {
+    const updater = boot()
+    const controller = bootUpdater({ isPackaged: true, updater })
+    updater.emit('update-available', { version: '2.0.0', releaseNotes: '- kept through download' })
+    updater.emit('download-progress', { percent: 40, bytesPerSecond: 1000 }) // no notes in this payload
+    expect(controller.status().releaseNotes).toBe('- kept through download')
+    updater.emit('update-downloaded', { version: '2.0.0' }) // no notes in this payload either
+    expect(controller.status()).toMatchObject({ state: 'downloaded', releaseNotes: '- kept through download' })
+  })
+
+  it('drops the notes once there is no pending update (up-to-date)', () => {
+    const updater = boot()
+    const controller = bootUpdater({ isPackaged: true, updater })
+    updater.emit('update-available', { version: '2.0.0', releaseNotes: 'stale' })
+    updater.emit('update-not-available', { version: '2.0.0' })
+    expect(controller.status().releaseNotes).toBeUndefined()
+  })
+
+  it('omits the field for malformed / absent notes (never throws)', () => {
+    const updater = boot()
+    const controller = bootUpdater({ isPackaged: true, updater })
+    for (const bad of [{ version: '1.0.0', releaseNotes: 42 }, { version: '1.0.0', releaseNotes: null }, { version: '1.0.0' }]) {
+      updater.emit('update-available', bad)
+      expect(controller.status().releaseNotes).toBeUndefined()
+      expect(controller.status().version).toBe('1.0.0')
+    }
+  })
+})
+
 describe('quiesceForInstall — pre-install drain (§21.9 G5+G6)', () => {
   /**
    * A fake storage engine whose lane goes idle after `idleAfter` laneIdle()

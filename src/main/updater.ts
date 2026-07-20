@@ -95,6 +95,84 @@ function versionField(payload: unknown): { version: string } | Record<string, ne
   return version !== 'unknown' ? { version } : {}
 }
 
+/**
+ * Bound on normalized release-notes text carried in every updater snapshot push
+ * (including throttled download-progress ticks) so a giant GitHub release body
+ * can never bloat IPC. Truncated notes end with a "…" line. Rule-12 pick.
+ */
+const RELEASE_NOTES_MAX_CHARS = 10_000
+
+/**
+ * Strip HTML from a release body (electron-updater's GitHub provider delivers
+ * HTML in some versions) — the notes are UNTRUSTED. Block-closing tags become
+ * newlines, every other tag is deleted, then the five common entities are
+ * decoded (&amp; LAST so a decoded tag can't re-form one). Pure string ops — the
+ * renderer additionally escapes the result, so this is defense-in-depth, not the
+ * sole guard. Any leftover encoded tag simply shows as literal text.
+ */
+function stripReleaseHtml(text: string): string {
+  return text
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|h[1-6])>/gi, '\n')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/\n{3,}/g, '\n\n')
+}
+
+/**
+ * Normalize electron-updater's `UpdateInfo.releaseNotes` (string | Array<{version,
+ * note}> | null | odd shapes) into one UNTRUSTED string, newest-version-first.
+ * Defensive: never throws on a malformed payload (the updater must not crash).
+ * HTML-stripped + length-capped here; the renderer escapes it as text too.
+ */
+function releaseNotesOf(payload: unknown): string | undefined {
+  if (typeof payload !== 'object' || payload === null || !('releaseNotes' in payload)) return undefined
+  const raw = (payload as { releaseNotes: unknown }).releaseNotes
+  let text: string
+  if (typeof raw === 'string') {
+    text = raw
+  } else if (Array.isArray(raw)) {
+    // Array<{ version, note }> for several skipped versions — keep the feed's
+    // order (electron-updater lists newest first) and label each block.
+    text = raw
+      .map((entry) => {
+        const e = (typeof entry === 'object' && entry !== null ? entry : {}) as Record<string, unknown>
+        const v = typeof e['version'] === 'string' ? e['version'] : ''
+        const note = typeof e['note'] === 'string' ? e['note'] : ''
+        if (note.trim() === '') return ''
+        return v !== '' ? `## ${v}\n${note}` : note
+      })
+      .filter((s) => s !== '')
+      .join('\n\n')
+  } else {
+    return undefined
+  }
+  const cleaned = stripReleaseHtml(text).trim()
+  if (cleaned === '') return undefined
+  return cleaned.length > RELEASE_NOTES_MAX_CHARS ? `${cleaned.slice(0, RELEASE_NOTES_MAX_CHARS)}\n\n…` : cleaned
+}
+
+/** A string field from the payload, omitted when absent/blank (exactOptional spread). */
+function stringField<K extends string>(key: K, payload: unknown, sourceKey: string): Record<K, string> | Record<string, never> {
+  if (typeof payload !== 'object' || payload === null) return {}
+  const v = (payload as Record<string, unknown>)[sourceKey]
+  return typeof v === 'string' && v.trim() !== '' ? ({ [key]: v } as Record<K, string>) : {}
+}
+
+/** The release-metadata fields (notes/name/date) for an update-available/downloaded payload. */
+function releaseMetaFields(payload: unknown): Partial<UpdaterStatusDto> {
+  const notes = releaseNotesOf(payload)
+  return {
+    ...(notes !== undefined ? { releaseNotes: notes } : {}),
+    ...stringField('releaseName', payload, 'releaseName'),
+    ...stringField('releaseDate', payload, 'releaseDate')
+  }
+}
+
 /** Finite-number field extractor for the exactOptionalPropertyTypes spread pattern. */
 function numberField<K extends string>(key: K, value: unknown): Record<K, number> | Record<string, never> {
   return typeof value === 'number' && Number.isFinite(value) ? ({ [key]: value } as Record<K, number>) : {}
@@ -210,6 +288,10 @@ export function bootUpdater(deps: BootUpdaterDeps = {}): UpdaterController {
   let snapshot: UpdaterStatusDto = { state: 'idle' }
   const listeners = new Set<(status: UpdaterStatusDto) => void>()
   let lastProgressAt = 0
+  // Release notes/name/date captured on update-available, re-applied to every
+  // download-progress tick (which only carries numbers) so the notes stay visible
+  // right through to the 'downloaded' state where the user reads them before restart.
+  let releaseMeta: Partial<UpdaterStatusDto> = {}
 
   const notify = (): void => {
     for (const cb of listeners) cb(snapshot)
@@ -281,18 +363,25 @@ export function bootUpdater(deps: BootUpdaterDeps = {}): UpdaterController {
     updater.autoInstallOnAppQuit = true
     // Quiet ticks (no log): checking / not-available / download-progress.
     updater.on('checking-for-update', () => setSnapshot({ state: 'checking' }))
-    updater.on('update-not-available', (info) => setSnapshot({ state: 'up-to-date', ...versionField(info) }))
+    updater.on('update-not-available', (info) => {
+      releaseMeta = {}
+      setSnapshot({ state: 'up-to-date', ...versionField(info) })
+    })
     updater.on('download-progress', (p) =>
-      setSnapshot({ state: 'downloading', ...progressFields(p, snapshot.version) }, true)
+      setSnapshot({ state: 'downloading', ...progressFields(p, snapshot.version), ...releaseMeta }, true)
     )
     // Logged transitions (preserve the phase-13 background log lines).
     updater.on('update-available', (info) => {
       log(`[updater] update available: v${versionOf(info)} — downloading in background`)
-      setSnapshot({ state: 'downloading', ...versionField(info) })
+      releaseMeta = releaseMetaFields(info) // captured once; re-applied to every progress tick
+      setSnapshot({ state: 'downloading', ...versionField(info), ...releaseMeta })
     })
     updater.on('update-downloaded', (info) => {
       log(`[updater] update downloaded: v${versionOf(info)} — installs on quit`)
-      setSnapshot({ state: 'downloaded', percent: 100, ...versionField(info) })
+      // Prefer the downloaded payload's notes; fall back to what update-available captured.
+      const downloadedMeta = releaseMetaFields(info)
+      releaseMeta = downloadedMeta.releaseNotes !== undefined ? downloadedMeta : { ...releaseMeta, ...downloadedMeta }
+      setSnapshot({ state: 'downloaded', percent: 100, ...versionField(info), ...releaseMeta })
     })
     updater.on('error', (err) => {
       log(`[updater] error: ${String(err)}`)

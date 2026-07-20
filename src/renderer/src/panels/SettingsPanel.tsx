@@ -21,6 +21,7 @@ import type {
 } from '../../../shared/ipc'
 import { call, IpcError, useIpc } from '../lib/ipc'
 import { plainBackend, plainBytes, plainStatus } from '../lib/plain'
+import { ReleaseNotes } from '../lib/releaseNotes'
 import { Icon } from '../ui/icons'
 import {
   Badge,
@@ -54,6 +55,23 @@ const RUNNER_DEFAULTS: RunnerSettingsDto = {
 
 /** Claude CLI model aliases offered in the runner model select. */
 const RUNNER_MODEL_OPTIONS = ['sonnet', 'opus', 'haiku'] as const
+
+/**
+ * The muted "release name · date" line above the patch notes — the release name
+ * only when it adds something over the bare version, and the date only when it
+ * parses (the one renderer-side date parse, guarded). Null ⇒ render no line.
+ */
+function releaseNotesHeader(u: UpdaterStatusDto): string | null {
+  const parts: string[] = []
+  const name = u.releaseName?.trim()
+  const bare = (s: string): string => s.toLowerCase().replace(/^v/, '')
+  if (name !== undefined && name !== '' && (u.version === undefined || bare(name) !== bare(u.version))) parts.push(name)
+  if (u.releaseDate !== undefined) {
+    const d = new Date(u.releaseDate)
+    if (!Number.isNaN(d.getTime())) parts.push(d.toLocaleDateString())
+  }
+  return parts.length > 0 ? parts.join(' · ') : null
+}
 
 /**
  * The three places background reasoning can run — the "AI processing" radio.
@@ -1371,6 +1389,29 @@ export default function SettingsPanel(): React.JSX.Element {
                 {updater.detail ?? 'The app is finishing a write — the update will install when you next close it.'}
               </p>
             )}
+
+            {/* What's new — the release notes for the update being downloaded /
+                ready to install, so the user can read them before restarting.
+                Collapsed by default; hidden entirely when the release carries no
+                notes (the common case while the repo is private → today's UI). */}
+            {(updState === 'downloading' || updState === 'downloaded') &&
+              updater?.releaseNotes !== undefined &&
+              updater.releaseNotes.trim() !== '' && (
+                <Disclosure
+                  key={updater.version ?? 'notes'}
+                  summary={`What's new${updater.version !== undefined ? ` in v${updater.version}` : ''}`}
+                  testId="updater-release-notes"
+                >
+                  <div className="flex flex-col gap-2">
+                    {releaseNotesHeader(updater) !== null && (
+                      <div className="text-[11px] text-ink-mute">{releaseNotesHeader(updater)}</div>
+                    )}
+                    <div className="max-h-64 overflow-y-auto">
+                      <ReleaseNotes text={updater.releaseNotes} />
+                    </div>
+                  </div>
+                </Disclosure>
+              )}
 
             {/* Actions: hidden entirely when auto-update is unavailable (dev build). */}
             {updState !== 'disabled' && (
