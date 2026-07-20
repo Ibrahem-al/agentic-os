@@ -24,6 +24,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type {
+  DedupeScanOptionsDto,
+  DedupeScanScope,
+  DedupeScanStatusDto,
   IpcEdgeType,
   IpcNodeLabel,
   JsonObject,
@@ -874,13 +877,26 @@ function reportOnlyHint(label: IpcNodeLabel): string {
   return `${label} items can't be auto-merged here.`
 }
 
-type DedupeScanState =
-  | { readonly phase: 'loading' }
-  | { readonly phase: 'error'; readonly error: IpcError }
-  | { readonly phase: 'ready'; readonly groups: readonly MemoryDuplicateGroupDto[]; readonly truncated: boolean }
-
 function dedupeGroupKey(group: MemoryDuplicateGroupDto): string {
   return `${group.label}:${group.suggestedKeepId}`
+}
+
+/** Default node budget for the "a set number" scope (mirrors DEDUPE_COUNT_DEFAULT). */
+const DEDUPE_COUNT_DEFAULT_UI = 500
+
+/** Plain-language scope choices for the background scan. */
+const DEDUPE_SCOPE_OPTIONS: readonly { value: DedupeScanScope; label: string }[] = [
+  { value: 'recent', label: 'Recently changed — fastest' },
+  { value: 'count', label: 'A set number of memories' },
+  { value: 'all', label: 'Everything — slowest' }
+]
+
+/** One plain sentence describing what a completed scan actually compared. */
+function dedupeScopeSummary(status: DedupeScanStatusDto): string {
+  if (status.lastScope === 'count') return `Compared your newest ${status.lastCount ?? DEDUPE_COUNT_DEFAULT_UI} memories.`
+  if (status.lastScope === 'all') return 'Compared your entire memory.'
+  if (status.lastScope === 'recent') return 'Compared the memories that changed since your last check.'
+  return ''
 }
 
 function DedupeGroupCard({
@@ -995,28 +1011,76 @@ function DedupeModal({
   onChanged: () => void
 }): React.JSX.Element {
   const toast = useToast()
-  const [scan, setScan] = useState<DedupeScanState>({ phase: 'loading' })
+  const [status, setStatus] = useState<DedupeScanStatusDto | null>(null)
+  const [loadError, setLoadError] = useState<IpcError | null>(null)
+  const [scope, setScope] = useState<DedupeScanScope>('recent')
+  const [countText, setCountText] = useState(String(DEDUPE_COUNT_DEFAULT_UI))
   const [keepers, setKeepers] = useState<Record<string, string>>({})
   const [confirming, setConfirming] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [starting, setStarting] = useState(false)
 
-  const runScan = useCallback(async (): Promise<void> => {
-    setScan({ phase: 'loading' })
-    setConfirming(null)
-    try {
-      const res = await call('memory.dedupe.scan', {})
-      const seed: Record<string, string> = {}
-      for (const group of res.groups) seed[dedupeGroupKey(group)] = group.suggestedKeepId
-      setKeepers(seed)
-      setScan({ phase: 'ready', groups: res.groups, truncated: res.truncated })
-    } catch (err) {
-      setScan({ phase: 'error', error: toIpcError(err) })
+  // Seed a keeper choice for any group we haven't seen yet (keeps a user's pick
+  // across the progress re-renders that arrive while a scan runs).
+  const applyStatus = useCallback((s: DedupeScanStatusDto): void => {
+    setStatus(s)
+    setLoadError(null)
+    const groups = s.lastResult?.groups
+    if (groups !== undefined) {
+      setKeepers((old) => {
+        const seed = { ...old }
+        for (const g of groups) {
+          const key = dedupeGroupKey(g)
+          if (!(key in seed)) seed[key] = g.suggestedKeepId
+        }
+        return seed
+      })
     }
   }, [])
 
+  // Read the current status on open, then ride live pushes — the scan runs in
+  // main and survives this modal closing, so reopening shows its progress/result.
   useEffect(() => {
-    void runScan()
-  }, [runScan])
+    let alive = true
+    void call('memory.dedupe.status', undefined).then(
+      (s) => {
+        if (alive) applyStatus(s)
+      },
+      (err) => {
+        if (alive) setLoadError(toIpcError(err))
+      }
+    )
+    const unsub = window.agenticOS.onDedupeStatus((s) => applyStatus(s))
+    return () => {
+      alive = false
+      unsub()
+    }
+  }, [applyStatus])
+
+  const startScan = useCallback(async (): Promise<void> => {
+    setStarting(true)
+    setConfirming(null)
+    try {
+      const parsed = Math.trunc(Number(countText))
+      const options: DedupeScanOptionsDto = {
+        scope,
+        ...(scope === 'count' ? { count: Number.isFinite(parsed) && parsed > 0 ? parsed : DEDUPE_COUNT_DEFAULT_UI } : {})
+      }
+      applyStatus(await call('memory.dedupe.scanStart', options))
+    } catch (err) {
+      toast.notify('err', toIpcError(err).message)
+    } finally {
+      setStarting(false)
+    }
+  }, [applyStatus, countText, scope, toast])
+
+  const cancelScan = useCallback(async (): Promise<void> => {
+    try {
+      applyStatus(await call('memory.dedupe.cancel', undefined))
+    } catch (err) {
+      toast.notify('err', toIpcError(err).message)
+    }
+  }, [applyStatus, toast])
 
   const merge = useCallback(
     async (group: MemoryDuplicateGroupDto, keepId: string): Promise<void> => {
@@ -1027,36 +1091,103 @@ function DedupeModal({
         const result = await call('memory.dedupe.merge', { label: group.label, keepId, removeIds })
         notifyUndoable(result.auditActionId, `Merged ${plural(result.removed, 'duplicate')} — undo available in History`)
         onChanged()
-        await runScan()
+        await startScan() // re-scan for fresh results (the merged nodes are gone)
       } catch (err) {
         toast.notify('err', toIpcError(err).message)
       } finally {
         setBusy(false)
       }
     },
-    [notifyUndoable, onChanged, runScan, toast]
+    [notifyUndoable, onChanged, startScan, toast]
   )
 
-  let body: ReactNode
-  if (scan.phase === 'loading') {
-    body = (
+  const running = status?.phase === 'running'
+  const groups = status?.lastResult?.groups ?? []
+  const progress = status?.running
+
+  // ── scan controls (scope picker + Start/Cancel) ──
+  const controls = (
+    <div className="flex flex-col gap-2 rounded-md border border-line bg-surface px-3 py-3">
+      <div className="flex flex-wrap items-end gap-3">
+        <Select
+          label="What to check"
+          ariaLabel="duplicate scan scope"
+          testId="dedupe-scope"
+          value={scope}
+          onChange={(v) => setScope(v as DedupeScanScope)}
+          options={DEDUPE_SCOPE_OPTIONS}
+        />
+        {scope === 'count' && (
+          <TextInput
+            label="How many"
+            ariaLabel="number of memories to check"
+            testId="dedupe-count"
+            width="w-24"
+            value={countText}
+            onChange={setCountText}
+            onEnter={() => void startScan()}
+          />
+        )}
+        <div className="ml-auto flex gap-1.5">
+          {running ? (
+            <Button testId="dedupe-cancel" onClick={() => void cancelScan()}>
+              Stop
+            </Button>
+          ) : (
+            <Button variant="primary" testId="dedupe-scan-start" disabled={starting} onClick={() => void startScan()}>
+              {status?.lastResult !== undefined ? 'Scan again' : 'Scan'}
+            </Button>
+          )}
+        </div>
+      </div>
+      <p className="text-[12px] leading-5 text-ink-mute">
+        {scope === 'recent'
+          ? 'Only the memories that changed since your last check — quick, and ideal right after importing projects.'
+          : scope === 'count'
+            ? 'Only your most recently updated memories, up to the number you set.'
+            : 'Every memory in the database. Thorough, but can take a while on a large graph.'}
+      </p>
+      {running && (
+        <div className="rounded-md bg-raised px-3 py-2 text-[12px] leading-5" role="status" data-testid="dedupe-progress">
+          Checking{progress?.currentLabel ? ` ${progress.currentLabel.toLowerCase()}s` : ''}…{' '}
+          {progress !== undefined && progress.totalNodes > 0
+            ? `${Math.min(progress.scannedNodes, progress.totalNodes)} of ${progress.totalNodes} memories`
+            : `${progress?.scannedNodes ?? 0} memories`}
+          . You can close this window — it keeps going in the background.
+        </div>
+      )}
+    </div>
+  )
+
+  // ── results (the last completed scan; stays visible while a new one runs) ──
+  let results: ReactNode = null
+  if (loadError !== null) {
+    results = <ErrorState error={loadError} onRetry={() => void startScan()} />
+  } else if (status === null) {
+    results = (
       <p className="py-2 text-[13px] text-ink-mute" role="status">
-        Comparing everything it knows…
+        Loading…
       </p>
     )
-  } else if (scan.phase === 'error') {
-    body = <ErrorState error={scan.error} onRetry={() => void runScan()} />
-  } else if (scan.groups.length === 0) {
-    body = <EmptyState icon={<Icon name="check" size={20} />}>No duplicates found — memory looks clean.</EmptyState>
-  } else {
-    body = (
+  } else if (status.phase === 'error' && status.error !== undefined) {
+    results = <ErrorState error={new IpcError('INTERNAL', status.error.message)} onRetry={() => void startScan()} />
+  } else if (groups.length > 0) {
+    results = (
       <div className="flex flex-col gap-3">
-        {scan.truncated && (
+        <div className="flex flex-wrap items-center gap-x-2 text-[12px] text-ink-mute">
+          <span>{dedupeScopeSummary(status)}</span>
+          {status.lastScope === 'recent' && status.effectiveCutoff !== undefined && (
+            <span>
+              (since <Timestamp iso={status.effectiveCutoff} />)
+            </span>
+          )}
+        </div>
+        {status.lastResult?.truncated === true && (
           <p className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-5">
-            Only part of memory was scanned (it&apos;s large) — run again after merging.
+            Memory is large, so only part of it was compared — merge these, then scan again (or narrow the scope).
           </p>
         )}
-        {scan.groups.map((group, i) => {
+        {groups.map((group, i) => {
           const key = dedupeGroupKey(group)
           return (
             <DedupeGroupCard
@@ -1064,7 +1195,7 @@ function DedupeModal({
               group={group}
               index={i}
               keepId={keepers[key] ?? group.suggestedKeepId}
-              busy={busy}
+              busy={busy || running}
               confirming={confirming === key}
               onPickKeeper={(id) => setKeepers((old) => ({ ...old, [key]: id }))}
               onStartMerge={() => setConfirming(key)}
@@ -1075,30 +1206,43 @@ function DedupeModal({
         })}
       </div>
     )
+  } else if (!running && (status.phase === 'done' || status.lastResult !== undefined)) {
+    // A completed scan that found nothing — keep it scope-specific so a narrow
+    // "recent" scan isn't misread as a clean bill for the whole database.
+    results = (
+      <EmptyState icon={<Icon name="check" size={20} />}>
+        {status.lastScope === 'recent'
+          ? 'No duplicates among the memories that changed since your last check.'
+          : status.lastScope === 'count'
+            ? 'No duplicates among the memories checked.'
+            : 'No duplicates found — memory looks clean.'}
+      </EmptyState>
+    )
+  } else if (!running) {
+    results = (
+      <EmptyState icon={<Icon name="search" size={20} />}>Run a scan to check your memory for duplicates.</EmptyState>
+    )
   }
 
-  const canRescan = scan.phase !== 'loading'
   return (
     <Modal
       title="Find duplicates"
       onClose={onClose}
       wide
       footer={
-        <>
-          <Button disabled={!canRescan || busy} onClick={() => void runScan()}>
-            Scan again
-          </Button>
-          <Button variant="primary" onClick={onClose}>
-            Done
-          </Button>
-        </>
+        <Button variant="primary" onClick={onClose}>
+          Done
+        </Button>
       }
     >
       <p className="mb-3 text-[12px] leading-5 text-ink-mute">
         Memories that say almost the same thing. Pick the one to keep — its connections stay and the duplicates fold into
         it. Every merge is undoable from History.
       </p>
-      {body}
+      <div className="flex flex-col gap-3">
+        {controls}
+        {results}
+      </div>
     </Modal>
   )
 }

@@ -124,8 +124,8 @@ import {
   deleteMemoryNode,
   mergeDuplicates,
   MemoryEditError,
-  scanDuplicates,
   updateMemoryNode,
+  type DedupeScanController,
   type MemoryEditDeps
 } from './memory'
 import {
@@ -203,6 +203,8 @@ export interface IpcDeps {
    *  so a fresh toggle sticks in the UI without waiting for the restart. */
   readonly mcpLanUrl?: string | null
   readonly triggers: IpcTriggerDeps | null
+  /** Background duplicate-scan controller (memory.dedupe.scanStart/cancel/status). Omitted in minimal test rigs. */
+  readonly dedupeController?: DedupeScanController | null
   readonly userDataDir: string
   readonly subsystems: AppStatusDto['subsystems']
   /**
@@ -369,7 +371,8 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     audit: (): AuditLog => deps.audit ?? raiseUnavailable('the audit log'),
     ollama: (): OllamaClient => deps.ollama ?? raiseUnavailable('the model layer'),
     reranker: (): Reranker => deps.reranker ?? raiseUnavailable('the reranker'),
-    keychain: (): Keychain => deps.keychain ?? raiseUnavailable('the keychain')
+    keychain: (): Keychain => deps.keychain ?? raiseUnavailable('the keychain'),
+    dedupeController: (): DedupeScanController => deps.dedupeController ?? raiseUnavailable('the duplicate scanner')
   }
   function raiseUnavailable(what: string): never {
     throw new UnavailableError(what)
@@ -481,15 +484,13 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   // ── memory deduplication (scan is read-only; merge is one audited lane job) ──
 
-  register('memory.dedupe.scan', ({ labels, threshold }) =>
-    scanDuplicates(
-      { engine: need.engine() },
-      {
-        ...(labels !== undefined ? { labels } : {}),
-        ...(threshold !== undefined ? { threshold } : {})
-      }
-    )
-  )
+  // The scan runs in the BACKGROUND (main-side controller) so it survives the
+  // modal closing; start/cancel return the fresh status, and progress rides
+  // IPC_EVENT_DEDUPE_STATUS. status() is read on modal open (shows the last
+  // completed result, even after a restart).
+  register('memory.dedupe.scanStart', (options) => Promise.resolve(need.dedupeController().start(options)))
+  register('memory.dedupe.cancel', () => Promise.resolve(need.dedupeController().cancel()))
+  register('memory.dedupe.status', () => Promise.resolve(need.dedupeController().snapshot()))
 
   register('memory.dedupe.merge', ({ label, keepId, removeIds }) =>
     mergeDuplicates({ engine: need.engine(), audit: need.audit(), actor: DASHBOARD_USER }, { label, keepId, removeIds })

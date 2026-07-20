@@ -26,6 +26,7 @@ export {
 export {
   DEDUPE_LABELS,
   DEDUPE_MERGE_LABELS,
+  DedupeScanAbortedError,
   mergeDuplicates,
   planDedupeMerge,
   scanDuplicates,
@@ -34,9 +35,17 @@ export {
   type DedupeMergeLabel,
   type DedupeMergePlan,
   type DedupeScanDeps,
+  type DedupeScanProgress,
+  type DedupeScope,
   type DuplicateGroup,
   type DuplicateNode,
   type MergeDuplicatesResult,
   type ScanDuplicatesOptions,
   type ScanDuplicatesResult
 } from './dedupe'
+export {
+  DedupeScanController,
+  type DedupeScanControllerDeps,
+  type DedupeScanStatus,
+  type DedupeScanStartOptions
+} from './dedupeController'

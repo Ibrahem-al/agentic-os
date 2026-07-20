@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import {
   IPC_EVENT_CLOSE_REQUEST,
+  IPC_EVENT_DEDUPE_STATUS,
   IPC_EVENT_INGEST_PROGRESS,
   IPC_EVENT_OLLAMA_PULL,
   IPC_EVENT_UPDATER_STATUS,
@@ -12,6 +13,7 @@ import {
   IPC_WINDOW_MINIMIZE,
   IPC_WINDOW_TOGGLE_MAXIMIZE,
   type CloseActivityDto,
+  type DedupeScanStatusDto,
   type IngestProgressEventDto,
   type IpcChannel,
   type IpcRequest,
@@ -51,6 +53,8 @@ const api = {
   onOllamaPull: subscribe<OllamaPullProgressDto>(IPC_EVENT_OLLAMA_PULL),
   /** Subscribe to auto-updater status pushes (Settings "Updates"); returns unsubscribe. */
   onUpdaterStatus: subscribe<UpdaterStatusDto>(IPC_EVENT_UPDATER_STATUS),
+  /** Subscribe to background duplicate-scan status/progress pushes; returns unsubscribe. */
+  onDedupeStatus: subscribe<DedupeScanStatusDto>(IPC_EVENT_DEDUPE_STATUS),
   /**
    * Window-chrome commands for the frameless title bar. Bespoke channels (not
    * the IpcChannels invoke map): OS window commands + chrome state, not DTOs.

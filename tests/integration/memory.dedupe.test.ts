@@ -24,6 +24,7 @@ import { EMBEDDING_DIM } from '../../src/main/config'
 import {
   DEDUPE_LABELS,
   DEDUPE_MERGE_LABELS,
+  DedupeScanAbortedError,
   MemoryEditError,
   mergeDuplicates,
   scanDuplicates,
@@ -178,6 +179,89 @@ describe('scanDuplicates', () => {
 
   it('DEDUPE_LABELS mirrors the retrievable labels + Tag (no drift)', () => {
     expect([...DEDUPE_LABELS]).toEqual([...RETRIEVABLE_LABELS, 'Tag'])
+  })
+})
+
+// ── scope + cost controls (recent / count / near-off) ────────────────────────────
+//
+// All over the Knowledge label with hand-set updated_at, so a scope filter is
+// observable. Layout (older → newer):
+//   alpha  sc-a1(OLD1) sc-a2(OLD2)   — exact dup, BOTH old
+//   beta   sc-b1(OLD2) sc-b2(NEW3)   — exact dup spanning the cutoff (recent-vs-OLD)
+//   gamma  sc-n1(NEW1) sc-n2(NEW2)   — NEAR dup, both recent
+
+describe('scanDuplicates scope + cost controls', () => {
+  const OLD1 = '2024-01-01T00:00:00.000Z'
+  const OLD2 = '2024-02-01T00:00:00.000Z'
+  const MID = '2024-06-01T00:00:00.000Z'
+  const NEW1 = '2024-10-01T00:00:00.000Z'
+  const NEW2 = '2024-11-01T00:00:00.000Z'
+  const NEW3 = '2024-12-01T00:00:00.000Z'
+
+  const setUpdatedAt = async (id: string, iso: string): Promise<void> => {
+    await store.engine.cypher('MATCH (n:Knowledge {id: $id}) SET n.updated_at = timestamp($ts)', { id, ts: iso })
+  }
+
+  beforeAll(async () => {
+    const e = store.engine
+    await e.upsertNode('Knowledge', { id: 'sc-a1', content: 'alpha note', embedding: basisEmbedding(EMBEDDING_DIM, 70) })
+    await e.upsertNode('Knowledge', { id: 'sc-a2', content: 'alpha note', embedding: basisEmbedding(EMBEDDING_DIM, 70) })
+    await e.upsertNode('Knowledge', { id: 'sc-b1', content: 'beta note', embedding: basisEmbedding(EMBEDDING_DIM, 71) })
+    await e.upsertNode('Knowledge', { id: 'sc-b2', content: 'beta note', embedding: basisEmbedding(EMBEDDING_DIM, 71) })
+    await e.upsertNode('Knowledge', { id: 'sc-n1', content: 'gamma release plan', embedding: basisEmbedding(EMBEDDING_DIM, 72) })
+    await e.upsertNode('Knowledge', { id: 'sc-n2', content: 'the gamma release schedule', embedding: blendEmbedding(EMBEDDING_DIM, 72, 73, 0.85) })
+    await setUpdatedAt('sc-a1', OLD1)
+    await setUpdatedAt('sc-a2', OLD2)
+    await setUpdatedAt('sc-b1', OLD2)
+    await setUpdatedAt('sc-b2', NEW3)
+    await setUpdatedAt('sc-n1', NEW1)
+    await setUpdatedAt('sc-n2', NEW2)
+  })
+
+  it('near:false runs the cheap exact-only pass — exact groups, zero near work', async () => {
+    const res = await scanDuplicates({ engine: store.engine }, { labels: ['Knowledge'], near: false })
+    expect(groupWith(res.groups, 'Knowledge', 'exact', 'sc-a1', 'sc-a2')).toBeDefined()
+    expect(groupWith(res.groups, 'Knowledge', 'exact', 'sc-b1', 'sc-b2')).toBeDefined()
+    expect(res.groups.some((g) => g.reason === 'near')).toBe(false)
+    expect(res.scannedNodes).toBe(0) // no vector probes at all
+  })
+
+  it("scope 'recent' surfaces a recent-vs-OLD duplicate (old member pulled in) and skips all-old groups, probing only recent candidates", async () => {
+    const res = await scanDuplicates(
+      { engine: store.engine },
+      { labels: ['Knowledge'], scope: 'recent', sinceUpdatedAtIso: MID }
+    )
+    // The beta exact group is surfaced BECAUSE sc-b2 is recent — and it still
+    // includes the OLD sc-b1 (materialized on demand).
+    const beta = groupWith(res.groups, 'Knowledge', 'exact', 'sc-b1', 'sc-b2')
+    expect(beta).toBeDefined()
+    // The all-old alpha group is NOT surfaced.
+    expect(res.groups.some((g) => g.nodes.some((n) => n.id === 'sc-a1'))).toBe(false)
+    // The recent near pair is surfaced.
+    expect(groupWith(res.groups, 'Knowledge', 'near', 'sc-n1', 'sc-n2')).toBeDefined()
+    // Only the 3 recent candidates were examined (not all 6 nodes) — the cost win.
+    expect(res.scannedNodes).toBe(3)
+  })
+
+  it("scope 'count' compares only the newest N (a lower N excludes older duplicates)", async () => {
+    // Newest 2 by updated_at: sc-b2 (NEW3), sc-n2 (NEW2).
+    const two = await scanDuplicates({ engine: store.engine }, { labels: ['Knowledge'], scope: 'count', count: 2 })
+    expect(two.scannedNodes).toBe(2)
+    expect(groupWith(two.groups, 'Knowledge', 'exact', 'sc-b1', 'sc-b2')).toBeDefined() // sc-b2 in newest-2
+    expect(two.groups.some((g) => g.nodes.some((n) => n.id === 'sc-a1'))).toBe(false) // alpha not in newest-2
+
+    // Newest 1 = sc-b2 only → nothing probes the gamma near pair.
+    const one = await scanDuplicates({ engine: store.engine }, { labels: ['Knowledge'], scope: 'count', count: 1 })
+    expect(one.scannedNodes).toBe(1)
+    expect(one.groups.some((g) => g.reason === 'near')).toBe(false)
+  })
+
+  it('throws DedupeScanAbortedError when the signal is already aborted', async () => {
+    const ctrl = new AbortController()
+    ctrl.abort()
+    await expect(
+      scanDuplicates({ engine: store.engine }, { labels: ['Knowledge'], signal: ctrl.signal })
+    ).rejects.toBeInstanceOf(DedupeScanAbortedError)
   })
 })
 

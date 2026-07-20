@@ -291,7 +291,22 @@ const APPDATA_SCHEMA: readonly string[] = [
     duration_ms INTEGER,
     ok INTEGER NOT NULL DEFAULT 1
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_local_llm_usage_ts ON local_llm_usage(ts)`
+  `CREATE INDEX IF NOT EXISTS idx_local_llm_usage_ts ON local_llm_usage(ts)`,
+  // Last COMPLETED background duplicate scan (memory/dedupeController.ts) — a
+  // single row (id=1). The scan runs in main and survives the modal closing;
+  // reopening (even after a restart) shows `result_json`. `watermark_at` is the
+  // scan-START wall-clock of the last completed recent/all scan — the next
+  // 'recent' scan compares only nodes changed since it. Not audited: read-only
+  // maintenance bookkeeping, like spend/usage rows.
+  `CREATE TABLE IF NOT EXISTS dedupe_scans (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    completed_at  TEXT NOT NULL,
+    scope         TEXT NOT NULL,
+    options_json  TEXT NOT NULL,
+    result_json   TEXT NOT NULL,
+    scanned_nodes INTEGER NOT NULL DEFAULT 0,
+    watermark_at  TEXT
+  )`
 ]
 
 /**

@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { networkInterfaces } from 'node:os'
 import {
   IPC_EVENT_CLOSE_REQUEST,
+  IPC_EVENT_DEDUPE_STATUS,
   IPC_EVENT_UPDATER_STATUS,
   IPC_EVENT_WINDOW_MAXIMIZE,
   IPC_WINDOW_CLOSE,
@@ -80,6 +81,7 @@ import {
   type InjectionScanner
 } from './security'
 import { createRetriever } from './retrieval'
+import { DedupeScanController } from './memory'
 import { Runner } from './runner'
 import { AgenticOsMcpServer, claudeMcpAddCommand, McpClientManager, writeSampleMcpJson } from './mcp'
 import {
@@ -155,6 +157,8 @@ if (!hasSingleInstanceLock) {
 
 let engine: Awaited<ReturnType<typeof openRyuGraphEngine>> | null = null
 let appData: AppData | null = null
+/** Background duplicate-scan controller — bound to engine+db, survives modal close. */
+let dedupeController: DedupeScanController | null = null
 let telemetry: Telemetry | null = null
 /** Kernel singletons (phase 04) — the MCP server + later agents run through these. */
 let kernelInstances: { kernel: Kernel; runner: LangGraphRunner; contextManager: ContextManager } | null = null
@@ -1110,11 +1114,26 @@ function bootIpc(): void {
           ruleErrors: () => ti.ruleRuntime.ruleErrors()
         }
       : null
+  // Background duplicate-scan controller — built once storage is up, reused
+  // across reconnect re-wires so a scan started before a reconnect keeps its
+  // status. Broadcasts every status change to all windows (IPC_EVENT_DEDUPE_STATUS).
+  if (dedupeController === null && appData !== null && engine !== null) {
+    dedupeController = new DedupeScanController({
+      engine,
+      db: appData.db,
+      broadcast: (status) => {
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) win.webContents.send(IPC_EVENT_DEDUPE_STATUS, status)
+        }
+      }
+    })
+  }
   const subsystems = currentSubsystems()
   const diagnostics = currentBootDiagnostics()
   registerIpcHandlers({
     engine,
     db: appData?.db ?? null,
+    dedupeController,
     permissions: securityInstances?.permissions ?? null,
     audit: securityInstances?.audit ?? null,
     scanner: securityInstances?.scanner ?? null,
@@ -1539,6 +1558,7 @@ app.on('will-quit', (event) => {
       engine = null
       const closingAppData = appData
       appData = null
+      dedupeController = null // rebinds to fresh handles if bootIpc ever runs again
       return (
         closingEngine?.close({ skipDatabaseClose: true }).catch((err) => console.error('[storage] close failed', err)) ??
         Promise.resolve()

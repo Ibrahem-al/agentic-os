@@ -420,14 +420,40 @@ export const ENTITY_TIEBREAK_COSINE_LOW = 0.75
  */
 export const DEDUPE_SIMILARITY_DEFAULT = 0.95
 /**
- * Per-label node cap for one dedupe scan (bounds the O(n·k) vector-probe work so
- * a huge graph can't hang the scan). When a label has more nodes than this, only
- * the most-recently-updated cap are scanned and the result is flagged truncated.
- * Rule-12 pick, recorded in the feature report.
+ * Per-label cap on the NEAR-duplicate candidate set — the nodes actually probed
+ * against the vector index (the O(candidates·k) work). Under a scoped scan
+ * (recent/count) the candidate set is already small; this only bites the legacy/
+ * whole-DB path, where more nodes than this ⇒ the newest cap are probed and the
+ * result is flagged truncated. Rule-12 pick, recorded in the feature report.
  */
 export const DEDUPE_SCAN_PER_LABEL_CAP = 2000
 /** k for each node's own-label vector probe during the near-duplicate scan (small — near-dups cluster tightly). Rule-12 pick. */
 export const DEDUPE_NEAR_NEIGHBOR_K = 10
+/**
+ * Per-label cap on the CHEAP exact-duplicate pass (text/name columns only, no
+ * embeddings pulled), so it can cover far more of the graph than the near pass
+ * for near-zero cost — an exact recent-vs-old duplicate is only caught when both
+ * nodes land in this text map. An order of magnitude above the near cap since no
+ * vector blobs are loaded. Rule-12 pick.
+ */
+export const DEDUPE_EXACT_SCAN_CAP = 20000
+/**
+ * Absolute node ceiling for the "entire database" scope — a pure out-of-memory
+ * backstop, NOT the normal bound (background execution + progress + cancel are).
+ * A label past this is probed up to the ceiling and the result flagged truncated.
+ * Rule-12 pick.
+ */
+export const DEDUPE_HARD_NODE_CEILING = 50000
+/** Default node budget when the "certain number of nodes" scope omits a count (newest-N across the scanned labels). Rule-12 pick. */
+export const DEDUPE_COUNT_DEFAULT = 500
+/**
+ * First-ever "recent" scan has no prior watermark, so it falls back to "changed
+ * within this window" — long enough to cover a fresh batch of ingests, short
+ * enough to stay cheap. Rule-12 pick.
+ */
+export const DEDUPE_RECENT_DEFAULT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+/** Vector probes between background-scan progress pushes (coarse enough not to spam IPC). Rule-12 pick. */
+export const DEDUPE_PROGRESS_EMIT_INTERVAL = 50
 
 // ── Knowledge-graph visualization ─────────────────────────────────────────────
 /**

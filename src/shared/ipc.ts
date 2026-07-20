@@ -239,11 +239,61 @@ export interface MemoryDuplicateGroupDto {
   readonly suggestedKeepId: string
 }
 
-/** memory.dedupe.scan result — the groups plus a partial-scan flag. */
+/** The completed groups of a scan plus a partial-scan flag. */
 export interface MemoryDedupeScanResultDto {
   readonly groups: readonly MemoryDuplicateGroupDto[]
-  /** True when a label held more nodes than the scan cap (the scan was partial). */
+  /** True when a label held more nodes than its cap (the scan was partial). */
   readonly truncated: boolean
+}
+
+/** Which slice of memory a background scan compares. */
+export type DedupeScanScope = 'recent' | 'count' | 'all'
+
+/**
+ * Options for `memory.dedupe.scanStart`. `recent` = only memories changed since
+ * the last scan (self-calibrating after a big ingest); `count` = the newest
+ * `count` memories; `all` = the entire database. `near:false` skips the
+ * embedding pass (fast, exact-only).
+ */
+export interface DedupeScanOptionsDto {
+  readonly scope: DedupeScanScope
+  /** scope==='count': how many newest nodes to compare (default DEDUPE_COUNT_DEFAULT). */
+  readonly count?: number
+  readonly labels?: readonly string[]
+  readonly threshold?: number
+  readonly near?: boolean
+}
+
+/** Live progress of the in-flight scan (present while `phase === 'running'`). */
+export interface DedupeScanRunningDto {
+  readonly scope: DedupeScanScope
+  readonly scannedNodes: number
+  /** 0 when the total isn't yet known (or an exact-only scan). */
+  readonly totalNodes: number
+  readonly currentLabel: string
+}
+
+/**
+ * The background duplicate-scan status the modal reads on open and via
+ * IPC_EVENT_DEDUPE_STATUS pushes. The scan runs in main and SURVIVES the modal
+ * closing; `lastResult` (persisted) is shown on reopen even after a restart.
+ */
+export interface DedupeScanStatusDto {
+  readonly phase: 'idle' | 'running' | 'done' | 'error'
+  /** Present while running. */
+  readonly running?: DedupeScanRunningDto
+  /** Present on `phase === 'error'`. */
+  readonly error?: { readonly message: string }
+  /** The last COMPLETED scan's groups (present on idle/done when one exists). */
+  readonly lastResult?: MemoryDedupeScanResultDto
+  readonly lastScope?: DedupeScanScope
+  /** Node budget of the last completed `count` scan (echoed in the UI). */
+  readonly lastCount?: number
+  readonly lastCompletedAt?: string
+  /** The resolved 'recent' cutoff of the last completed recent scan (UI echo). */
+  readonly effectiveCutoff?: string
+  /** The watermark advanced by the last completed recent/all scan. */
+  readonly watermarkAt?: string | null
 }
 
 /** memory.dedupe.merge result — undoable via `auditActionId`. */
@@ -1227,8 +1277,16 @@ export interface IpcChannels {
    * GROUPS across Project/Skill/Preference/Knowledge/Tag; `merge` collapses one
    * group onto its keeper in ONE audited lane job (undoable in History) — v1
    * merges Preference/Knowledge/Tag only (Skill/Project are scan-report-only).
+   *
+   * The scan runs in the BACKGROUND (main process) and survives the modal
+   * closing: `scanStart` kicks it off (rejects with INVALID_STATE if one is
+   * already running) and returns the fresh status; `status` reads the current
+   * phase + last completed result; `cancel` aborts the in-flight scan. Live
+   * progress rides IPC_EVENT_DEDUPE_STATUS.
    */
-  'memory.dedupe.scan': { req: { labels?: readonly string[]; threshold?: number }; res: MemoryDedupeScanResultDto }
+  'memory.dedupe.scanStart': { req: DedupeScanOptionsDto; res: DedupeScanStatusDto }
+  'memory.dedupe.cancel': { req: void; res: DedupeScanStatusDto }
+  'memory.dedupe.status': { req: void; res: DedupeScanStatusDto }
   'memory.dedupe.merge': {
     req: { label: IpcNodeLabel; keepId: string; removeIds: readonly string[] }
     res: MemoryDedupeMergeResultDto
@@ -1408,6 +1466,8 @@ export const IPC_EVENT_INGEST_PROGRESS = 'event.ingest.progress'
 export const IPC_EVENT_OLLAMA_PULL = 'event.ollama.pull'
 /** Auto-updater snapshot pushes (main → renderer) — mirrors the ingest/ollama events. */
 export const IPC_EVENT_UPDATER_STATUS = 'event.updater.status'
+/** Background duplicate-scan status pushes (main → renderer) — DedupeScanStatusDto. */
+export const IPC_EVENT_DEDUPE_STATUS = 'event.dedupe.status'
 
 /** Prefix every invokable channel rides under (namespacing + preload filter). */
 export const IPC_INVOKE_PREFIX = 'agentic-os:'

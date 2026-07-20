@@ -9,8 +9,26 @@
  *    (Project/Skill/Preference/Knowledge) plus exact Tag names; NEAR groups are
  *    embedding cosine ≥ threshold (default DEDUPE_SIMILARITY_DEFAULT), probed
  *    against each node's OWN label vector index and union-found into groups.
- *    Read-only — nothing mutates. The scan is capped per label so a huge graph
- *    cannot hang it (the result flags `truncated` when a cap bit).
+ *    Read-only — nothing mutates.
+ *
+ *    COST MODEL (user-directed improvement): the scan is split into a CHEAP
+ *    exact pass (text/name columns only, no embeddings, covers up to
+ *    DEDUPE_EXACT_SCAN_CAP nodes/label) and an EXPENSIVE near pass (loads
+ *    embeddings + probes the ANN index) whose CANDIDATE set is bounded by the
+ *    scope. `scope`:
+ *      · omitted  — legacy whole-DB pass (newest per-label caps, every group).
+ *      · 'recent' — only nodes changed since `sinceUpdatedAtIso`. KEY WIN: a
+ *        newly-introduced duplicate must involve a recent node, so probing ONLY
+ *        the recent candidates against the FULL ANN index still finds
+ *        recent-vs-old dups — O(recent·k) instead of O(all·k).
+ *      · 'count'  — the newest `count` nodes across the scanned labels.
+ *      · 'all'    — every node (bounded only by DEDUPE_HARD_NODE_CEILING).
+ *    For 'recent'/'count' a group is surfaced only when it contains ≥1 in-scope
+ *    node; the OTHER (older) members of a near/exact match are pulled in on
+ *    demand so a recent-vs-old duplicate is never hidden. The scan flags
+ *    `truncated` when a cap bit, reports `scannedNodes`, honours an AbortSignal
+ *    (cooperative cancel) and an onProgress tick — the background scan
+ *    controller drives both.
  *
  *  - `mergeDuplicates` collapses a group onto a keeper in ONE audited lane job
  *    (so it is undoable from History, §21 rule 11). v1 supports Preference,
@@ -28,7 +46,15 @@
  * The keeper a scan SUGGESTS (and a merge should target) is the group's
  * best-connected node — most incident edges, ties broken by newest updated_at.
  */
-import { DEDUPE_NEAR_NEIGHBOR_K, DEDUPE_SCAN_PER_LABEL_CAP, DEDUPE_SIMILARITY_DEFAULT } from '../config'
+import {
+  DEDUPE_COUNT_DEFAULT,
+  DEDUPE_EXACT_SCAN_CAP,
+  DEDUPE_HARD_NODE_CEILING,
+  DEDUPE_NEAR_NEIGHBOR_K,
+  DEDUPE_PROGRESS_EMIT_INTERVAL,
+  DEDUPE_SCAN_PER_LABEL_CAP,
+  DEDUPE_SIMILARITY_DEFAULT
+} from '../config'
 import { skillEmbedText } from '../agents/skills/lifecycle'
 import type { AuditLog } from '../security/audit'
 import {
@@ -96,15 +122,42 @@ export interface DedupeScanDeps {
   readonly engine: StorageEngine
 }
 
+/** Which slice of memory a scan compares (see ScanDuplicatesOptions.scope). */
+export type DedupeScope = 'recent' | 'count' | 'all'
+
+/** Progress tick during the near pass (drives the background controller's UI). */
+export interface DedupeScanProgress {
+  readonly scannedNodes: number
+  readonly totalNodes: number
+  readonly currentLabel: DedupeLabel
+}
+
 export interface ScanDuplicatesOptions {
   /** Restrict to these labels (default: every DEDUPE_LABELS). */
   readonly labels?: readonly string[]
   /** Near-duplicate cosine floor (default DEDUPE_SIMILARITY_DEFAULT). */
   readonly threshold?: number
-  /** Per-label node cap (default DEDUPE_SCAN_PER_LABEL_CAP). */
+  /** Run the (expensive) near pass. Default true; false = cheap exact-only. */
+  readonly near?: boolean
+  /**
+   * Which slice to compare. Omitted = the legacy whole-DB pass. See the file
+   * header for 'recent' / 'count' / 'all' semantics.
+   */
+  readonly scope?: DedupeScope
+  /** scope==='count': newest-N budget across the scanned labels (default DEDUPE_COUNT_DEFAULT). */
+  readonly count?: number
+  /** scope==='recent': the resolved cutoff (ISO). Nodes with updated_at > this are in scope. */
+  readonly sinceUpdatedAtIso?: string
+  /** Near-candidate per-label cap (default DEDUPE_SCAN_PER_LABEL_CAP; 'all' uses the ceiling). */
   readonly perLabelCap?: number
+  /** Exact-pass per-label cap (default DEDUPE_EXACT_SCAN_CAP). */
+  readonly exactCap?: number
   /** Vector-probe k per node (default DEDUPE_NEAR_NEIGHBOR_K). */
   readonly nearK?: number
+  /** Cooperative cancel — checked between probes; aborting throws DedupeScanAbortedError. */
+  readonly signal?: AbortSignal
+  /** Fired every DEDUPE_PROGRESS_EMIT_INTERVAL near probes (and once per label). */
+  readonly onProgress?: (p: DedupeScanProgress) => void
 }
 
 export interface DuplicateNode {
@@ -129,37 +182,42 @@ export interface DuplicateGroup {
 
 export interface ScanDuplicatesResult {
   readonly groups: readonly DuplicateGroup[]
-  /** True when some label had more nodes than the cap ⇒ the scan was partial. */
+  /** True when some label had more nodes than its cap ⇒ the scan was partial. */
   readonly truncated: boolean
+  /** Near-pass nodes examined (the final progress numerator). */
+  readonly scannedNodes: number
 }
 
-/** One node pulled for scanning (retrievable nodes also carry their embedding). */
-interface ScannedNode {
+/** Thrown by scanDuplicates when its AbortSignal fires — the controller treats it as a cancel, not an error. */
+export class DedupeScanAbortedError extends Error {
+  constructor() {
+    super('duplicate scan cancelled')
+    this.name = 'DedupeScanAbortedError'
+  }
+}
+
+/** One node pulled for scanning (near candidates also carry their embedding). */
+interface ScanNode {
   readonly id: string
   /** Normalized render text (exact key); '' means "nothing to compare". */
   readonly key: string
   readonly display: string
-  readonly updatedAtIso: string | null
+  readonly updatedIso: string | null
   readonly updatedMs: number
   readonly embedding: number[] | null
 }
 
 const clamp01 = (n: number): number => Math.min(1, Math.max(0, n))
 
+const checkAbort = (signal: AbortSignal | undefined): void => {
+  if (signal?.aborted === true) throw new DedupeScanAbortedError()
+}
+
 export async function scanDuplicates(
   deps: DedupeScanDeps,
   options: ScanDuplicatesOptions = {}
 ): Promise<ScanDuplicatesResult> {
   const requested = options.labels ?? DEDUPE_LABELS
-  const threshold = clamp01(options.threshold ?? DEDUPE_SIMILARITY_DEFAULT)
-  const perLabelCap = Math.max(1, Math.trunc(options.perLabelCap ?? DEDUPE_SCAN_PER_LABEL_CAP))
-  const nearK = Math.max(1, Math.trunc(options.nearK ?? DEDUPE_NEAR_NEIGHBOR_K))
-  // VectorHit.distance is cosine distance (1 − similarity): near ⟺ distance ≤ 1 − threshold.
-  const maxDistance = 1 - threshold
-
-  const groups: DuplicateGroup[] = []
-  let truncated = false
-
   for (const raw of requested) {
     if (!(DEDUPE_LABELS as readonly string[]).includes(raw)) {
       throw new MemoryEditError(
@@ -167,128 +225,323 @@ export async function scanDuplicates(
         `cannot scan '${raw}' for duplicates — only ${DEDUPE_LABELS.join(', ')} are supported`
       )
     }
-    const label = raw as DedupeLabel
-    const spec = DEDUPE_RENDER[label]
-    const { nodes, truncated: labelTruncated } = await scanLabelNodes(deps.engine, label, perLabelCap)
-    if (labelTruncated) truncated = true
+  }
+  const labels = requested as readonly DedupeLabel[]
+  const engine = deps.engine
+  const scope = options.scope
+  const runNear = options.near ?? true
+  const threshold = clamp01(options.threshold ?? DEDUPE_SIMILARITY_DEFAULT)
+  const maxDistance = 1 - threshold // VectorHit.distance is cosine distance (1 − similarity)
+  const exactCap = Math.max(1, Math.trunc(options.exactCap ?? DEDUPE_EXACT_SCAN_CAP))
+  const nearCap =
+    scope === 'all' ? DEDUPE_HARD_NODE_CEILING : Math.max(1, Math.trunc(options.perLabelCap ?? DEDUPE_SCAN_PER_LABEL_CAP))
+  const nearK = Math.max(1, Math.trunc(options.nearK ?? DEDUPE_NEAR_NEIGHBOR_K))
+  const countBudget = Math.max(1, Math.trunc(options.count ?? DEDUPE_COUNT_DEFAULT))
+  const cutoffMs =
+    scope === 'recent' && options.sinceUpdatedAtIso !== undefined ? Date.parse(options.sinceUpdatedAtIso) : null
+  const cutoffIso = cutoffMs !== null && Number.isFinite(cutoffMs) ? new Date(cutoffMs).toISOString() : null
 
-    // ── exact groups (take priority — an exact pair is also a near pair) ──
+  const groups: DuplicateGroup[] = []
+  let truncated = false
+  let scannedNodes = 0
+
+  // scope==='count': the candidate set is the newest-N ACROSS labels, so gather
+  // (and bucket) it once up-front. 'count' is intentionally partial, so it does
+  // NOT set `truncated` (the UI copy says "newest N" — a flag would be noise).
+  let countByLabel: Map<DedupeLabel, ScanNode[]> | null = null
+  let countIdSet: Set<string> | null = null
+  if (scope === 'count') {
+    const gathered = await gatherCountCandidates(engine, labels, countBudget)
+    countByLabel = gathered.byLabel
+    countIdSet = gathered.ids
+  }
+
+  // Progress denominator (near pass only): the total candidate count.
+  let totalNodes = 0
+  if (runNear) {
+    if (scope === 'count') {
+      totalNodes = countIdSet?.size ?? 0
+    } else {
+      for (const label of labels) {
+        if (!DEDUPE_RENDER[label].retrievable) continue
+        totalNodes += await plannedNearCount(engine, label, cutoffIso, nearCap)
+      }
+    }
+  }
+  const emitProgress = (label: DedupeLabel): void =>
+    options.onProgress?.({ scannedNodes, totalNodes, currentLabel: label })
+
+  for (const label of labels) {
+    checkAbort(options.signal)
+    const spec = DEDUPE_RENDER[label]
+
+    // ── EXACT pass (cheap: text/name only, broad) ──────────────────────────
+    const exact = await fetchExactNodes(engine, label, exactCap)
+    if (exact.truncated) truncated = true
+    const cache = new Map<string, ScanNode>()
+    for (const n of exact.nodes) cache.set(n.id, n)
+
     const claimed = new Set<string>()
-    const byKey = new Map<string, ScannedNode[]>()
-    for (const node of nodes) {
-      if (node.key === '') continue
-      const list = byKey.get(node.key) ?? []
-      list.push(node)
-      byKey.set(node.key, list)
+    const byKey = new Map<string, ScanNode[]>()
+    for (const n of exact.nodes) {
+      if (n.key === '') continue
+      const list = byKey.get(n.key) ?? []
+      list.push(n)
+      byKey.set(n.key, list)
     }
     for (const list of byKey.values()) {
       if (list.length < 2) continue
+      if (!exactGroupInScope(list, scope, cutoffMs, countIdSet)) continue
       for (const n of list) claimed.add(n.id)
-      groups.push(await buildGroup(deps.engine, label, list, 'exact', undefined))
+      groups.push(await buildGroup(engine, label, list.map((n) => n.id), 'exact', undefined, cache))
     }
 
-    // ── near groups (retrievable labels only; exact-claimed nodes excluded) ──
-    if (spec.retrievable) {
+    // ── NEAR pass (bounded candidate set; probes the FULL ANN index) ────────
+    if (runNear && spec.retrievable) {
       const retrievableLabel = label as RetrievableLabel // spec.retrievable ⇒ label ∈ RETRIEVABLE_LABELS
-      const byId = new Map(nodes.map((n) => [n.id, n] as const))
+      let candidates: ScanNode[]
+      if (scope === 'count') {
+        candidates = countByLabel?.get(label) ?? []
+      } else {
+        const fetched = await fetchNearCandidates(engine, label, cutoffIso, nearCap)
+        if (fetched.truncated) truncated = true
+        candidates = fetched.nodes
+      }
+      for (const n of candidates) cache.set(n.id, n)
+
       const dsu = new Dsu()
       const pairSim = new Map<string, number>()
-      for (const node of nodes) {
-        if (node.embedding === null || claimed.has(node.id)) continue
-        const hits = await deps.engine.vectorSearch(retrievableLabel, node.embedding, nearK)
+      for (const node of candidates) {
+        if (node.embedding === null || claimed.has(node.id)) {
+          scannedNodes += 1
+          continue
+        }
+        const hits = await engine.vectorSearch(retrievableLabel, node.embedding, nearK)
         for (const hit of hits) {
-          if (hit.id === node.id || hit.distance > maxDistance) continue
-          if (!byId.has(hit.id) || claimed.has(hit.id)) continue
+          if (hit.id === node.id || hit.distance > maxDistance || claimed.has(hit.id)) continue
           dsu.union(node.id, hit.id)
           const pk = node.id < hit.id ? `${node.id}|${hit.id}` : `${hit.id}|${node.id}`
           const sim = 1 - hit.distance
           const prev = pairSim.get(pk)
           if (prev === undefined || sim < prev) pairSim.set(pk, sim)
         }
+        scannedNodes += 1
+        if (scannedNodes % DEDUPE_PROGRESS_EMIT_INTERVAL === 0) {
+          checkAbort(options.signal)
+          emitProgress(label)
+        }
       }
-      const comps = new Map<string, ScannedNode[]>()
-      for (const node of nodes) {
-        if (node.embedding === null || claimed.has(node.id) || !dsu.has(node.id)) continue
-        const root = dsu.find(node.id)
+
+      // Union-find components (may include OLD nodes reached only as hits).
+      const comps = new Map<string, string[]>()
+      for (const id of dsu.members()) {
+        const root = dsu.find(id)
         const list = comps.get(root) ?? []
-        list.push(node)
+        list.push(id)
         comps.set(root, list)
       }
-      for (const [root, list] of comps) {
-        if (list.length < 2) continue
-        // The group's similarity is its weakest connecting edge (honest floor).
-        let minSim = 1
+      for (const [root, ids] of comps) {
+        if (ids.length < 2) continue
+        let minSim = 1 // the group's similarity is its weakest connecting edge (honest floor)
         for (const [pk, sim] of pairSim) {
           const bar = pk.indexOf('|')
-          const a = pk.slice(0, bar)
-          const b = pk.slice(bar + 1)
-          if (dsu.has(a) && dsu.has(b) && dsu.find(a) === root && dsu.find(b) === root && sim < minSim) minSim = sim
+          if (dsu.find(pk.slice(0, bar)) === root && dsu.find(pk.slice(bar + 1)) === root && sim < minSim) minSim = sim
         }
-        groups.push(await buildGroup(deps.engine, label, list, 'near', minSim))
+        const group = await buildGroup(engine, label, ids, 'near', minSim, cache)
+        if (group.nodes.length >= 2) groups.push(group) // a member may vanish mid-scan
       }
     }
+    emitProgress(label)
   }
 
-  return { groups: sortGroups(groups), truncated }
+  return { groups: sortGroups(groups), truncated, scannedNodes }
 }
 
-async function scanLabelNodes(
+/** COUNT(n:label), or the count since a cutoff when `cutoffIso` is set. */
+async function countLabel(engine: StorageEngine, label: DedupeLabel, cutoffIso: string | null): Promise<number> {
+  const rows =
+    cutoffIso === null
+      ? await engine.cypher(`MATCH (n:${label}) RETURN count(n) AS c`)
+      : await engine.cypher(`MATCH (n:${label}) WHERE n.updated_at > timestamp($cutoff) RETURN count(n) AS c`, {
+          cutoff: cutoffIso
+        })
+  return Number(rows[0]?.['c'] ?? 0)
+}
+
+/** Planned near-candidate count for a label (for the progress denominator). */
+async function plannedNearCount(
+  engine: StorageEngine,
+  label: DedupeLabel,
+  cutoffIso: string | null,
+  cap: number
+): Promise<number> {
+  return Math.min(await countLabel(engine, label, cutoffIso), cap)
+}
+
+const scanNodeFrom = (spec: LabelSpec, row: Row, withEmbedding: boolean): ScanNode => {
+  const get = (c: string): string => {
+    const v = row[c]
+    return typeof v === 'string' ? v : ''
+  }
+  const rendered = spec.render(get)
+  const updated = row['updated_at']
+  const embedding = row['embedding']
+  const id = String(row['id'] ?? '')
+  return {
+    id,
+    key: normalizeText(rendered),
+    display: truncate(rendered.replace(/\s+/g, ' ').trim()) || id,
+    updatedIso: updated instanceof Date ? updated.toISOString() : null,
+    updatedMs: updated instanceof Date ? updated.getTime() : 0,
+    embedding: withEmbedding && Array.isArray(embedding) ? (embedding as number[]) : null
+  }
+}
+
+/** Newest `cap` nodes of a label for the exact pass — text columns only, NO embedding. */
+async function fetchExactNodes(
   engine: StorageEngine,
   label: DedupeLabel,
   cap: number
-): Promise<{ nodes: ScannedNode[]; truncated: boolean }> {
+): Promise<{ nodes: ScanNode[]; truncated: boolean }> {
   const spec = DEDUPE_RENDER[label]
-  const totalRows = await engine.cypher(`MATCH (n:${label}) RETURN count(n) AS c`)
-  const total = Number(totalRows[0]?.['c'] ?? 0)
+  const total = await countLabel(engine, label, null)
   const cols = ['n.id AS id', 'n.updated_at AS updated_at', ...spec.columns.map((c) => `n.${c} AS ${c}`)]
-  if (spec.retrievable) cols.push('n.embedding AS embedding')
-  // Newest-first so a truncated scan keeps the freshest nodes (LIMIT is the cap).
   const rows = await engine.cypher(
     `MATCH (n:${label}) RETURN ${cols.join(', ')} ORDER BY n.updated_at DESC, n.id LIMIT ${cap}`
   )
-  const nodes = rows.map((row): ScannedNode => {
-    const get = (c: string): string => {
-      const v = row[c]
-      return typeof v === 'string' ? v : ''
-    }
-    const rendered = spec.render(get)
-    const updated = row['updated_at']
-    const embedding = row['embedding']
-    const id = String(row['id'] ?? '')
-    return {
-      id,
-      key: normalizeText(rendered),
-      display: truncate(rendered.replace(/\s+/g, ' ').trim()) || id,
-      updatedAtIso: updated instanceof Date ? updated.toISOString() : null,
-      updatedMs: updated instanceof Date ? updated.getTime() : 0,
-      embedding: spec.retrievable && Array.isArray(embedding) ? (embedding as number[]) : null
-    }
-  })
-  return { nodes, truncated: total > cap }
+  return { nodes: rows.map((row) => scanNodeFrom(spec, row, false)), truncated: total > cap }
+}
+
+/** Near candidates for a label (embeddings loaded), optionally since a cutoff. */
+async function fetchNearCandidates(
+  engine: StorageEngine,
+  label: DedupeLabel,
+  cutoffIso: string | null,
+  cap: number
+): Promise<{ nodes: ScanNode[]; truncated: boolean }> {
+  const spec = DEDUPE_RENDER[label]
+  const total = await countLabel(engine, label, cutoffIso)
+  const cols = [
+    'n.id AS id',
+    'n.updated_at AS updated_at',
+    ...spec.columns.map((c) => `n.${c} AS ${c}`),
+    'n.embedding AS embedding'
+  ]
+  const where = cutoffIso === null ? '' : 'WHERE n.updated_at > timestamp($cutoff) '
+  const rows = await engine.cypher(
+    `MATCH (n:${label}) ${where}RETURN ${cols.join(', ')} ORDER BY n.updated_at DESC, n.id LIMIT ${cap}`,
+    cutoffIso === null ? {} : { cutoff: cutoffIso }
+  )
+  return { nodes: rows.map((row) => scanNodeFrom(spec, row, true)), truncated: total > cap }
+}
+
+/**
+ * The newest `budget` nodes across the retrievable scanned labels (with
+ * embeddings), bucketed per label. Fetching the newest `budget` PER label and
+ * merge-taking the global top `budget` is exact: any node in the global newest-N
+ * ranks ≤ N within its own label, so it is captured.
+ */
+async function gatherCountCandidates(
+  engine: StorageEngine,
+  labels: readonly DedupeLabel[],
+  budget: number
+): Promise<{ byLabel: Map<DedupeLabel, ScanNode[]>; ids: Set<string> }> {
+  const all: { label: DedupeLabel; node: ScanNode }[] = []
+  for (const label of labels) {
+    const spec = DEDUPE_RENDER[label]
+    if (!spec.retrievable) continue
+    const cols = [
+      'n.id AS id',
+      'n.updated_at AS updated_at',
+      ...spec.columns.map((c) => `n.${c} AS ${c}`),
+      'n.embedding AS embedding'
+    ]
+    const rows = await engine.cypher(
+      `MATCH (n:${label}) RETURN ${cols.join(', ')} ORDER BY n.updated_at DESC, n.id LIMIT ${budget}`
+    )
+    for (const row of rows) all.push({ label, node: scanNodeFrom(spec, row, true) })
+  }
+  all.sort((a, b) => b.node.updatedMs - a.node.updatedMs || (a.node.id < b.node.id ? -1 : a.node.id > b.node.id ? 1 : 0))
+  const byLabel = new Map<DedupeLabel, ScanNode[]>()
+  const ids = new Set<string>()
+  for (const { label, node } of all.slice(0, budget)) {
+    const list = byLabel.get(label) ?? []
+    list.push(node)
+    byLabel.set(label, list)
+    ids.add(node.id)
+  }
+  return { byLabel, ids }
+}
+
+/** Whether an exact group touches the current scope (recent/count filter). */
+function exactGroupInScope(
+  members: readonly ScanNode[],
+  scope: DedupeScope | undefined,
+  cutoffMs: number | null,
+  countIdSet: Set<string> | null
+): boolean {
+  if (scope === undefined || scope === 'all') return true
+  if (scope === 'recent') return cutoffMs === null ? true : members.some((n) => n.updatedMs > cutoffMs)
+  // scope === 'count'
+  return countIdSet !== null && members.some((n) => countIdSet.has(n.id))
+}
+
+/** Resolve a member not already scanned into memory (an OLD node pulled in by a near hit). */
+async function materializeNode(
+  engine: StorageEngine,
+  label: DedupeLabel,
+  id: string
+): Promise<{ display: string; updatedIso: string | null; updatedMs: number } | null> {
+  const spec = DEDUPE_RENDER[label]
+  const cols = ['n.updated_at AS updated_at', ...spec.columns.map((c) => `n.${c} AS ${c}`)]
+  const rows = await engine.cypher(`MATCH (n:${label} {id: $id}) RETURN ${cols.join(', ')} LIMIT 1`, { id })
+  const row = rows[0]
+  if (row === undefined) return null
+  const get = (c: string): string => {
+    const v = row[c]
+    return typeof v === 'string' ? v : ''
+  }
+  const rendered = spec.render(get)
+  const updated = row['updated_at']
+  return {
+    display: truncate(rendered.replace(/\s+/g, ' ').trim()) || id,
+    updatedIso: updated instanceof Date ? updated.toISOString() : null,
+    updatedMs: updated instanceof Date ? updated.getTime() : 0
+  }
 }
 
 async function buildGroup(
   engine: StorageEngine,
   label: DedupeLabel,
-  members: readonly ScannedNode[],
+  memberIds: readonly string[],
   reason: 'exact' | 'near',
-  similarity: number | undefined
+  similarity: number | undefined,
+  cache: Map<string, ScanNode>
 ): Promise<DuplicateGroup> {
-  const withCounts = await Promise.all(
-    members.map(async (node) => ({ node, edgeCount: await edgeCountOf(engine, label, node.id) }))
-  )
+  const resolved: { id: string; display: string; updatedMs: number; updatedIso: string | null; edgeCount: number }[] = []
+  for (const id of memberIds) {
+    const cached = cache.get(id)
+    const base = cached ?? (await materializeNode(engine, label, id))
+    if (base === null) continue // deleted mid-scan — drop it
+    const updatedIso = cached !== undefined ? cached.updatedIso : base.updatedIso
+    resolved.push({
+      id,
+      display: base.display,
+      updatedMs: cached !== undefined ? cached.updatedMs : base.updatedMs,
+      updatedIso,
+      edgeCount: await edgeCountOf(engine, label, id)
+    })
+  }
   // Keeper ranking: most edges, tie → newest updated_at, tie → id (determinism).
-  withCounts.sort(
+  resolved.sort(
     (a, b) =>
-      b.edgeCount - a.edgeCount ||
-      b.node.updatedMs - a.node.updatedMs ||
-      (a.node.id < b.node.id ? -1 : a.node.id > b.node.id ? 1 : 0)
+      b.edgeCount - a.edgeCount || b.updatedMs - a.updatedMs || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
   )
-  const nodes: DuplicateNode[] = withCounts.map((w) => ({
-    id: w.node.id,
-    display: w.node.display,
-    updatedAt: w.node.updatedAtIso,
-    edgeCount: w.edgeCount
+  const nodes: DuplicateNode[] = resolved.map((r) => ({
+    id: r.id,
+    display: r.display,
+    updatedAt: r.updatedIso,
+    edgeCount: r.edgeCount
   }))
   return {
     label,
@@ -516,6 +769,10 @@ class Dsu {
 
   has(x: string): boolean {
     return this.parent.has(x)
+  }
+
+  members(): IterableIterator<string> {
+    return this.parent.keys()
   }
 
   find(x: string): string {
