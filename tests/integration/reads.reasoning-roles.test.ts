@@ -41,6 +41,8 @@ describe('getReasoningRoles (reasoning.roles read shape)', () => {
   it('groups every role, and ingest.skillProposal lands under "Improving skills" (not Summaries) despite its ingest namespace', () => {
     const byRole = new Map(getReasoningRoles({}).map((r) => [r.role, r.group]))
     expect(byRole.get('ingest.skillProposal')).toBe('Improving skills')
+    // The §8 graph-cleanup dedupe judge groups with the entity-resolution work.
+    expect(byRole.get('cleanup.dedupeJudge')).toBe('Understanding your sessions')
     expect(byRole.get('ingest.projectSummary')).toBe('Summaries')
     expect(byRole.get('context.summarize')).toBe('Summaries')
     expect(byRole.get('scanner.llmVerdict')).toBe('Safety scanning')

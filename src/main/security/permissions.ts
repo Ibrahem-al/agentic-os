@@ -124,17 +124,19 @@ export const CONTROL_TOOLS = new Set([
   'ingest_codebase'
 ])
 /**
- * Dashboard-maintenance tools (memory dedup — user-directed extension): they
- * behave like read/staging (no graph side effect — the scanner reads,
- * propose_dedupe_merge only STAGES), so they AUTO-ALLOW on the interactive
- * `mcp:` session. They are deliberately EXCLUDED from the runner surface
- * (`mcp-runner:` profile + the server-side RUNNER_SESSION_ALLOWLIST), so a
- * headless background reasoner can never trigger them — de-duplicating a user's
- * long-lived memory is a human-in-the-loop chore, not autonomous background
- * work. Kept a SEPARATE tier from READ_TOOLS/STAGING_TOOLS precisely so the
- * runner allowlist (derived from those two) stays unchanged.
+ * Dashboard-maintenance tools (memory dedup — user-directed extension): their
+ * net effect is read/staging only (no direct graph write — the scanner reads,
+ * propose_dedupe_merge only STAGES, and run_graph_cleanup enqueues a §8
+ * background scan whose ONLY output is staged merge proposals for review, §21
+ * rule 6), so they AUTO-ALLOW on the interactive `mcp:` session. They are
+ * deliberately EXCLUDED from the runner surface (`mcp-runner:` profile + the
+ * server-side RUNNER_SESSION_ALLOWLIST), so a headless background reasoner can
+ * never trigger them — de-duplicating a user's long-lived memory is a
+ * human-in-the-loop chore, not autonomous background work. Kept a SEPARATE tier
+ * from READ_TOOLS/STAGING_TOOLS precisely so the runner allowlist (derived from
+ * those two) stays unchanged.
  */
-export const DASHBOARD_TOOLS = new Set(['list_duplicate_memories', 'propose_dedupe_merge'])
+export const DASHBOARD_TOOLS = new Set(['list_duplicate_memories', 'propose_dedupe_merge', 'run_graph_cleanup'])
 
 export class PermissionEngine implements PermissionChecker {
   private readonly db: BetterSqlite3.Database

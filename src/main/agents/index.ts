@@ -199,3 +199,17 @@ export {
   type SkillTestSet,
   type SkillWorkItem
 } from './skills/types'
+
+// ── graph-cleanup agent (§8 background task — user-directed extension) ─────────
+export {
+  enqueueGraphCleanup,
+  GRAPH_CLEANUP_PROPOSER,
+  GRAPH_CLEANUP_TASK_KIND,
+  registerGraphCleanupHandler,
+  runGraphCleanup,
+  type DedupeJudgeRouter,
+  type GraphCleanupDeps,
+  type GraphCleanupOptions,
+  type GraphCleanupResult,
+  type RunGraphCleanupOptions
+} from './cleanup'

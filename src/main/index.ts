@@ -88,6 +88,7 @@ import {
   createExtractionAgent,
   createSkillImprovementAgent,
   parseTranscriptFile,
+  registerGraphCleanupHandler,
   registerSkillImprovementHandler,
   type ExtractionAgent,
   type SkillImprovementAgent
@@ -987,6 +988,16 @@ async function bootTriggers(): Promise<void> {
   const folderStore = new WatchedFolderStore({ configPath: join(userDataDir, WATCHED_FOLDERS_CONFIG_FILENAME) })
   if (engine !== null) {
     registerMaintenanceHandlers(queue, { engine, audit: securityInstances.audit, exportsDir: paths.exportsDir })
+    // Graph-cleanup (§8 'graph-cleanup' — user-directed extension): the duplicate
+    // scan → stage-for-review agent, fired by the MCP run_graph_cleanup tool + the
+    // dashboard cleanupStart trigger. db = appdata.db (staged_writes lives there);
+    // the shared router judges near-duplicates (absent ⇒ only exact groups stage,
+    // guarded like the sibling handlers).
+    registerGraphCleanupHandler(queue, {
+      engine,
+      db: appData.db,
+      ...(providerRouter !== null ? { router: providerRouter } : {})
+    })
     if (ollama !== null) {
       registerIngestHandlers(queue, {
         knowledge: {

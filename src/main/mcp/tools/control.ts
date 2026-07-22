@@ -9,12 +9,13 @@
  *   run_extraction                       enqueue extraction for a finished session
  *   improve_skill_now                    enqueue the §17 manual improvement
  *   run_maintenance                      fire a prune / export maintenance job
+ *   run_graph_cleanup                    enqueue the §8 duplicate-memory cleanup (stages for review)
  *   retry_task                           re-run a deferred §8 task now
  *   scan_watched_folder                  ingest a configured watched folder now
  */
 import * as z from 'zod'
 import { TASK_PRIORITY } from '../../config'
-import { enqueueManualImprovement } from '../../agents'
+import { enqueueGraphCleanup, enqueueManualImprovement } from '../../agents'
 import {
   IngestError,
   ingestCodebase,
@@ -186,6 +187,46 @@ async function runMaintenanceTool(args: unknown, ctx: ToolContext): Promise<unkn
   }
 }
 
+// ── run_graph_cleanup ────────────────────────────────────────────────────────
+
+const RunGraphCleanupInput = z.object({
+  scope: z
+    .enum(['recent', 'count', 'all'])
+    .optional()
+    .describe("Which slice of memory to scan (default 'recent' — memories changed in the last 7 days)."),
+  count: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe("Only with scope 'count': how many of the newest memories to compare."),
+  threshold: z.number().min(0).max(1).optional().describe('Near-duplicate cosine floor (0..1); higher = stricter.'),
+  labels: z
+    .array(z.string())
+    .optional()
+    .describe('Restrict the scan to these memory kinds (default: every de-duplicated label).')
+})
+
+async function runGraphCleanupTool(args: unknown, ctx: ToolContext): Promise<unknown> {
+  const input = parse(RunGraphCleanupInput, args, 'run_graph_cleanup')
+  const queue = requireQueue(ctx, 'run_graph_cleanup')
+  // Deterministic per-minute id (a same-minute burst dedups); the registered
+  // 'graph-cleanup' handler runs the duplicate scan and STAGES merge proposals for
+  // review — it never merges directly (§21 rule 6). The scan options ride the payload.
+  const result = enqueueGraphCleanup(queue, {
+    ...(input.scope !== undefined ? { scope: input.scope } : {}),
+    ...(input.count !== undefined ? { count: input.count } : {}),
+    ...(input.threshold !== undefined ? { threshold: input.threshold } : {}),
+    ...(input.labels !== undefined ? { labels: input.labels } : {})
+  })
+  return {
+    scheduled: true,
+    taskId: result.taskId,
+    deduped: result.deduped,
+    note: 'AI cleanup scheduled — it scans for duplicate memories and STAGES merge proposals for user review (list_staged_writes shows them); nothing merges without approval (§21 rule 6).'
+  }
+}
+
 // ── retry_task ─────────────────────────────────────────────────────────────────
 
 const RetryTaskInput = z.object({
@@ -285,6 +326,13 @@ export const CONTROL_TOOL_DEFS: readonly McpToolDef[] = [
       'Fire a maintenance job now: "prune" (the nightly retention sweep — an audited, reversible transcript-ref drop + task/checkpoint cleanup) or "export" (write the CSV + Cypher memory export). Deduped per minute; runs on the §8 queue.',
     inputSchema: jsonSchema(RunMaintenanceInput),
     handle: runMaintenanceTool
+  },
+  {
+    name: 'run_graph_cleanup',
+    description:
+      'Schedule an AI memory-cleanup pass now: it scans for duplicate memories (exact matches plus near-duplicates the local LLM judges) and STAGES merge proposals for your review — it never merges anything directly (§21 rule 6; approve them in the review queue, list_staged_writes shows them). Optional scope (default "recent" = memories changed in the last 7 days; "count" the newest N; "all" everything), count (only with scope "count"), threshold (near-duplicate cosine floor 0..1), and labels (restrict to certain memory kinds). Deduped per minute; runs on the §8 queue.',
+    inputSchema: jsonSchema(RunGraphCleanupInput),
+    handle: runGraphCleanupTool
   },
   {
     name: 'retry_task',

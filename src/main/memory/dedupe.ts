@@ -616,6 +616,22 @@ export interface MergeDuplicatesResult {
 }
 
 /**
+ * mergeDuplicateGroups result (batch "accept all"). `auditActionId` is the single
+ * undoable action, or null when no group survived validation (no lane job ran).
+ * `skipped` lists the groups the batch did NOT merge — a node vanished since the
+ * scan (NOT_FOUND) or the group overlaps an earlier merge in the batch — each
+ * with its reason. The counts sum over the surviving (merged) groups only.
+ */
+export interface MergeDuplicateGroupsResult {
+  readonly auditActionId: string | null
+  readonly mergedGroups: number
+  readonly removed: number
+  readonly edgesRepointed: number
+  readonly edgesDropped: number
+  readonly skipped: readonly { readonly label: string; readonly keepId: string; readonly reason: string }[]
+}
+
+/**
  * Validate a merge request and resolve the human displays (all PRE-lane, so a
  * bad request leaves no trace). Shared by `mergeDuplicates` and the MCP
  * `propose_dedupe_merge` staging tool (which stores the displays in its payload
@@ -651,50 +667,179 @@ export async function planDedupeMerge(
   return { label, keepId: args.keepId, keepDisplay, removals }
 }
 
-export async function mergeDuplicates(
-  deps: DedupeMergeDeps,
-  args: { label: string; keepId: string; removeIds: readonly string[] }
-): Promise<MergeDuplicatesResult> {
-  const plan = await planDedupeMerge({ engine: deps.engine }, args) // validates + resolves displays (pre-lane)
-  const { label, keepId } = plan
-  const removeIds = plan.removals.map((r) => r.id)
-  const removeSet = new Set(removeIds)
+/** A label-qualified node the merge removes (and DETACH-deletes). */
+interface MergeRemoval {
+  readonly label: DedupeMergeLabel
+  readonly id: string
+}
 
+/**
+ * A merge resolved to concrete graph ops PRE-lane: which edges re-point onto the
+ * keeper(s) (schema-valid, deduped, props preserved), how many were DROPPED (a
+ * self-loop / off-schema pair), and the removed nodes to DETACH-delete after.
+ * Shared by the single `mergeDuplicates` and the batch `mergeDuplicateGroups` so
+ * both drive the write lane through exactly the same re-point-then-delete core.
+ */
+interface MergeOps {
+  /** Edges to (re-)create onto the keeper(s), in insertion order. */
+  readonly repoint: readonly IncidentEdge[]
+  readonly edgesDropped: number
+  /** Nodes to DETACH-delete after the re-points, label-qualified. */
+  readonly deletions: readonly MergeRemoval[]
+}
+
+/**
+ * Resolve one-or-more validated groups to graph ops against a SHARED
+ * removed-endpoint → keeper map (keyed "label:id" — node ids are unique only
+ * within a label table). Every incident edge of every removed node is collected
+ * ONCE by physical identity, then BOTH endpoints are re-pointed through the map,
+ * so an edge whose two endpoints are removed in DIFFERENT groups of one batch
+ * becomes keeperA→keeperB (created + counted once) instead of being orphaned onto
+ * a node the batch is about to DETACH-delete — which would silently lose the
+ * keeper→keeper edge (a Preference/Knowledge and a Tag group sharing an
+ * APPLIES_TO/TAGGED edge is the exact 'accept all' hazard). An edge that then
+ * self-loops or leaves the schema is DROPPED and counted.
+ */
+async function collectMerge(
+  engine: StorageEngine,
+  removals: readonly MergeRemoval[],
+  removedToKeeper: ReadonlyMap<string, string>
+): Promise<MergeOps> {
   // Collect every incident edge of every removed node ONCE, keyed by physical
-  // identity, so an edge between two removed nodes is not processed twice.
+  // identity, so an edge between two removed nodes (even across groups) is not
+  // processed twice.
   const original = new Map<string, IncidentEdge>()
-  for (const id of removeIds) {
-    for (const edge of await incidentEdges(deps.engine, label, id)) {
+  for (const { label, id } of removals) {
+    for (const edge of await incidentEdges(engine, label, id)) {
       const key = `${edge.type}|${edge.from.label}:${edge.from.id}|${edge.to.label}:${edge.to.id}`
       if (!original.has(key)) original.set(key, edge)
     }
   }
 
-  // Re-point each unique edge onto the keeper. Any removed endpoint maps to the
-  // keeper; an edge that then self-loops or leaves the schema is DROPPED.
+  // Re-point BOTH endpoints through the shared map (a removed endpoint maps to
+  // its own group's keeper); an edge that then self-loops or leaves the schema is
+  // DROPPED.
+  const remap = (ref: NodeRef): NodeRef => {
+    const keeper = removedToKeeper.get(`${ref.label}:${ref.id}`)
+    return keeper === undefined ? ref : { label: ref.label, id: keeper }
+  }
   const repoint = new Map<string, IncidentEdge>()
   let edgesDropped = 0
   for (const edge of original.values()) {
-    const from: NodeRef = removeSet.has(edge.from.id) ? { label: edge.from.label, id: keepId } : edge.from
-    const to: NodeRef = removeSet.has(edge.to.id) ? { label: edge.to.label, id: keepId } : edge.to
+    const from = remap(edge.from)
+    const to = remap(edge.to)
     if (from.id === to.id || !isSchemaPair(edge.type, from, to)) {
       edgesDropped += 1
       continue
     }
-    const key = `${edge.type}|${from.id}|${to.id}`
+    const key = `${edge.type}|${from.label}:${from.id}|${to.label}:${to.id}`
     if (!repoint.has(key)) repoint.set(key, { type: edge.type, from, to, ...(edge.props !== undefined ? { props: edge.props } : {}) })
   }
-  const edgesRepointed = repoint.size
+  return { repoint: [...repoint.values()], edgesDropped, deletions: removals }
+}
+
+/** One group's removed-endpoint → keeper entries (keyed "label:id"). */
+function keeperEntriesOf(plan: DedupeMergePlan): [string, string][] {
+  return plan.removals.map((r) => [`${plan.label}:${r.id}`, plan.keepId])
+}
+
+/** One group's label-qualified removals (for collectMerge + the deletes). */
+function removalsOf(plan: DedupeMergePlan): MergeRemoval[] {
+  return plan.removals.map((r) => ({ label: plan.label, id: r.id }))
+}
+
+export async function mergeDuplicates(
+  deps: DedupeMergeDeps,
+  args: { label: string; keepId: string; removeIds: readonly string[] }
+): Promise<MergeDuplicatesResult> {
+  const plan = await planDedupeMerge({ engine: deps.engine }, args) // validates + resolves displays (pre-lane)
+  const removedToKeeper = new Map<string, string>(keeperEntriesOf(plan))
+  const ops = await collectMerge(deps.engine, removalsOf(plan), removedToKeeper)
 
   const description =
-    `dashboard: merge ${removeIds.length} duplicate ${label} into ${keepId}` +
-    (plan.keepDisplay !== keepId ? ` ('${plan.keepDisplay}')` : '')
+    `dashboard: merge ${plan.removals.length} duplicate ${plan.label} into ${plan.keepId}` +
+    (plan.keepDisplay !== plan.keepId ? ` ('${plan.keepDisplay}')` : '')
   const { actionId } = await deps.audit.graphWrite(deps.actor, description, async (tx) => {
     // Re-point first (both endpoints still exist), then delete the removed nodes.
-    for (const edge of repoint.values()) await tx.createEdge(edge.type, edge.from, edge.to, edge.props)
-    for (const id of removeIds) await tx.deleteNode(label, id)
+    for (const edge of ops.repoint) await tx.createEdge(edge.type, edge.from, edge.to, edge.props)
+    for (const d of ops.deletions) await tx.deleteNode(d.label, d.id)
   })
-  return { auditActionId: actionId, removed: removeIds.length, edgesRepointed, edgesDropped }
+  return { auditActionId: actionId, removed: plan.removals.length, edgesRepointed: ops.repoint.length, edgesDropped: ops.edgesDropped }
+}
+
+/**
+ * Batch "accept all suggested" merge: collapse many duplicate groups in ONE
+ * audited lane job (one undoable action). Every group is validated + resolved
+ * PRE-lane via planDedupeMerge; because a scan goes stale, a group whose keeper
+ * or a removal has since vanished (NOT_FOUND) is SKIPPED and reported rather than
+ * failing the batch — but a structurally impossible request (INVALID_INPUT: an
+ * unsupported label, or a keeper listed among its own removals — our own UI would
+ * have to be buggy) still throws. Groups run in order behind a per-label set of
+ * ids already consumed as removals, so a stale scan double-listing a node can't
+ * corrupt a later group: one whose keeper or a removal was already consumed is
+ * skipped. When no group survives, NO lane job runs and `auditActionId` is null.
+ */
+export async function mergeDuplicateGroups(
+  deps: DedupeMergeDeps,
+  args: { groups: readonly { label: string; keepId: string; removeIds: readonly string[] }[] }
+): Promise<MergeDuplicateGroupsResult> {
+  const skipped: { label: string; keepId: string; reason: string }[] = []
+  // Ids already consumed as REMOVALS by an earlier surviving group. Node ids are
+  // unique only within a label table, so this is keyed by label.
+  const consumedByLabel = new Map<DedupeMergeLabel, Set<string>>()
+  const plans: DedupeMergePlan[] = []
+
+  for (const group of args.groups) {
+    let plan: DedupeMergePlan
+    try {
+      plan = await planDedupeMerge({ engine: deps.engine }, group)
+    } catch (err) {
+      // A vanished node (stale scan) is skipped, not fatal; a malformed request
+      // (unsupported label / keeper ∈ removeIds) still throws.
+      if (err instanceof MemoryEditError && err.code === 'NOT_FOUND') {
+        skipped.push({ label: group.label, keepId: group.keepId, reason: err.message })
+        continue
+      }
+      throw err
+    }
+    const consumed = consumedByLabel.get(plan.label) ?? new Set<string>()
+    if (consumed.has(plan.keepId) || plan.removals.some((r) => consumed.has(r.id))) {
+      skipped.push({ label: plan.label, keepId: plan.keepId, reason: 'overlaps an earlier merge in this batch' })
+      continue
+    }
+    for (const r of plan.removals) consumed.add(r.id)
+    consumedByLabel.set(plan.label, consumed)
+    plans.push(plan)
+  }
+
+  if (plans.length === 0) {
+    return { auditActionId: null, mergedGroups: 0, removed: 0, edgesRepointed: 0, edgesDropped: 0, skipped }
+  }
+
+  // Build the BATCH-GLOBAL removed-endpoint → keeper map over every surviving
+  // group, then resolve the whole batch in ONE collectMerge pass. Re-pointing
+  // both endpoints through this shared map is what keeps a cross-group edge
+  // (both endpoints removed in DIFFERENT groups) — becoming keeperA→keeperB
+  // instead of being orphaned onto a soon-to-be-DETACH-deleted node and lost.
+  const removedToKeeper = new Map<string, string>(plans.flatMap(keeperEntriesOf))
+  const ops = await collectMerge(deps.engine, plans.flatMap(removalsOf), removedToKeeper)
+
+  const removed = ops.deletions.length
+  const description = `dashboard: merge ${plans.length} duplicate groups (${removed} duplicates)`
+  const { actionId } = await deps.audit.graphWrite(deps.actor, description, async (tx) => {
+    // All re-points first (every endpoint still exists), then all deletes — the
+    // same ordering the single merge uses, applied across the whole batch.
+    for (const edge of ops.repoint) await tx.createEdge(edge.type, edge.from, edge.to, edge.props)
+    for (const d of ops.deletions) await tx.deleteNode(d.label, d.id)
+  })
+  return {
+    auditActionId: actionId,
+    mergedGroups: plans.length,
+    removed,
+    edgesRepointed: ops.repoint.length,
+    edgesDropped: ops.edgesDropped,
+    skipped
+  }
 }
 
 interface IncidentEdge {

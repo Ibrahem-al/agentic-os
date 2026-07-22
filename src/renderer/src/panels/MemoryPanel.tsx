@@ -1017,6 +1017,9 @@ function DedupeModal({
   const [countText, setCountText] = useState(String(DEDUPE_COUNT_DEFAULT_UI))
   const [keepers, setKeepers] = useState<Record<string, string>>({})
   const [confirming, setConfirming] = useState<string | null>(null)
+  const [acceptingAll, setAcceptingAll] = useState(false)
+  const [aiConfirm, setAiConfirm] = useState(false)
+  const [cleanupBusy, setCleanupBusy] = useState(false)
   const [busy, setBusy] = useState(false)
   const [starting, setStarting] = useState(false)
 
@@ -1057,9 +1060,27 @@ function DedupeModal({
     }
   }, [applyStatus])
 
+  // Focus lifecycle for the accept-all confirm (an inline alertdialog whose
+  // trigger unmounts when it opens): when it opens, remember the control that
+  // opened it and move focus into the confirm so keyboard/screen-reader users land
+  // on the destructive choice and its appearance is announced (WCAG 2.4.3 / 4.1.3);
+  // when it closes, return focus to the opener. Mirrors Modal's discipline (kit.tsx).
+  const acceptAllConfirmRef = useRef<HTMLDivElement>(null)
+  const acceptAllOpenerRef = useRef<HTMLElement | null>(null)
+  useEffect(() => {
+    if (acceptingAll) {
+      acceptAllOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+      acceptAllConfirmRef.current?.focus()
+    } else if (acceptAllOpenerRef.current !== null) {
+      acceptAllOpenerRef.current.focus()
+      acceptAllOpenerRef.current = null
+    }
+  }, [acceptingAll])
+
   const startScan = useCallback(async (): Promise<void> => {
     setStarting(true)
     setConfirming(null)
+    setAcceptingAll(false)
     try {
       const parsed = Math.trunc(Number(countText))
       const options: DedupeScanOptionsDto = {
@@ -1101,9 +1122,75 @@ function DedupeModal({
     [notifyUndoable, onChanged, startScan, toast]
   )
 
+  // "Accept all suggested": collapse every mergeable group onto its keeper in ONE
+  // audited lane job (the backend batches; one undo restores the lot). Stale
+  // groups ride `skipped` rather than failing the batch — surfaced as a note.
+  const mergeAll = useCallback(
+    async (
+      groupsToMerge: readonly { label: IpcNodeLabel; keepId: string; removeIds: readonly string[] }[]
+    ): Promise<void> => {
+      if (groupsToMerge.length === 0) return
+      setBusy(true)
+      setAcceptingAll(false)
+      try {
+        const result = await call('memory.dedupe.mergeAll', { groups: groupsToMerge })
+        if (result.auditActionId === null) {
+          toast.notify('ok', 'Nothing left to merge — scan again.')
+        } else {
+          notifyUndoable(
+            result.auditActionId,
+            `Merged ${plural(result.removed, 'duplicate')} across ${plural(result.mergedGroups, 'group')} — undo available in History`
+          )
+          if (result.skipped.length > 0) {
+            toast.notify('info', `${plural(result.skipped.length, 'group')} skipped — its memories changed since the scan.`)
+          }
+        }
+        onChanged()
+        await startScan() // re-scan for fresh results (the merged nodes are gone)
+      } catch (err) {
+        toast.notify('err', toIpcError(err).message)
+      } finally {
+        setBusy(false)
+      }
+    },
+    [notifyUndoable, onChanged, startScan, toast]
+  )
+
+  // "Let AI clean up": enqueue the background graph-cleanup job for the current
+  // scope. It stages merge proposals for review (§21 rule 6) — nothing merges
+  // without approval — so this is fire-and-forget: a toast, no result to show.
+  const startCleanup = useCallback(async (): Promise<void> => {
+    setCleanupBusy(true)
+    try {
+      const parsed = Math.trunc(Number(countText))
+      const res = await call('memory.dedupe.cleanupStart', {
+        scope,
+        ...(scope === 'count' ? { count: Number.isFinite(parsed) && parsed > 0 ? parsed : DEDUPE_COUNT_DEFAULT_UI } : {})
+      })
+      toast.notify('ok', res.deduped ? 'AI cleanup is already scheduled.' : 'AI cleanup started — proposals will appear in Approvals.')
+      setAiConfirm(false)
+    } catch (err) {
+      toast.notify('err', toIpcError(err).message)
+    } finally {
+      setCleanupBusy(false)
+    }
+  }, [countText, scope, toast])
+
   const running = status?.phase === 'running'
   const groups = status?.lastResult?.groups ?? []
   const progress = status?.running
+
+  // Accept-all only offers the auto-mergeable groups (Preference/Knowledge/Tag);
+  // Skill/Project groups are report-only and stay out of the batch. removeCount
+  // sums the duplicates that fold away (each group keeps one).
+  const mergeableGroups = groups.filter((g) => MERGEABLE_DEDUPE_LABELS.has(g.label))
+  const reportOnlyCount = groups.length - mergeableGroups.length
+  const acceptAllRemoveCount = mergeableGroups.reduce((sum, g) => sum + (g.nodes.length - 1), 0)
+  const buildAcceptAllGroups = (): { label: IpcNodeLabel; keepId: string; removeIds: string[] }[] =>
+    mergeableGroups.map((g) => {
+      const keepId = keepers[dedupeGroupKey(g)] ?? g.suggestedKeepId
+      return { label: g.label, keepId, removeIds: g.nodes.map((n) => n.id).filter((id) => id !== keepId) }
+    })
 
   // ── scan controls (scope picker + Start/Cancel) ──
   const controls = (
@@ -1129,6 +1216,9 @@ function DedupeModal({
           />
         )}
         <div className="ml-auto flex gap-1.5">
+          <Button testId="dedupe-ai-cleanup" disabled={cleanupBusy} onClick={() => setAiConfirm((v) => !v)}>
+            Let AI clean up
+          </Button>
           {running ? (
             <Button testId="dedupe-cancel" onClick={() => void cancelScan()}>
               Stop
@@ -1140,6 +1230,27 @@ function DedupeModal({
           )}
         </div>
       </div>
+      {aiConfirm && (
+        <div className="rounded-md border border-line bg-raised px-3 py-2">
+          <p className="text-[12px] leading-5 text-ink-mute">
+            A background job scans for duplicates and has your local AI review the near-matches. Its merge proposals
+            appear in Approvals for your review — nothing changes without your approval.
+          </p>
+          <div className="mt-2 flex gap-1.5">
+            <Button disabled={cleanupBusy} onClick={() => setAiConfirm(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              testId="dedupe-ai-cleanup-confirm"
+              disabled={cleanupBusy}
+              onClick={() => void startCleanup()}
+            >
+              Start cleanup
+            </Button>
+          </div>
+        </div>
+      )}
       <p className="text-[12px] leading-5 text-ink-mute">
         {scope === 'recent'
           ? 'Only the memories that changed since your last check — quick, and ideal right after importing projects.'
@@ -1182,6 +1293,55 @@ function DedupeModal({
             </span>
           )}
         </div>
+        {mergeableGroups.length > 0 && (
+          <div className="rounded-md border border-line bg-surface px-3 py-2.5">
+            {acceptingAll ? (
+              <div
+                ref={acceptAllConfirmRef}
+                tabIndex={-1}
+                role="alertdialog"
+                aria-label="Confirm merging all duplicate groups"
+                className="flex flex-col gap-2 outline-none"
+              >
+                <p className="text-[12px] leading-5 text-ink-mute">
+                  Merge {plural(acceptAllRemoveCount, 'duplicate')} across {plural(mergeableGroups.length, 'group')} into
+                  the selected keepers? Connections move onto the kept memories, and one undo in History restores
+                  everything.
+                  {reportOnlyCount > 0 &&
+                    ` The ${plural(reportOnlyCount, 'group')} that can't be auto-merged ${reportOnlyCount === 1 ? 'is' : 'are'} not included.`}
+                </p>
+                <div className="flex gap-1.5">
+                  <Button disabled={busy} onClick={() => setAcceptingAll(false)}>
+                    Cancel
+                  </Button>
+                  <Button
+                    variant="primary"
+                    testId="dedupe-accept-all-confirm"
+                    disabled={busy || running}
+                    onClick={() => void mergeAll(buildAcceptAllGroups())}
+                  >
+                    Merge all {mergeableGroups.length}
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+                <span className="text-[12px] leading-5 text-ink-mute">
+                  {plural(acceptAllRemoveCount, 'duplicate')} across {plural(mergeableGroups.length, 'group')} can merge
+                  into the suggested keepers in one step.
+                </span>
+                <Button
+                  variant="primary"
+                  testId="dedupe-accept-all"
+                  disabled={busy || running}
+                  onClick={() => setAcceptingAll(true)}
+                >
+                  Merge all {mergeableGroups.length} suggested
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
         {status.lastResult?.truncated === true && (
           <p className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-5">
             Memory is large, so only part of it was compared — merge these, then scan again (or narrow the scope).

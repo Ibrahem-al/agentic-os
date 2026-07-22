@@ -269,11 +269,11 @@ describe('ipc settings mutators (phase-16b)', () => {
     expect(readFileSync(settingsPath(dir), 'utf8')).not.toMatch(/network/)
   })
 
-  it('reasoning.roles enumerates all 14 roles with plain groups + the sensitive flag; effectiveBackend is null with no router wired (DEFAULT == TODAY)', async () => {
+  it('reasoning.roles enumerates all 15 roles with plain groups + the sensitive flag; effectiveBackend is null with no router wired (DEFAULT == TODAY)', async () => {
     const roles = dataOf(await invoke('reasoning.roles'))
     // Every §2.2 role, canonical order, no dupes.
-    expect(roles).toHaveLength(14)
-    expect(new Set(roles.map((r) => r.role)).size).toBe(14)
+    expect(roles).toHaveLength(15)
+    expect(new Set(roles.map((r) => r.role)).size).toBe(15)
     // The five HARD-local roles are exactly the ones marked sensitive.
     const sensitive = roles.filter((r) => r.sensitive).map((r) => r.role)
     expect(new Set(sensitive)).toEqual(

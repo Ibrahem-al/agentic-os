@@ -210,6 +210,9 @@ describe('internal registrations (boot profile)', () => {
     for (const tool of ['run_extraction', 'improve_skill_now', 'run_maintenance', 'retry_task', 'scan_watched_folder']) {
       expect(engine.check(sid, { kind: 'mcp-call', name: tool }).allowed).toBe(true)
     }
+    // run_graph_cleanup is a dashboard-maintenance tool (net effect: staging only):
+    // AUTO-allowed on the interactive session, like the dedup scan/propose tools.
+    expect(engine.check(sid, { kind: 'mcp-call', name: 'run_graph_cleanup' }).allowed).toBe(true)
     // P0.6: an unknown / undeclared tool name is now BLOCKED (pre-14b it was allow-defaulted).
     const unknown = engine.check(sid, { kind: 'mcp-call', name: 'no-such-tool' })
     expect(unknown.allowed).toBe(false)
@@ -225,9 +228,10 @@ describe('internal registrations (boot profile)', () => {
     for (const tool of ['get_context', 'list_sessions', 'get_runner_status', 'propose_correction', 'submit_extraction_items']) {
       expect(engine.check(rid, { kind: 'mcp-call', name: tool }).allowed).toBe(true)
     }
-    // Control tools are NOT in the runner's declared surface → hard-blocked
-    // (no standing write grant exists either).
-    for (const tool of ['ingest_document', 'ingest_codebase', 'run_extraction', 'run_maintenance', 'retry_task']) {
+    // Control + dashboard-maintenance tools are NOT in the runner's declared
+    // surface → hard-blocked (no standing write grant exists either). run_graph_cleanup
+    // is dashboard-only, so a headless runner can never trigger a memory-cleanup pass.
+    for (const tool of ['ingest_document', 'ingest_codebase', 'run_extraction', 'run_maintenance', 'retry_task', 'run_graph_cleanup']) {
       const denied = engine.check(rid, { kind: 'mcp-call', name: tool })
       expect(denied.allowed).toBe(false)
       expect(denied.reason).toContain('hard block')

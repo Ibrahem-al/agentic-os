@@ -455,6 +455,33 @@ export const DEDUPE_RECENT_DEFAULT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 /** Vector probes between background-scan progress pushes (coarse enough not to spam IPC). Rule-12 pick. */
 export const DEDUPE_PROGRESS_EMIT_INTERVAL = 50
 
+// ── Graph-cleanup agent (§8 background task — user-directed extension) ─────────
+/**
+ * v1 graph-cleanup (§8 "have an AI go through the graph and clean things up")
+ * runs the existing duplicate scan, stages EXACT groups directly, and has the
+ * LOCAL LLM judge the NEAR groups — every proposal a staged 'dedupe-merge' row
+ * for human review (§21 rule 6: the agent never writes the graph). Neither value
+ * below is a §20 figure; both are conservative rule-12 picks, recorded in the
+ * feature report.
+ */
+/**
+ * Max NEAR groups the local LLM judges per run. Each judged group is ONE local
+ * qwen3 call; beyond this the remaining near groups are left for the next run and
+ * the result note flags it (truncated). Sized so a single run is bounded work on
+ * the local tier while covering any realistic recent-scan batch — a wider sweep
+ * is just the next scheduled run. Rule-12 pick.
+ */
+export const GRAPH_CLEANUP_MAX_LLM_JUDGMENTS = 50
+/**
+ * Output cap (num_predict / max_tokens) for one dedupe-judge reply — a small
+ * constrained JSON object {same, keep_id, reason}. Above the 64-token YES/NO
+ * entity tiebreak (EXTRACTION_TIEBREAK_MAX_TOKENS) and the 256/300-token
+ * critic/verifier because this reply carries a node id plus a human-readable
+ * rationale sentence, and qwen3 may narrate briefly before the JSON; still well
+ * under the 800-token extraction pass. Rule-12 pick.
+ */
+export const GRAPH_CLEANUP_JUDGE_MAX_TOKENS = 512
+
 // ── Knowledge-graph visualization ─────────────────────────────────────────────
 /**
  * Node cap for one graph.overview payload — the ceiling on what the renderer's

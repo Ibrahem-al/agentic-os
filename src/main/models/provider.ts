@@ -40,7 +40,12 @@ import { meteredComplete, type SpendMeter } from './spend'
 /** The three reasoning tiers a role can resolve to. */
 export type ReasoningBackend = 'local-qwen3' | 'cloud-api' | 'subscription-claude'
 
-/** The 13 §2.2 reasoning roles (embeddings + reranker are NOT reasoning). */
+/**
+ * The §2.2 reasoning roles (embeddings + reranker are NOT reasoning): the 13
+ * spec roles plus two user-directed extensions that ride the same seam —
+ * `ingest.skillProposal` (feature A / Stage 3) and `cleanup.dedupeJudge` (§8
+ * graph-cleanup agent).
+ */
 export type RoleKey =
   | 'extraction.fuzzy'
   | 'extraction.tiebreak'
@@ -56,6 +61,7 @@ export type RoleKey =
   | 'ingest.skillProposal'
   | 'scanner.llmVerdict'
   | 'context.summarize'
+  | 'cleanup.dedupeJudge'
 
 /** Canonical ordered list of every role (dashboards, validation, tests). */
 export const ROLE_KEYS: readonly RoleKey[] = [
@@ -72,7 +78,8 @@ export const ROLE_KEYS: readonly RoleKey[] = [
   'ingest.projectSummary',
   'ingest.skillProposal',
   'scanner.llmVerdict',
-  'context.summarize'
+  'context.summarize',
+  'cleanup.dedupeJudge'
 ]
 
 /**
@@ -119,7 +126,13 @@ export const ROLE_DEFAULTS: Readonly<Record<RoleKey, RoleDefault>> = {
   // subscribable so a user who opts into the runner may route it, never HARD.
   'ingest.skillProposal': { today: 'local-qwen3', hardLocal: false, subscribable: true },
   'scanner.llmVerdict': { today: 'local-qwen3', hardLocal: true, subscribable: false },
-  'context.summarize': { today: 'local-qwen3', hardLocal: false, subscribable: false }
+  'context.summarize': { today: 'local-qwen3', hardLocal: false, subscribable: false },
+  // §8 graph-cleanup dedupe judge — an "is this the same memory?" verdict, the
+  // same routing class as extraction.tiebreak: local-by-default (DEFAULT ==
+  // TODAY), not HARD-local (it runs in a background maintenance task, so there is
+  // no live-path timeout / egress / call-volume hazard), and subscribable so a
+  // runner user may route it.
+  'cleanup.dedupeJudge': { today: 'local-qwen3', hardLocal: false, subscribable: true }
 }
 
 // ── The provider contract ─────────────────────────────────────────────────────

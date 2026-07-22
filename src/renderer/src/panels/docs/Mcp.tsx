@@ -76,7 +76,7 @@ export function Mcp(): React.JSX.Element {
       <DocProse>
         <H2>The tool surface</H2>
         <P>
-          The original v1 surface is the seven tools below. It has since grown to about 38 — read
+          The original v1 surface is the seven tools below. It has since grown to about 42 — read
           tools for every dashboard view, staged-write tools that drive the whole learning loop, and
           control tools that trigger sanctioned internal jobs — but the shape never changes:{' '}
           <Strong>reads open, writes land only as staged proposals, and the human-gated approve /

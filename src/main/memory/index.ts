@@ -27,6 +27,7 @@ export {
   DEDUPE_LABELS,
   DEDUPE_MERGE_LABELS,
   DedupeScanAbortedError,
+  mergeDuplicateGroups,
   mergeDuplicates,
   planDedupeMerge,
   scanDuplicates,
@@ -39,6 +40,7 @@ export {
   type DedupeScope,
   type DuplicateGroup,
   type DuplicateNode,
+  type MergeDuplicateGroupsResult,
   type MergeDuplicatesResult,
   type ScanDuplicatesOptions,
   type ScanDuplicatesResult

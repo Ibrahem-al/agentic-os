@@ -137,7 +137,7 @@ export function Architecture(): React.JSX.Element {
         />
 
         <Callout tone="accent" title="Claude's only write path">
-          Of the ~38 MCP tools, most are read-only; the rest stage proposals or trigger sanctioned jobs. <Code>propose_correction</Code>{' '}
+          Of the ~42 MCP tools, most are read-only; the rest stage proposals or trigger sanctioned jobs. <Code>propose_correction</Code>{' '}
           writes a row to the SQLite <Code>staged_writes</Code> table, never the graph. The correction becomes real only after a human
           approves it in the review queue. &quot;Claude is confident&quot; is not itself a permission check.
         </Callout>

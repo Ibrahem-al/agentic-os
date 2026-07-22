@@ -6,7 +6,7 @@
  * resolves to right now (router.resolve — reflects settings + key/health +
  * fallback chain). Read-only: it never mutates and never reaches a model.
  *
- * The group map is a UI grouping (not a spec concept) so 14 dotted role keys
+ * The group map is a UI grouping (not a spec concept) so the dotted role keys
  * present as five human categories. `effectiveBackend` is null only when no
  * router booted this launch (a degraded state the renderer reads as the local
  * default — DEFAULT == TODAY).
@@ -35,7 +35,11 @@ const ROLE_GROUPS: Readonly<Record<RoleKey, ReasoningRoleGroupDto>> = {
   'ingest.projectSummary': 'Summaries',
   'ingest.skillProposal': 'Improving skills',
   'scanner.llmVerdict': 'Safety scanning',
-  'context.summarize': 'Summaries'
+  'context.summarize': 'Summaries',
+  // The §8 graph-cleanup dedupe judge decides whether two stored memories are the
+  // same — the same class of "understanding your memory" work as extraction's
+  // entity-resolution tiebreak, so it groups under "Understanding your sessions".
+  'cleanup.dedupeJudge': 'Understanding your sessions'
 }
 
 export interface ReasoningRolesDeps {

@@ -304,6 +304,30 @@ export interface MemoryDedupeMergeResultDto {
   readonly edgesDropped: number
 }
 
+/** One group `memory.dedupe.mergeAll` did NOT merge, with the reason why (a stale-scan skip). */
+export interface MemoryDedupeMergeSkipDto {
+  readonly label: string
+  readonly keepId: string
+  readonly reason: string
+}
+
+/**
+ * memory.dedupe.mergeAll result — the batch "accept all suggested" merge. Every
+ * surviving group is collapsed in ONE audited lane job undoable via
+ * `auditActionId`; groups whose nodes vanished since the scan, or that overlap an
+ * earlier merge in the batch, ride `skipped` (never fatal). `auditActionId` is
+ * null when no group survived validation (no lane job ran); the counts sum over
+ * the merged groups only.
+ */
+export interface MemoryDedupeMergeAllResultDto {
+  readonly auditActionId: string | null
+  readonly mergedGroups: number
+  readonly removed: number
+  readonly edgesRepointed: number
+  readonly edgesDropped: number
+  readonly skipped: readonly MemoryDedupeMergeSkipDto[]
+}
+
 // ── knowledge graph (visualization) ───────────────────────────────────────────
 
 /**
@@ -1310,6 +1334,30 @@ export interface IpcChannels {
   'memory.dedupe.merge': {
     req: { label: IpcNodeLabel; keepId: string; removeIds: readonly string[] }
     res: MemoryDedupeMergeResultDto
+  }
+  /**
+   * Batch "accept all suggested" merge: collapse every listed group onto its
+   * keeper in ONE audited lane job (undoable via `auditActionId`). A group whose
+   * nodes vanished since the scan, or that overlaps an earlier merge in the batch,
+   * is reported in `skipped` rather than failing the batch; a structurally bad
+   * request (unsupported label / keeper ∈ removeIds) still errors INVALID_INPUT.
+   * `auditActionId` is null when no group survived (no lane job ran).
+   */
+  'memory.dedupe.mergeAll': {
+    req: { groups: readonly { label: IpcNodeLabel; keepId: string; removeIds: readonly string[] }[] }
+    res: MemoryDedupeMergeAllResultDto
+  }
+  /**
+   * Kick off an AI graph-cleanup pass now (the dashboard "clean up with AI"
+   * trigger): enqueues the §8 'graph-cleanup' task, which scans for duplicate
+   * memories and STAGES merge proposals for review — nothing merges without
+   * approval (§21 rule 6; the review queue surfaces them). Deduped per minute, so
+   * a same-minute burst returns the same `taskId` with `deduped: true`.
+   * UNAVAILABLE when the trigger runtime did not boot this launch.
+   */
+  'memory.dedupe.cleanupStart': {
+    req: { scope: DedupeScanScope; count?: number }
+    res: { taskId: string; deduped: boolean }
   }
 
   /**

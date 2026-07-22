@@ -100,6 +100,7 @@ import {
 } from './security'
 import {
   SkillImprovementError,
+  enqueueGraphCleanup,
   enqueueManualImprovement,
   getSkillSettings,
   latestStandingAdoption,
@@ -122,6 +123,7 @@ import {
   createMemoryNode,
   deleteMemoryEdge,
   deleteMemoryNode,
+  mergeDuplicateGroups,
   mergeDuplicates,
   MemoryEditError,
   updateMemoryNode,
@@ -495,6 +497,22 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   register('memory.dedupe.merge', ({ label, keepId, removeIds }) =>
     mergeDuplicates({ engine: need.engine(), audit: need.audit(), actor: DASHBOARD_USER }, { label, keepId, removeIds })
   )
+
+  // Batch "accept all suggested" — collapse every listed group in ONE audited lane
+  // job (stale-scan skips ride the result's `skipped`, never fail the batch).
+  register('memory.dedupe.mergeAll', ({ groups }) =>
+    mergeDuplicateGroups({ engine: need.engine(), audit: need.audit(), actor: DASHBOARD_USER }, { groups })
+  )
+
+  // "Clean up with AI" — enqueue the §8 'graph-cleanup' task (the same enqueue the
+  // MCP run_graph_cleanup tool fires). It scans for duplicates and STAGES merge
+  // proposals for review; nothing merges without approval (§21 rule 6). Reaches the
+  // queue through the trigger runtime (UNAVAILABLE when triggers did not boot).
+  register('memory.dedupe.cleanupStart', ({ scope, count }) => {
+    const queue = deps.triggers?.queue ?? raiseUnavailable('the task queue (triggers did not boot this launch)')
+    const result = enqueueGraphCleanup(queue, { scope, ...(count !== undefined ? { count } : {}) })
+    return { taskId: result.taskId, deduped: result.deduped }
+  })
 
   // ── knowledge graph (read-only overview for the visualization) ───────────────
 
